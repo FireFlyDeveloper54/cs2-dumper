@@ -19,6 +19,7 @@ mod formatter;
 mod interfaces;
 mod offsets;
 mod schemas;
+mod sdk;
 
 enum Item<'a> {
     Buttons(&'a ButtonMap),
@@ -133,6 +134,7 @@ impl<'a> Output<'a> {
         }
 
         self.dump_schemas()?;
+        sdk::dump_sdk(self.out_dir, &self.result.schemas)?;
         self.dump_info(process)?;
 
         Ok(())
