@@ -1,6 +1,7 @@
-/.idea
-/.vscode
-/.vs
 /target
-Cargo.lock
-cs2-dumper.exe
+/output
+/dist
+*.log
+*.pdb
+*.exp
+*.lib

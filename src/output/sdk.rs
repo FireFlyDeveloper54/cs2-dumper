@@ -124,6 +124,24 @@ public:
     T (*ptr() const)[N] { return m_ptr; }
 };
 
+namespace sdk {
+template <typename T>
+inline T& field_ref(void* base, std::ptrdiff_t offset) noexcept {
+    return *reinterpret_cast<T*>(reinterpret_cast<std::byte*>(base) + offset);
+}
+
+template <typename T>
+inline const T& field_ref(const void* base, std::ptrdiff_t offset) noexcept {
+    return *reinterpret_cast<const T*>(reinterpret_cast<const std::byte*>(base) + offset);
+}
+}
+
+#define SCHEMA_FIELD(TYPE, NAME, OFFSET) \
+    inline TYPE& NAME() noexcept { return ::sdk::field_ref<TYPE>(this, OFFSET); } \
+    inline std::add_const_t<TYPE>& NAME() const noexcept { return ::sdk::field_ref<TYPE>(this, OFFSET); }
+
+#define SCHEMA_PAD(NAME, SIZE) std::byte NAME[(SIZE)]
+
 // Basic structs
 struct Vector { float x, y, z; };
 struct Vector2D { float x, y; };
@@ -174,10 +192,111 @@ struct ResolvedType {
     arr_size: usize,
 }
 
-fn resolve_type(raw: &str, enum_names: &HashSet<&str>) -> ResolvedType {
+fn sanitize_cpp_ident(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut previous_separator = false;
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+            previous_separator = false;
+        } else if !previous_separator {
+            out.push('_');
+            previous_separator = true;
+        }
+    }
+    if out.is_empty() {
+        return "Anonymous".to_string();
+    }
+    if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    if is_cpp_keyword(&out) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+fn is_cpp_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "alignas"
+            | "alignof"
+            | "asm"
+            | "auto"
+            | "bool"
+            | "break"
+            | "case"
+            | "catch"
+            | "char"
+            | "class"
+            | "const"
+            | "constexpr"
+            | "continue"
+            | "default"
+            | "delete"
+            | "do"
+            | "double"
+            | "else"
+            | "enum"
+            | "explicit"
+            | "export"
+            | "extern"
+            | "false"
+            | "float"
+            | "for"
+            | "friend"
+            | "goto"
+            | "if"
+            | "inline"
+            | "int"
+            | "long"
+            | "mutable"
+            | "namespace"
+            | "new"
+            | "noexcept"
+            | "nullptr"
+            | "operator"
+            | "private"
+            | "protected"
+            | "public"
+            | "register"
+            | "reinterpret_cast"
+            | "return"
+            | "short"
+            | "signed"
+            | "sizeof"
+            | "static"
+            | "struct"
+            | "switch"
+            | "template"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typedef"
+            | "typename"
+            | "union"
+            | "unsigned"
+            | "using"
+            | "virtual"
+            | "void"
+            | "volatile"
+            | "while"
+    )
+}
+
+fn resolve_type(raw: &str, known_types: &HashSet<&str>) -> ResolvedType {
     let ts = raw.trim();
 
     if ts.ends_with('*') {
+        let pointee = ts.trim_end_matches('*').trim();
+        if known_types.contains(pointee) {
+            return ResolvedType {
+                cpp_type: format!("{}*", sanitize_cpp_ident(pointee)),
+                is_arr: false,
+                arr_size: 0,
+            };
+        }
         return ResolvedType {
             cpp_type: "uintptr_t".to_string(),
             is_arr: false,
@@ -186,7 +305,7 @@ fn resolve_type(raw: &str, enum_names: &HashSet<&str>) -> ResolvedType {
     }
 
     if let Some((inner, size)) = parse_fixed_array(ts) {
-        let mut resolved = resolve_type(&inner, enum_names);
+        let mut resolved = resolve_type(&inner, known_types);
         resolved.is_arr = true;
         resolved.arr_size = size;
         return resolved;
@@ -232,9 +351,27 @@ fn resolve_type(raw: &str, enum_names: &HashSet<&str>) -> ResolvedType {
         };
     }
 
-    if enum_names.contains(ts) {
+    if matches!(
+        stripped.as_str(),
+        "Vector"
+            | "Vector2D"
+            | "Vector4D"
+            | "QAngle"
+            | "CTransform"
+            | "CNetworkOriginCellCoordQuantizedVector"
+            | "CNetworkVelocityVector"
+            | "CNetworkViewOffsetVector"
+    ) {
         return ResolvedType {
-            cpp_type: ts.to_string(),
+            cpp_type: stripped,
+            is_arr: false,
+            arr_size: 0,
+        };
+    }
+
+    if known_types.contains(ts) {
+        return ResolvedType {
+            cpp_type: sanitize_cpp_ident(ts),
             is_arr: false,
             arr_size: 0,
         };
@@ -244,8 +381,8 @@ fn resolve_type(raw: &str, enum_names: &HashSet<&str>) -> ResolvedType {
         let last = &ts[pos + 2..];
 
         return ResolvedType {
-            cpp_type: if enum_names.contains(last) {
-                last.to_string()
+            cpp_type: if known_types.contains(ts) || known_types.contains(last) {
+                sanitize_cpp_ident(ts)
             } else {
                 "uint32_t".to_string()
             },
@@ -289,7 +426,7 @@ fn parse_bitfield(raw: &str) -> Option<u32> {
     raw.strip_prefix("bitfield:")?.parse::<u32>().ok()
 }
 
-pub fn write_sdk_types(classes: &[(&String, &Class)]) -> String {
+pub fn write_sdk_types(classes: &[(&String, &Class)], build_number: Option<u32>) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "#pragma once");
     let _ = writeln!(out);
@@ -298,11 +435,17 @@ pub fn write_sdk_types(classes: &[(&String, &Class)]) -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "#include <cstdint>");
     let _ = writeln!(out, "#include <cstddef>");
+    let _ = writeln!(out, "#include <type_traits>");
+    let _ = writeln!(
+        out,
+        "\nnamespace sdk {{ inline constexpr std::uint32_t CS2_BUILD = {}; }}",
+        build_number.unwrap_or(0)
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "// Forward declarations");
 
-    for (name, _) in classes.iter().copied() {
-        let _ = writeln!(out, "class {};", name);
+    for (_, class) in classes {
+        let _ = writeln!(out, "class {};", sanitize_cpp_ident(&class.name));
     }
 
     let _ = writeln!(out);
@@ -335,6 +478,22 @@ fn enum_max_value(type_name: &str) -> u64 {
     }
 }
 
+fn enum_value_literal(value: i64, type_name: &str) -> String {
+    let bits = match type_name {
+        "uint8_t" => 8,
+        "uint16_t" => 16,
+        "uint32_t" => 32,
+        "uint64_t" => 64,
+        _ => 32,
+    };
+    let masked = if bits == 64 {
+        value as u64
+    } else {
+        (value as u64) & ((1u64 << bits) - 1)
+    };
+    format!("{:#X}", masked)
+}
+
 pub fn write_sdk_enums(enums: &[(&String, &Enum)]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "#pragma once");
@@ -346,18 +505,24 @@ pub fn write_sdk_enums(enums: &[(&String, &Enum)]) -> String {
     let _ = writeln!(out);
 
     for (module_name, enum_) in enums.iter().copied() {
-        let type_name = enum_underlying(enum_.alignment);
+        let type_name = enum_underlying(enum_.storage_bytes());
         let _ = writeln!(out, "// Module: {}", module_name);
-        let _ = writeln!(out, "enum class {} : {} {{", enum_.name, type_name);
+        let _ = writeln!(
+            out,
+            "enum class {} : {} {{",
+            sanitize_cpp_ident(&enum_.name),
+            type_name
+        );
 
         for member in &enum_.members {
-            let formatted_value = if (0..=i32::MAX as i64).contains(&member.value) {
-                format!("{:#X}", member.value)
-            } else {
-                format!("{:#X}", enum_max_value(type_name))
-            };
+            let formatted_value = enum_value_literal(member.value, type_name);
 
-            let _ = writeln!(out, "    {} = {},", member.name, formatted_value);
+            let _ = writeln!(
+                out,
+                "    {} = {},",
+                sanitize_cpp_ident(&member.name),
+                formatted_value
+            );
         }
 
         let _ = writeln!(out, "}};");
@@ -378,14 +543,15 @@ pub fn write_sdk_classes(classes: &[(&String, &Class)], enums: &[(&String, &Enum
     let _ = writeln!(out, "#include \"sdk_enums.hpp\"");
     let _ = writeln!(out);
 
-    let enum_names: HashSet<&str> = enums
+    let known_types: HashSet<&str> = classes
         .iter()
-        .map(|(_, enum_)| enum_.name.as_str())
+        .map(|(_, class)| class.name.as_str())
+        .chain(enums.iter().map(|(_, enum_)| enum_.name.as_str()))
         .collect();
 
     let class_map: BTreeMap<&str, &Class> = classes
         .iter()
-        .map(|(name, class)| (name.as_str(), *class))
+        .map(|(_, class)| (class.name.as_str(), *class))
         .collect();
 
     let mut ordered = Vec::new();
@@ -417,18 +583,24 @@ pub fn write_sdk_classes(classes: &[(&String, &Class)], enums: &[(&String, &Enum
         ordered.push(name);
     }
 
-    for (name, _) in classes.iter().copied() {
-        visit(name.as_str(), &class_map, &mut state, &mut ordered);
+    for (_, class) in classes {
+        visit(class.name.as_str(), &class_map, &mut state, &mut ordered);
     }
 
     for name in &ordered {
         let class = class_map[*name];
-        let parent = class.parent_name.as_deref().unwrap_or("None");
+        let class_name = sanitize_cpp_ident(name);
+        let parent = class.parent_name.as_deref();
 
-        if parent == "None" {
-            let _ = writeln!(out, "class {} {{", name);
+        if let Some(parent) = parent {
+            let _ = writeln!(
+                out,
+                "class {} : public {} {{",
+                class_name,
+                sanitize_cpp_ident(parent)
+            );
         } else {
-            let _ = writeln!(out, "class {} : public {} {{", name, parent);
+            let _ = writeln!(out, "class {} {{", class_name);
         }
         let _ = writeln!(out, "public:");
 
@@ -441,20 +613,28 @@ pub fn write_sdk_classes(classes: &[(&String, &Class)], enums: &[(&String, &Enum
                 continue;
             }
 
-            let resolved = resolve_type(&field.type_name, &enum_names);
+            let resolved = resolve_type(&field.type_name, &known_types);
+            let field_name = sanitize_cpp_ident(&field.name);
             let field_type = if resolved.is_arr {
                 format!("{}[{}]", resolved.cpp_type, resolved.arr_size)
             } else {
                 resolved.cpp_type
             };
 
-            let _ = writeln!(
-                out,
-                "    FieldRef<{}> {}() {{ return {{this, {:#X}}}; }}",
-                field_type, field.name, field.offset
-            );
+            if resolved.is_arr {
+                let _ = writeln!(
+                    out,
+                    "    FieldRef<{}> {}() {{ return {{this, {:#X}}}; }}",
+                    field_type, field_name, field.offset
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "    SCHEMA_FIELD({}, {}, {:#X})",
+                    field_type, field_name, field.offset
+                );
+            }
         }
-
         let _ = writeln!(out, "}};");
         let _ = writeln!(out);
     }
@@ -466,7 +646,10 @@ pub fn write_sdk_umbrella() -> String {
     let mut out = String::new();
     let _ = writeln!(out, "#pragma once");
     let _ = writeln!(out);
-    let _ = writeln!(out, "// SDK umbrella header - auto-generated by cs2-dumper.");
+    let _ = writeln!(
+        out,
+        "// SDK umbrella header - auto-generated by cs2-dumper."
+    );
     let _ = writeln!(out, "// Include this in your code:  #include <sdk/sdk.hpp>");
     let _ = writeln!(out);
     let _ = writeln!(out, "#include \"sdk_types.hpp\"");
@@ -517,26 +700,309 @@ pub fn collect_sdk_data(schemas: &SchemaMap) -> (Vec<(String, Enum)>, Vec<(Strin
     )
 }
 
-pub fn dump_sdk(out_dir: &std::path::Path, schemas: &SchemaMap) -> std::io::Result<()> {
+fn module_slug(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.ends_with("_dll") {
+        out.truncate(out.len() - 4);
+    }
+    if out.is_empty() {
+        "module".to_string()
+    } else {
+        out
+    }
+}
+
+fn write_module_header(module: &str, classes: &[Class], enums: &[Enum]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "#pragma once\n#include <cstddef>\n#include <cstdint>\n"
+    );
+    let _ = writeln!(
+        out,
+        "// Auto-generated per-schema-scope offsets for {}.",
+        module
+    );
+    let _ = writeln!(
+        out,
+        "namespace offsets {{ namespace {} {{",
+        module_slug(module)
+    );
+    for enum_ in enums {
+        let underlying = enum_underlying(enum_.storage_bytes());
+        let _ = writeln!(
+            out,
+            "enum class {} : {} {{",
+            sanitize_cpp_ident(&enum_.name),
+            underlying
+        );
+        for member in &enum_.members {
+            let _ = writeln!(
+                out,
+                "    {} = 0x{:X},",
+                sanitize_cpp_ident(&member.name),
+                u64::from_str_radix(
+                    enum_value_literal(member.value, underlying)
+                        .trim_start_matches("0x")
+                        .trim_start_matches("0X"),
+                    16,
+                )
+                .unwrap_or_else(|_| enum_max_value(underlying))
+            );
+        }
+        let _ = writeln!(out, "}};\n");
+    }
+    for class in classes {
+        let _ = writeln!(out, "namespace {} {{", sanitize_cpp_ident(&class.name));
+        let _ = writeln!(
+            out,
+            "inline constexpr std::size_t kSize = 0x{:X};",
+            class.size.max(0)
+        );
+        let _ = writeln!(
+            out,
+            "inline constexpr std::size_t kAlignment = {};",
+            class.alignment
+        );
+        for field in &class.fields {
+            let _ = writeln!(
+                out,
+                "inline constexpr std::ptrdiff_t {} = 0x{:X}; // {}",
+                sanitize_cpp_ident(&field.name),
+                field.offset,
+                field.type_name
+            );
+        }
+        let _ = writeln!(out, "}}\n");
+    }
+    let _ = writeln!(out, "}} }}");
+    out
+}
+
+fn write_class_header(module: &str, class: &Class) -> String {
+    let mut out = String::new();
+    let module = module_slug(module);
+    let _ = writeln!(out, "#pragma once\n#include <cstddef>\n");
+    let _ = writeln!(out, "// Auto-generated schema offsets for {}.", class.name);
+    for flag in &class.flags {
+        let _ = writeln!(out, "// {}", flag);
+    }
+    let _ = writeln!(
+        out,
+        "namespace offsets {{ namespace {} {{ namespace {} {{",
+        module,
+        sanitize_cpp_ident(&class.name)
+    );
+    let _ = writeln!(
+        out,
+        "inline constexpr std::size_t kSize = 0x{:X};",
+        class.size.max(0)
+    );
+    let _ = writeln!(
+        out,
+        "inline constexpr std::size_t kAlignment = {};",
+        class.alignment
+    );
+    for field in &class.fields {
+        let _ = writeln!(
+            out,
+            "inline constexpr std::ptrdiff_t {} = 0x{:X}; // {}",
+            sanitize_cpp_ident(&field.name),
+            field.offset,
+            field.type_name
+        );
+    }
+    let _ = writeln!(out, "}} }} }}");
+    out
+}
+
+pub fn dump_module_headers(out_dir: &std::path::Path, schemas: &SchemaMap) -> std::io::Result<()> {
+    let modules_dir = out_dir.join("sdk").join("modules");
+    std::fs::create_dir_all(&modules_dir)?;
+    let classes_dir = out_dir.join("sdk").join("classes");
+    std::fs::create_dir_all(&classes_dir)?;
+    let mut umbrella = String::from("#pragma once\n\n");
+    for (module, (classes, enums)) in schemas {
+        let slug = module_slug(module);
+        std::fs::write(
+            modules_dir.join(format!("{}.hpp", slug)),
+            write_module_header(module, classes, enums),
+        )?;
+        let module_classes_dir = classes_dir.join(&slug);
+        std::fs::create_dir_all(&module_classes_dir)?;
+        for class in classes {
+            std::fs::write(
+                module_classes_dir.join(format!("{}.hpp", sanitize_cpp_ident(&class.name))),
+                write_class_header(module, class),
+            )?;
+        }
+        let _ = writeln!(umbrella, "#include \"modules/{}.hpp\"", slug);
+    }
+    std::fs::write(out_dir.join("sdk").join("modules.hpp"), umbrella)?;
+    Ok(())
+}
+pub fn dump_sdk(
+    out_dir: &std::path::Path,
+    schemas: &SchemaMap,
+    build_number: Option<u32>,
+) -> std::io::Result<()> {
     let sdk_dir = out_dir.join("sdk");
     std::fs::create_dir_all(&sdk_dir)?;
 
     let (enums, classes) = collect_sdk_data(schemas);
 
-    let enum_refs: Vec<(&String, &Enum)> = enums.iter().map(|(module, enum_)| (module, enum_)).collect();
-    let class_refs: Vec<(&String, &Class)> = classes.iter().map(|(module, class)| (module, class)).collect();
+    let enum_refs: Vec<(&String, &Enum)> = enums
+        .iter()
+        .map(|(module, enum_)| (module, enum_))
+        .collect();
+    let class_refs: Vec<(&String, &Class)> = classes
+        .iter()
+        .map(|(module, class)| (module, class))
+        .collect();
 
-    std::fs::write(sdk_dir.join("sdk_types.hpp"), write_sdk_types(&class_refs))?;
+    std::fs::write(
+        sdk_dir.join("sdk_types.hpp"),
+        write_sdk_types(&class_refs, build_number),
+    )?;
     println!("  sdk/sdk_types.hpp");
 
     std::fs::write(sdk_dir.join("sdk_enums.hpp"), write_sdk_enums(&enum_refs))?;
     println!("  sdk/sdk_enums.hpp     {} enums", enums.len());
 
-    std::fs::write(sdk_dir.join("sdk_classes.hpp"), write_sdk_classes(&class_refs, &enum_refs))?;
+    std::fs::write(
+        sdk_dir.join("sdk_classes.hpp"),
+        write_sdk_classes(&class_refs, &enum_refs),
+    )?;
     println!("  sdk/sdk_classes.hpp   {} classes", classes.len());
 
     std::fs::write(sdk_dir.join("sdk.hpp"), write_sdk_umbrella())?;
+    dump_module_headers(out_dir, schemas)?;
+    println!("  sdk/modules.hpp       per-scope class/enum offsets");
     println!("  sdk/sdk.hpp           umbrella header");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::{ClassField, EnumMember};
+    use std::process::Command;
+
+    #[test]
+    fn sanitizes_nested_cpp_names_without_changing_normal_names() {
+        assert_eq!(sanitize_cpp_ident("CCSPlayerPawn"), "CCSPlayerPawn");
+        assert_eq!(
+            sanitize_cpp_ident("CPulseCell::TimelineEvent_t"),
+            "CPulseCell_TimelineEvent_t"
+        );
+        assert_eq!(sanitize_cpp_ident("3d_type"), "_3d_type");
+        assert_eq!(sanitize_cpp_ident("operator"), "_operator");
+    }
+
+    #[test]
+    fn preserves_known_schema_pointer_types() {
+        let known = HashSet::from(["C_BaseEntity", "SomeEnum"]);
+        let resolved = resolve_type("C_BaseEntity*", &known);
+        assert_eq!(resolved.cpp_type, "C_BaseEntity*");
+        let nested = resolve_type("C_BaseEntity[2]", &known);
+        assert_eq!(nested.cpp_type, "C_BaseEntity");
+        assert!(nested.is_arr);
+        assert_eq!(nested.arr_size, 2);
+        assert_eq!(resolve_type("Vector", &known).cpp_type, "Vector");
+    }
+
+    #[test]
+    fn preserves_enum_values_at_signed_and_unsigned_boundaries() {
+        assert_eq!(enum_value_literal(-1, "uint8_t"), "0xFF");
+        assert_eq!(enum_value_literal(-2, "uint16_t"), "0xFFFE");
+        assert_eq!(
+            enum_value_literal(i32::MAX as i64 + 1, "uint32_t"),
+            "0x80000000"
+        );
+        assert_eq!(enum_value_literal(-1, "uint64_t"), "0xFFFFFFFFFFFFFFFF");
+    }
+
+    #[test]
+    fn synthetic_sdk_headers_compile_when_gplusplus_is_available() {
+        if Command::new("g++").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("cs2-dumper-sdk-smoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let base = Class {
+            name: "C_BaseEntity".to_string(),
+            module_name: "client.dll".to_string(),
+            parent_name: None,
+            size: 0x20,
+            alignment: 8,
+            metadata: Vec::new(),
+            fields: vec![ClassField {
+                name: "m_vecOrigin".to_string(),
+                type_name: "Vector".to_string(),
+                offset: 0x10,
+                metadata: Vec::new(),
+            }],
+            static_fields: Vec::new(),
+            flags: Vec::new(),
+        };
+        let derived = Class {
+            name: "C_TestEntity".to_string(),
+            module_name: "client.dll".to_string(),
+            parent_name: Some("C_BaseEntity".to_string()),
+            size: 0x28,
+            alignment: 8,
+            metadata: Vec::new(),
+            fields: vec![ClassField {
+                name: "m_hOwner".to_string(),
+                type_name: "C_BaseEntity*".to_string(),
+                offset: 0x20,
+                metadata: Vec::new(),
+            }],
+            static_fields: Vec::new(),
+            flags: Vec::new(),
+        };
+        let enum_ = Enum {
+            name: "TestMode".to_string(),
+            alignment: 4,
+            size: 4,
+            members: vec![EnumMember {
+                name: "Mode_Invalid".to_string(),
+                value: -1,
+            }],
+            flags: Vec::new(),
+        };
+        let schemas =
+            SchemaMap::from([("client.dll".to_string(), (vec![base, derived], vec![enum_]))]);
+
+        dump_sdk(&root, &schemas, Some(12345)).expect("write synthetic SDK");
+        let sdk_types = std::fs::read_to_string(root.join("sdk/sdk_types.hpp")).unwrap();
+        assert!(sdk_types.contains("CS2_BUILD = 12345"));
+        let source = root.join("smoke.cpp");
+        std::fs::write(
+            &source,
+            "#include \"sdk_classes.hpp\"\nint main() { return 0; }\n",
+        )
+        .expect("write smoke source");
+
+        let status = Command::new("g++")
+            .args(["-std=c++20", "-fsyntax-only"])
+            .arg("-I")
+            .arg(&root.join("sdk"))
+            .arg(&source)
+            .status()
+            .expect("run g++");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(status.success(), "generated SDK does not compile");
+    }
 }

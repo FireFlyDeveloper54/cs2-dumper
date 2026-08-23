@@ -98,8 +98,21 @@ pattern_map! {
             map.insert("dwSensitivity_sensitivity".to_string(), 0x58);
         }),
         "dwViewMatrix" => pattern!("488d0d${'} 48c1e006") => None,
-        "dwViewRender" => pattern!("488905${'} 488bc8 4885c0") => None,
+        "dwViewRender" => pattern!("488905${'} 488bc8 4885c0") => Some(|view, map, rva| {
+            // `48 89 05 rel32; 48 8B C8; 48 85 C0` is a compiler idiom
+            // (`mov [global], rax; mov rcx, rax; test rax, rax`), not a
+            // unique symbol. best-dumper used the same bytes for
+            // dwViewRender and dwVPhys2World, so both names bound the first
+            // hit. Keep the first as dwViewRender; a single extra hit is
+            // dwVPhys2World. More than one extra hit is ambiguous — skip.
+            if let Some(phys) = second_store_global(view, rva) {
+                map.insert("dwVPhys2World".to_string(), phys);
+            }
+        }),
         "dwWeaponC4" => pattern!("488b15${'} 488b5c24? ffc0 8905${} 488bc6 488934ea 80be") => None,
+        "dwCreateMove" => pattern!("'488bc44c89401848894808555341544155") => None,
+        "dwParticleManager" => pattern!("488b0d${'} 41b8${} f30f117424? 48c74424? ${}") => None,
+        "dwClientMode" => pattern!("488d0d${'} 4869c0${} 4803c1 c3 cccc") => None,
     },
     engine2 => {
         "dwBuildNumber" => pattern!("8905${'} 488d0d${} ff15${} 488b0d") => None,
@@ -113,9 +126,13 @@ pattern_map! {
         "dwNetworkGameClient_signOnState" => pattern!("448b81u4 488d0d") => None,
         "dwWindowHeight" => pattern!("8b05${'} 8903") => None,
         "dwWindowWidth" => pattern!("8b05${'} 8907") => None,
+        "dwPVSManager" => pattern!("488d0d${'} 33d2 ff50") => None,
     },
     input_system => {
         "dwInputSystem" => pattern!("488905${'} 33c0") => None,
+    },
+    tier0 => {
+        "dwCVar" => pattern!("488d05${'} c3 cccccccccccccccc e9") => None,
     },
     matchmaking => {
         "dwGameTypes" => pattern!("488d0d${'} ff90") => None,
@@ -126,26 +143,56 @@ pattern_map! {
     },
 }
 
+/// First extra RIP-relative store using the ViewRender idiom, if unique.
+fn second_store_global(view: &PeView<'_>, view_render: Rva) -> Option<Rva> {
+    let pat = pattern!("488905${'} 488bc8 4885c0");
+    let mut save = vec![0; save_len(pat)];
+    let mut others = Vec::new();
+    let mut iter = view.scanner().matches_code(pat);
+    while iter.next(&mut save) {
+        if save[1] != view_render {
+            others.push(save[1]);
+        }
+    }
+    match others.as_slice() {
+        [only] => Some(*only),
+        _ => {
+            if others.len() > 1 {
+                debug!(
+                    "dwVPhys2World skipped: {} extra hits of the ViewRender store idiom",
+                    others.len()
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Unique extra hit of a repeated pattern, excluding `first`. Used so
+/// dwVPhys2World is not silently aliased to dwViewRender.
+pub fn unique_extra_hit(first: u32, hits: &[u32]) -> Option<u32> {
+    let others: Vec<u32> = hits.iter().copied().filter(|&hit| hit != first).collect();
+    match others.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
 pub fn offsets<P: Process + MemoryView>(process: &mut P) -> Result<OffsetMap> {
     let mut map = BTreeMap::new();
 
-    let modules: [(&str, fn(PeView) -> BTreeMap<String, u32>); 5] = [
+    let modules: [(&str, fn(PeView) -> BTreeMap<String, u32>); 6] = [
         ("client.dll", client::offsets),
         ("engine2.dll", engine2::offsets),
         ("inputsystem.dll", input_system::offsets),
         ("matchmaking.dll", matchmaking::offsets),
         ("soundsystem.dll", soundsystem::offsets),
+        ("tier0.dll", tier0::offsets),
     ];
 
     for (module_name, offsets) in &modules {
-        let module = process.module_by_name(module_name)?;
-
-        let buf = process
-            .read_raw(module.base, module.size as _)
-            .data_part()?;
-
+        let (_base, buf) = crate::analysis::module_data::read_pe_image(process, module_name)?;
         let view = PeView::from_bytes(&buf)?;
-
         map.insert(module_name.to_string(), offsets(view));
     }
 
@@ -164,6 +211,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a running cs2.exe and freshly generated output"]
     fn build_number() -> Result<()> {
         let mut process = setup()?;
 
@@ -179,6 +227,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a running cs2.exe and freshly generated output"]
     fn global_vars() -> Result<()> {
         let mut process = setup()?;
 
@@ -200,6 +249,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a running cs2.exe and freshly generated output"]
     fn local_controller() -> Result<()> {
         let mut process = setup()?;
 
@@ -224,6 +274,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a running cs2.exe and freshly generated output"]
     fn local_pawn() -> Result<()> {
         #[derive(Pod)]
         #[repr(C)]
@@ -266,6 +317,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a running cs2.exe and freshly generated output"]
     fn window_size() -> Result<()> {
         let mut process = setup()?;
 
@@ -285,6 +337,14 @@ mod tests {
         debug!("window size: {}x{}", window_width, window_height);
 
         Ok(())
+    }
+
+    #[test]
+    fn vphys2_world_is_only_bound_when_the_store_idiom_has_one_extra_hit() {
+        assert_eq!(unique_extra_hit(0x1000, &[0x1000]), None);
+        assert_eq!(unique_extra_hit(0x1000, &[0x1000, 0x2000]), Some(0x2000));
+        assert_eq!(unique_extra_hit(0x1000, &[0x1000, 0x2000, 0x3000]), None);
+        assert_eq!(unique_extra_hit(0x1000, &[0x2000, 0x1000]), Some(0x2000));
     }
 
     fn setup() -> Result<IntoProcessInstanceArcBox<'static>> {

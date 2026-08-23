@@ -1,7 +1,9 @@
 pub use buttons::*;
 pub use interfaces::*;
 pub use offsets::*;
+pub use protobufs::*;
 pub use schemas::*;
+pub use vtables::*;
 
 use std::any::type_name;
 
@@ -12,9 +14,26 @@ use log::{error, info};
 use memflow::prelude::v1::*;
 
 mod buttons;
+pub mod convars;
+pub mod dyn_offsets;
+pub mod entities;
+pub mod entity_anchor;
+pub mod entity_list;
+pub mod gameevents;
+pub mod global_anchor;
 mod interfaces;
+pub mod manual_iface;
+pub mod module_data;
 mod offsets;
+mod protobufs;
+pub mod rtti;
+pub mod schema_anchor;
+pub mod schema_flags;
 mod schemas;
+pub mod static_fields;
+pub mod view_matrix;
+mod vtables;
+pub mod weapons;
 
 #[derive(Debug)]
 pub struct AnalysisResult {
@@ -22,6 +41,7 @@ pub struct AnalysisResult {
     pub interfaces: InterfaceMap,
     pub offsets: OffsetMap,
     pub schemas: SchemaMap,
+    pub vtables: VTableMap,
 }
 
 pub fn analyze_all<P: Process + MemoryView>(process: &mut P) -> Result<AnalysisResult> {
@@ -67,11 +87,19 @@ pub fn analyze_all<P: Process + MemoryView>(process: &mut P) -> Result<AnalysisR
         schemas.len()
     );
 
+    let vtables = match vtables::vtables(process, &interfaces) {
+        Ok(value) => value,
+        Err(err) => {
+            error!("failed to read interface vtables: {}", err);
+            VTableMap::default()
+        }
+    };
     Ok(AnalysisResult {
         buttons,
         interfaces,
         offsets,
         schemas,
+        vtables,
     })
 }
 

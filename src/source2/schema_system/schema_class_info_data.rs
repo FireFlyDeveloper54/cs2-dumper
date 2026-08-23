@@ -26,5 +26,8 @@ pub struct SchemaClassInfoData {
     pub static_metadata: Pointer64<[SchemaMetadataEntryData]>, // 0x0048
     pub type_scope: Pointer64<SchemaSystemTypeScope>,          // 0x0058
     pub r#type: Pointer64<SchemaType>,                         // 0x0060
-    pad_2: [u8; 0x10],                                         // 0x0068
+    /// SCHEMA_CF1_* bits (Has VTable, abstract, construct allowed, …).
+    pub class_flags: u32,                                      // 0x0068
+    pub flags2: u32,                                           // 0x006C
+    pub manipulator: Pointer64<u8>,                            // 0x0070
 }

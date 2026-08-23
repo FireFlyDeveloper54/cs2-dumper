@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub use client::*;
 pub use schema_system::*;
 pub use tier0::*;

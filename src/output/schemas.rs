@@ -22,7 +22,7 @@ impl CodeWriter for SchemaMap {
                     false,
                     |fmt| {
                         for enum_ in enums {
-                            let type_name = match enum_.alignment {
+                            let type_name = match enum_.storage_bytes() {
                                 1 => "byte",
                                 2 => "ushort",
                                 4 => "uint",
@@ -31,7 +31,7 @@ impl CodeWriter for SchemaMap {
                             };
 
                             writeln!(fmt, "// Alignment: {}", enum_.alignment)?;
-                            writeln!(fmt, "// Member count: {}", enum_.size)?;
+                            writeln!(fmt, "// Member count: {}", enum_.members.len())?;
 
                             fmt.block(
                                 &format!("public enum {} : {}", slugify(&enum_.name), type_name),
@@ -116,7 +116,7 @@ impl CodeWriter for SchemaMap {
                         false,
                         |fmt| {
                             for enum_ in enums {
-                                let type_name = match enum_.alignment {
+                                let type_name = match enum_.storage_bytes() {
                                     1 => "uint8_t",
                                     2 => "uint16_t",
                                     4 => "uint32_t",
@@ -125,7 +125,7 @@ impl CodeWriter for SchemaMap {
                                 };
 
                                 writeln!(fmt, "// Alignment: {}", enum_.alignment)?;
-                                writeln!(fmt, "// Member count: {}", enum_.size)?;
+                                writeln!(fmt, "// Member count: {}", enum_.members.len())?;
 
                                 fmt.block(
                                     &format!("enum class {} : {}", slugify(&enum_.name), type_name),
@@ -233,14 +233,34 @@ impl CodeWriter for SchemaMap {
                             })
                             .collect();
 
-                        (
-                            slugify(&class.name),
-                            json!({
-                                "parent": class.parent_name,
-                                "fields": fields,
-                                "metadata": metadata
-                            }),
-                        )
+                        let mut value = json!({
+                            "parent": class.parent_name,
+                            "fields": fields,
+                            "metadata": metadata
+                        });
+
+                        // Only present when the static-field geometry validated
+                        // against the live process, so a dump from a build this
+                        // dumper cannot read stays byte-identical to before.
+                        if !class.static_fields.is_empty() {
+                            let statics: Vec<_> = class
+                                .static_fields
+                                .iter()
+                                .map(|field| {
+                                    json!({
+                                        "name": field.name,
+                                        "type_name": field.type_name,
+                                        "index": field.index,
+                                    })
+                                })
+                                .collect();
+                            value["static_fields"] = json!(statics);
+                        }
+                        if !class.flags.is_empty() {
+                            value["flags"] = json!(class.flags);
+                        }
+
+                        (slugify(&class.name), value)
                     })
                     .collect();
 
@@ -253,7 +273,7 @@ impl CodeWriter for SchemaMap {
                             .map(|member| (&member.name, member.value))
                             .collect();
 
-                        let type_name = match enum_.alignment {
+                        let type_name = match enum_.storage_bytes() {
                             1 => "uint8",
                             2 => "uint16",
                             4 => "uint32",
@@ -264,6 +284,7 @@ impl CodeWriter for SchemaMap {
                         (
                             slugify(&enum_.name),
                             json!({
+                                "size": enum_.size,
                                 "alignment": enum_.alignment,
                                 "type": type_name,
                                 "members": members,
@@ -303,7 +324,7 @@ impl CodeWriter for SchemaMap {
                         false,
                         |fmt| {
                             for enum_ in enums {
-                                let type_name = match enum_.alignment {
+                                let type_name = match enum_.storage_bytes() {
                                     1 => "u8",
                                     2 => "u16",
                                     4 => "u32",
@@ -312,7 +333,7 @@ impl CodeWriter for SchemaMap {
                                 };
 
                                 writeln!(fmt, "// Alignment: {}", enum_.alignment)?;
-                                writeln!(fmt, "// Member count: {}", enum_.size)?;
+                                writeln!(fmt, "// Member count: {}", enum_.members.len())?;
 
                                 fmt.block(
                                     &format!(
@@ -406,7 +427,7 @@ impl CodeWriter for SchemaMap {
                         true,
                         |fmt| {
                             for enum_ in enums {
-                                let type_name = match enum_.alignment {
+                                let type_name = match enum_.storage_bytes() {
                                     1 => "u8",
                                     2 => "u16",
                                     4 => "u32",
@@ -415,7 +436,7 @@ impl CodeWriter for SchemaMap {
                                 };
 
                                 writeln!(fmt, "// Alignment: {}", enum_.alignment)?;
-                                writeln!(fmt, "// Member count: {}", enum_.size)?;
+                                writeln!(fmt, "// Member count: {}", enum_.members.len())?;
 
                                 let enum_name = zig_ident(&slugify(&enum_.name));
 
@@ -536,4 +557,125 @@ fn format_zig_enum_member_value(value: i64, type_name: &str) -> String {
     };
 
     format!("{:#X}", wrapped_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::static_fields::StaticField;
+    use crate::analysis::{Class, ClassField};
+
+    fn render_json(schemas: &SchemaMap) -> serde_json::Value {
+        let mut out = String::new();
+        let mut fmt = Formatter::new(&mut out, 4);
+        schemas.write_json(&mut fmt).expect("json render");
+        serde_json::from_str(&out).expect("the writer must emit valid json")
+    }
+
+    fn schemas(static_fields: Vec<StaticField>) -> SchemaMap {
+        SchemaMap::from([(
+            "client.dll".to_string(),
+            (
+                vec![Class {
+                    name: "C_BaseEntity".to_string(),
+                    module_name: "client.dll".to_string(),
+                    parent_name: None,
+                    size: 0x100,
+                    alignment: 8,
+                    metadata: Vec::new(),
+                    fields: vec![ClassField {
+                        name: "m_iHealth".to_string(),
+                        type_name: "int32".to_string(),
+                        offset: 0x338,
+                        metadata: Vec::new(),
+                    }],
+                    static_fields,
+                    flags: Vec::new(),
+                }],
+                Vec::new(),
+            ),
+        )])
+    }
+
+    fn rendered_class(schemas: &SchemaMap) -> serde_json::Value {
+        render_json(schemas)["client.dll"]["classes"]["C_BaseEntity"].clone()
+    }
+
+    /// A build whose static-field geometry does not validate must produce the
+    /// exact object shape this dumper emitted before static fields existed.
+    #[test]
+    fn a_class_without_static_fields_renders_exactly_as_before() {
+        let class = rendered_class(&schemas(Vec::new()));
+        let keys: Vec<_> = class
+            .as_object()
+            .expect("class object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, vec!["fields", "metadata", "parent"]);
+        assert_eq!(class["fields"]["m_iHealth"], 0x338);
+    }
+
+    #[test]
+    fn validated_static_fields_are_emitted_in_declaration_order() {
+        let class = rendered_class(&schemas(vec![
+            StaticField {
+                name: "m_bIsDefault".to_string(),
+                type_name: "bool".to_string(),
+                index: 0,
+            },
+            StaticField {
+                name: "sm_pInstance".to_string(),
+                type_name: "CGameRules*".to_string(),
+                index: 1,
+            },
+        ]));
+
+        let statics = class["static_fields"]
+            .as_array()
+            .expect("static_fields array");
+        assert_eq!(statics.len(), 2);
+        assert_eq!(statics[0]["name"], "m_bIsDefault");
+        assert_eq!(statics[0]["type_name"], "bool");
+        assert_eq!(statics[0]["index"], 0);
+        assert_eq!(statics[1]["name"], "sm_pInstance");
+        assert_eq!(statics[1]["type_name"], "CGameRules*");
+        assert_eq!(statics[1]["index"], 1);
+
+        // The pre-existing keys keep their meaning alongside the new one.
+        assert_eq!(class["fields"]["m_iHealth"], 0x338);
+    }
+
+    /// The non-JSON writers are consumed as generated source; adding a section
+    /// to them would change every downstream file, so they must stay untouched.
+    #[test]
+    fn static_fields_do_not_leak_into_the_generated_source_writers() {
+        let populated = schemas(vec![StaticField {
+            name: "sm_pInstance".to_string(),
+            type_name: "CGameRules*".to_string(),
+            index: 0,
+        }]);
+        let bare = schemas(Vec::new());
+
+        for file_type in ["cs", "hpp", "rs", "zig"] {
+            let render = |schemas: &SchemaMap| {
+                let mut out = String::new();
+                let mut fmt = Formatter::new(&mut out, 4);
+                match file_type {
+                    "cs" => schemas.write_cs(&mut fmt),
+                    "hpp" => schemas.write_hpp(&mut fmt),
+                    "rs" => schemas.write_rs(&mut fmt),
+                    "zig" => schemas.write_zig(&mut fmt),
+                    _ => unreachable!(),
+                }
+                .expect("render");
+                out
+            };
+            assert_eq!(
+                render(&populated),
+                render(&bare),
+                "{file_type} output changed once static fields were present"
+            );
+        }
+    }
 }

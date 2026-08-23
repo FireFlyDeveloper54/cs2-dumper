@@ -59,14 +59,21 @@ impl<D: Pod, const C: usize, K: Pod> UtlTsHash<D, C, K> {
     }
 
     fn allocated_elements(&self, mem: &mut impl MemoryView) -> Vec<Pointer64<D>> {
-        let used_count = self.entry_mem.blocks_allocated as usize;
+        let used_count = bounded_count(self.entry_mem.blocks_allocated);
+        if used_count == 0 {
+            return Vec::new();
+        }
 
         let mut elements = Vec::with_capacity(used_count);
+        let mut seen_nodes = HashSet::new();
 
         for bucket in &self.buckets {
             let mut node_ptr = bucket.first_uncommitted;
 
             while !node_ptr.is_null() {
+                if !seen_nodes.insert(node_ptr.address().to_umem()) {
+                    break;
+                }
                 let node = match mem.read_ptr(node_ptr).data_part() {
                     Ok(n) => n,
                     Err(_) => break,
@@ -88,15 +95,22 @@ impl<D: Pod, const C: usize, K: Pod> UtlTsHash<D, C, K> {
     }
 
     fn unallocated_elements(&self, mem: &mut impl MemoryView) -> Vec<Pointer64<D>> {
-        let free_count = self.entry_mem.peak_allocated as usize;
+        let free_count = bounded_count(self.entry_mem.peak_allocated);
+        if free_count == 0 {
+            return Vec::new();
+        }
 
         let mut elements = Vec::with_capacity(free_count);
+        let mut seen_nodes = HashSet::new();
 
         let mut blob_ptr = Pointer64::<UtlTsHashAllocatedBlob<D>>::from(
             self.entry_mem.free_blocks.head.next.address(),
         );
 
         while !blob_ptr.is_null() {
+            if !seen_nodes.insert(blob_ptr.address().to_umem()) {
+                break;
+            }
             let blob = match mem.read_ptr(blob_ptr).data_part() {
                 Ok(b) => b,
                 Err(_) => break,
@@ -117,4 +131,23 @@ impl<D: Pod, const C: usize, K: Pod> UtlTsHash<D, C, K> {
     }
 }
 
+const MAX_HASH_ELEMENTS: usize = 1_000_000;
+
+fn bounded_count(value: i32) -> usize {
+    usize::try_from(value).unwrap_or(0).min(MAX_HASH_ELEMENTS)
+}
+
 unsafe impl<D: 'static, const C: usize, K: 'static> Pod for UtlTsHash<D, C, K> {}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_HASH_ELEMENTS, bounded_count};
+
+    #[test]
+    fn bounds_remote_hash_counts() {
+        assert_eq!(bounded_count(-1), 0);
+        assert_eq!(bounded_count(0), 0);
+        assert_eq!(bounded_count(42), 42);
+        assert_eq!(bounded_count(i32::MAX), MAX_HASH_ELEMENTS);
+    }
+}

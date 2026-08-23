@@ -9,7 +9,7 @@ pub struct UtlVector<T> {
 
 impl<T: Pod> UtlVector<T> {
     pub fn element(&self, mem: &mut impl MemoryView, index: usize) -> Result<T> {
-        if index >= self.count as usize {
+        if self.count < 0 || index >= self.count as usize {
             return Err(ErrorKind::OutOfBounds.into());
         }
 

@@ -1,5 +1,4 @@
 pub use interface::*;
-pub use utl_memory::*;
 pub use utl_memory_pool::*;
 pub use utl_ts_hash::*;
 pub use utl_vector::*;

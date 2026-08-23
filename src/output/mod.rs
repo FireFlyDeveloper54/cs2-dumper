@@ -2,7 +2,7 @@ use std::fmt::{self, Write};
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 use chrono::{DateTime, Utc};
 
@@ -14,12 +14,32 @@ use formatter::Formatter;
 
 use crate::analysis::*;
 
+pub mod amalgamation;
 mod buttons;
+pub mod convars;
+pub mod engine_structs;
+pub mod entities;
+pub mod entity_system;
 mod formatter;
+pub mod gameevents;
+pub mod guessed_structs;
+pub mod ident;
+pub mod include_tree;
+pub mod interface_classes;
+pub mod interface_diff;
 mod interfaces;
+pub mod netvars;
 mod offsets;
+pub mod pattern_diff;
+pub mod protobufs;
+pub mod schema_diff;
+pub mod schema_index;
 mod schemas;
 mod sdk;
+pub mod sdk_classes;
+pub mod verified;
+pub mod vtables;
+pub mod weapons;
 
 enum Item<'a> {
     Buttons(&'a ButtonMap),
@@ -101,6 +121,7 @@ pub struct Output<'a> {
     indent_size: usize,
     out_dir: &'a Path,
     result: &'a AnalysisResult,
+    build_number: Option<u32>,
     timestamp: DateTime<Utc>,
 }
 
@@ -110,6 +131,7 @@ impl<'a> Output<'a> {
         indent_size: usize,
         out_dir: &'a Path,
         result: &'a AnalysisResult,
+        build_number: Option<u32>,
     ) -> Result<Self> {
         fs::create_dir_all(&out_dir)?;
 
@@ -118,6 +140,7 @@ impl<'a> Output<'a> {
             indent_size,
             out_dir,
             result,
+            build_number,
             timestamp: Utc::now(),
         })
     }
@@ -134,26 +157,87 @@ impl<'a> Output<'a> {
         }
 
         self.dump_schemas()?;
-        sdk::dump_sdk(self.out_dir, &self.result.schemas)?;
+        sdk::dump_sdk(self.out_dir, &self.result.schemas, self.build_number)?;
         self.dump_info(process)?;
 
         Ok(())
     }
 
+    pub fn dump_manifest(&self) -> Result<()> {
+        let class_count: usize = self
+            .result
+            .schemas
+            .values()
+            .map(|(classes, _)| classes.len())
+            .sum();
+        let enum_count: usize = self
+            .result
+            .schemas
+            .values()
+            .map(|(_, enums)| enums.len())
+            .sum();
+
+        let exists = |relative: &str| self.out_dir.join(relative).exists();
+        let content = serde_json::to_string_pretty(&json!({
+            "generated_at": self.timestamp.to_rfc3339(),
+            "modules": self.result.schemas.len(),
+            "classes": class_count,
+            "enums": enum_count,
+            "outputs": {
+                "buttons": exists("buttons.hpp") || exists("buttons.json"),
+                "offsets": exists("offsets.hpp"),
+                "interfaces": exists("interfaces.hpp") || exists("interfaces/interfaces.hpp"),
+                "schemas": exists("client_dll.hpp"),
+                "sdk": exists("sdk/sdk.hpp"),
+                "schema_index": exists("schema_index.json"),
+                "schema_index_diff": exists("schema_index.diff.json"),
+                "interface_diff": exists("interfaces.diff.json"),
+                "sdk_modules": exists("sdk/modules.hpp"),
+                "sdk_class_headers": exists("sdk/classes"),
+                "patterns": exists("patterns.json"),
+                "pattern_headers": exists("patterns.hpp"),
+                "pattern_markdown": exists("patterns.md"),
+                "pattern_language_outputs": exists("patterns.cs") || exists("patterns.rs") || exists("patterns.zig"),
+                "pattern_diff": exists("patterns.diff.json"),
+                "pattern_repair": exists("patterns.repair.json"),
+                "pattern_repair_patch": exists("patterns.repair.patch.json"),
+                "pattern_summary": exists("patterns.json"),
+                "netvars": exists("netvars/netvars.json"),
+                "convars": exists("convars/convars.json"),
+                "gameevents": exists("gameevents/gameevents.json"),
+                "vtables": exists("vtables.json"),
+                "vtable_headers": exists("vtables.hpp"),
+                "typed_interfaces": exists("interfaces/interfaces.hpp"),
+                "protobufs": exists("protobufs/protobufs.json"),
+                "entity_snapshot": exists("entities/entities.json"),
+                "weapon_vdata": exists("weapons/weapons.json"),
+                "include_tree": exists("macros.hpp") && exists("cs2.hpp"),
+                "schema_headers": exists("schemas"),
+                "engine_structs": exists("engine/engine_structs.json"),
+                "verified_features": exists("verified_features.json"),
+                "impl_entity_system": exists("impl/entity_system.hpp"),
+                "schema_inventory": exists("schemas/info.txt"),
+                "guessed_structs": exists("structs.hpp"),
+            },
+        }))?;
+
+        fs::write(self.out_dir.join("manifest.json"), content)?;
+        Ok(())
+    }
     fn dump_info<P: MemoryView + Process>(&self, process: &mut P) -> Result<()> {
         let file_path = self.out_dir.join("info.json");
 
-        let build_number = self
-            .result
-            .offsets
-            .iter()
-            .find_map(|(module_name, offsets)| {
-                let module = process.module_by_name(module_name).ok()?;
-                let offset = offsets.iter().find(|(name, _)| *name == "dwBuildNumber")?.1;
+        let build_number = self.build_number.or_else(|| {
+            self.result
+                .offsets
+                .iter()
+                .find_map(|(module_name, offsets)| {
+                    let module = process.module_by_name(module_name).ok()?;
+                    let offset = offsets.iter().find(|(name, _)| *name == "dwBuildNumber")?.1;
 
-                process.read::<u32>(module.base + offset).data_part().ok()
-            })
-            .ok_or(anyhow!("failed to read build number"))?;
+                    process.read::<u32>(module.base + offset).data_part().ok()
+                })
+        });
 
         let content = serde_json::to_string_pretty(&json!({
             "timestamp": self.timestamp.to_rfc3339(),

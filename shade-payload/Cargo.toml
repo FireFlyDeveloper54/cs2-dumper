@@ -1,0 +1,9 @@
+[package]
+name = "cs2-dumper-shade"
+version = "0.2.0"
+edition = "2021"
+description = "Optional in-process InstallSchemaBindings payload injected by cs2-dumper -c shade"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
