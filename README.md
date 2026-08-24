@@ -290,7 +290,6 @@ cargo test -- --ignored --nocapture
 | [bt629414/cs2-best-dumper](https://github.com/bt629414/cs2-best-dumper) | 额外 `dwCreateMove` / `dwParticleManager` / `dwClientMode` / `dwPVSManager` / `dwVPhys2World`、磁盘 PE 回退、可选 syscall RPM（`-c syscall`）、`--guess-structs` |
 | [arisuwine/shade-dumper](https://github.com/arisuwine/shade-dumper) | 完整 `SCHEMA_CF1_*` / `SCHEMA_EF_*` 标签、vtable slot dump、可选注入后调用 `InstallSchemaBindings`（`-c shade`） |
 | [xsip/cs2-schema-dumper-no-process](https://github.com/xsip/cs2-schema-dumper-no-process) | 游戏没开时：找 Steam 安装、对本进程 `LoadLibrary` schema DLL 再 dump |
-| [dr-NHA/Source2-Schema-System-Dumper-CE](https://github.com/dr-NHA/Source2-Schema-System-Dumper-CE) | Cheat Engine 表当对照：button / cvar 布局 |
 
 ### Libraries and related Source 2 tools
 
