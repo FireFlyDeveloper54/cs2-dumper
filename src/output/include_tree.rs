@@ -393,7 +393,14 @@ fn emit_auto_forward_decls(
         let _ = writeln!(macros, "class {};", t);
     }
     for (ns, names) in &qual {
-        let _ = write!(macros, "namespace {} {{ ", ns);
+        // `ns` can be more than one segment deep (`A::B` for a mention of
+        // `A::B::C`), so open each one. Nested braces rather than the C++17
+        // `namespace A::B` spelling, to match the standard the rest of the
+        // generated headers are written against.
+        let segments: Vec<&str> = ns.split("::").filter(|s| !s.is_empty()).collect();
+        for segment in &segments {
+            let _ = write!(macros, "namespace {} {{ ", segment);
+        }
         for (name, is_t) in names {
             if *is_t {
                 let _ = write!(macros, "template <class...> class {}; ", name);
@@ -401,7 +408,10 @@ fn emit_auto_forward_decls(
                 let _ = write!(macros, "class {}; ", name);
             }
         }
-        macros.push_str("}\n");
+        for _ in 0..segments.len() {
+            macros.push_str("} ");
+        }
+        macros.push('\n');
     }
     macros.push('\n');
 }
@@ -439,8 +449,13 @@ fn extract_type_idents<'a>(
             let is_t = j < arg.len() && bytes[j] as char == '<';
 
             if let Some((ns, name)) = tok.rsplit_once("::") {
-                let ns = ns.split("::").next().unwrap_or(ns);
-                if !is_builtin_type(ns) && !module_ns_set.contains(ns) && !is_defined(name) {
+                // Key on the whole qualifier. Keeping only its first segment
+                // declared `A::C` for a mention of `A::B::C`: the type that
+                // actually needed declaring stayed undeclared, and the invented
+                // name clashes with whatever `A::C` really is — a redeclaration
+                // error when macros_base.hpp already has it as an enum.
+                let root = ns.split("::").next().unwrap_or(ns);
+                if !is_builtin_type(root) && !module_ns_set.contains(root) && !is_defined(name) {
                     let e = qual.entry(ns).or_default();
                     let v = e.entry(name).or_insert(false);
                     *v = *v || is_t;
@@ -477,9 +492,43 @@ pub fn live_csgo_input_rva(offsets: &OffsetMap, pattern_rva: Option<u64>) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_defined, live_csgo_input_rva};
+    use super::{collect_defined, extract_type_idents, live_csgo_input_rva};
     use crate::analysis::{AnalysisResult, OffsetMap};
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// A multi-level qualified name used to be recorded under only the first
+    /// segment, so `A::B::C` produced `namespace A { class C; }` — the type that
+    /// needed declaring stayed undeclared, and `A::C` was invented out of thin
+    /// air (a redeclaration error whenever `A::C` already exists as something
+    /// else).
+    #[test]
+    fn a_multi_level_qualified_name_keeps_its_whole_qualifier() {
+        let mut plain = BTreeSet::new();
+        let mut templated = BTreeSet::new();
+        let mut qual: BTreeMap<&str, BTreeMap<&str, bool>> = BTreeMap::new();
+        let module_ns_set = BTreeSet::new();
+
+        extract_type_idents(
+            "A::B::C",
+            |_| false,
+            &module_ns_set,
+            &mut plain,
+            &mut templated,
+            &mut qual,
+        );
+
+        assert!(
+            qual.contains_key("A::B"),
+            "the qualifier must be kept whole, got {:?}",
+            qual.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(qual["A::B"].keys().collect::<Vec<_>>(), vec![&"C"]);
+        assert!(
+            !qual.contains_key("A"),
+            "no bare `A::C` may be invented, got {:?}",
+            qual.keys().collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn prefers_canonical_dw_csgo_input() {

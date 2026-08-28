@@ -21,7 +21,7 @@ use std::fmt::Write;
 
 use crate::analysis::InterfaceMap;
 
-use super::ident::{cpp_identifier, sanitize_ident, type_ident};
+use super::ident::{cpp_identifier, sanitize_ident, type_ident, IdentifierAllocator};
 use super::comment_text;
 
 pub struct Method<'a> {
@@ -122,7 +122,10 @@ pub fn render_hpp(
     let mut sorted: Vec<&IfaceClass<'_>> = classes.iter().collect();
     sorted.sort_by(|a, b| (a.module, a.iface_name).cmp(&(b.module, b.iface_name)));
 
-    let mut grouped: BTreeMap<&str, BTreeMap<String, (&IfaceClass<'_>, Vec<&str>)>> =
+    // Group by RTTI class so one struct describes one vtable shape, but keep
+    // every interface's own singleton RVA: sharing an RTTI class does not mean
+    // sharing an instance, and the analysis pass resolves the RVA per interface.
+    let mut grouped: BTreeMap<&str, BTreeMap<String, (&IfaceClass<'_>, Vec<(&str, Option<u64>)>)>> =
         BTreeMap::new();
     for c in &sorted {
         let entry = grouped
@@ -131,7 +134,7 @@ pub fn render_hpp(
             .entry(class_ns(c))
             .or_insert_with(|| (*c, Vec::new()));
         if !c.manual {
-            entry.1.push(c.iface_name);
+            entry.1.push((c.iface_name, c.instance_rva));
         }
     }
 
@@ -140,7 +143,11 @@ pub fn render_hpp(
         let mns = module_ns(module);
         writeln!(s, "    namespace {} {{", mns).ok();
         for (cns, (rep, ifaces)) in ns_map {
-            let joined_ifaces = ifaces.join(", ");
+            let joined_ifaces = ifaces
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ");
             let iface_list = comment_text(&joined_ifaces);
             writeln!(
                 s,
@@ -152,8 +159,16 @@ pub fn render_hpp(
             .ok();
             writeln!(s, "        struct {} {{", cns).ok();
 
+            // Two slots can recover the same symbol, and a recovered name can
+            // collide with another slot's `method_<n>` fallback. Either one
+            // declared the same member twice and the struct stopped compiling,
+            // so slot identifiers are allocated — the same thing `vtables.rs`
+            // does with `intern_unique_ident` for this data.
+            let mut method_names = IdentifierAllocator::default();
+            let mut curated_slots: Vec<(usize, String)> = Vec::new();
             for m in &rep.methods {
                 if let Some(cur) = curated(module, cns, m.index) {
+                    let name = method_names.allocate(cur.name.to_string());
                     let params = cur
                         .params
                         .iter()
@@ -164,24 +179,26 @@ pub fn render_hpp(
                     writeln!(
                         s,
                         "            virtual {} {}({}) = 0; // slot {}",
-                        cur.ret, cur.name, params, m.index
+                        cur.ret, name, params, m.index
                     )
                     .ok();
+                    curated_slots.push((m.index, name));
                 } else if let Some(name) = m.name {
                     // Slot identified via Pattern-RVA cross-reference; args unknown.
-                    writeln!(s, "            virtual void {}() = 0; // slot {} (name recovered, args unverified)", cpp_identifier(name), m.index).ok();
+                    let name = method_names.allocate(cpp_identifier(name));
+                    writeln!(s, "            virtual void {}() = 0; // slot {} (name recovered, args unverified)", name, m.index).ok();
                 } else {
-                    writeln!(s, "            virtual void method_{}() = 0;", m.index).ok();
+                    let name = method_names.allocate(format!("method_{}", m.index));
+                    writeln!(s, "            virtual void {}() = 0;", name).ok();
                 }
             }
-            for m in &rep.methods {
-                if let Some(cur) = curated(module, cns, m.index) {
-                    writeln!(
-                        s,
-                        "            void* p{}() {{ return (*reinterpret_cast<void***>(this))[{}]; }}",
-                        cur.name, m.index
-                    ).ok();
-                }
+            for (index, name) in &curated_slots {
+                writeln!(
+                    s,
+                    "            void* p{}() {{ return (*reinterpret_cast<void***>(this))[{}]; }}",
+                    name, index
+                )
+                .ok();
             }
             writeln!(s, "        }};").ok();
         }
@@ -197,13 +214,16 @@ pub fn render_hpp(
         let mns = module_ns(module);
         writeln!(s, "    namespace {} {{", mns).ok();
         for (cns, (rep, ifaces)) in ns_map {
-            let Some(rva) = rep.instance_rva else {
-                continue;
-            };
             let class_name = cns;
-            let fallback = [rep.iface_name];
-            let names: &[&str] = if ifaces.is_empty() { &fallback } else { ifaces };
-            for iface in names {
+            let fallback = [(rep.iface_name, rep.instance_rva)];
+            let names: &[(&str, Option<u64>)] = if ifaces.is_empty() { &fallback } else { ifaces };
+            for (iface, instance_rva) in names {
+                // One interface without a resolved singleton must not take the
+                // rest of its RTTI group with it, and must not borrow another
+                // interface's address either.
+                let Some(rva) = instance_rva else {
+                    continue;
+                };
                 writeln!(
                     s,
                     "        inline {}* get_{}(std::uintptr_t module_base) noexcept {{ return reinterpret_cast<{}*>(module_base + 0x{:X}); }}",
@@ -261,5 +281,96 @@ mod tests {
         assert_eq!(ns.as_ref(), "client");
         assert!(matches!(ns, Cow::Borrowed(_)));
         assert!(std::ptr::eq(ns.as_ref().as_ptr(), module.as_ptr()));
+    }
+
+    /// Interfaces sharing an RTTI class each resolve their own singleton, so each
+    /// accessor has to use its own RVA. They used to all report the first one's.
+    #[test]
+    fn each_interface_accessor_uses_its_own_instance_rva() {
+        let interfaces = InterfaceMap::new();
+        let shared = |iface: &'static str, rva: Option<u64>| IfaceClass {
+            module: "engine2.dll",
+            iface_name: iface,
+            instance_rva: rva,
+            rtti_class: Some(Cow::Borrowed("CEngineShared")),
+            methods: vec![Method {
+                index: 0,
+                name: None,
+            }],
+            manual: false,
+        };
+        let classes = vec![
+            shared("SharedOne001", Some(0x1000)),
+            shared("SharedTwo001", Some(0x2000)),
+        ];
+        let output = render_hpp(&interfaces, &classes, None);
+        assert!(
+            output.contains("get_SharedOne001(std::uintptr_t module_base) noexcept { return reinterpret_cast<CEngineShared*>(module_base + 0x1000)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("get_SharedTwo001(std::uintptr_t module_base) noexcept { return reinterpret_cast<CEngineShared*>(module_base + 0x2000)"),
+            "{output}"
+        );
+    }
+
+    /// A group whose first interface has no resolved singleton must not take the
+    /// rest of the group down with it.
+    #[test]
+    fn an_unresolved_first_interface_does_not_hide_its_siblings() {
+        let interfaces = InterfaceMap::new();
+        let shared = |iface: &'static str, rva: Option<u64>| IfaceClass {
+            module: "engine2.dll",
+            iface_name: iface,
+            instance_rva: rva,
+            rtti_class: Some(Cow::Borrowed("CEngineShared")),
+            methods: Vec::new(),
+            manual: false,
+        };
+        // Sorted by iface name, so "AAA" is the group representative.
+        let classes = vec![
+            shared("AAAUnresolved001", None),
+            shared("ZZZResolved001", Some(0x3000)),
+        ];
+        let output = render_hpp(&interfaces, &classes, None);
+        assert!(
+            output.contains("get_ZZZResolved001"),
+            "the resolved sibling lost its accessor: {output}"
+        );
+        assert!(
+            !output.contains("get_AAAUnresolved001"),
+            "an unresolved interface must not get a bogus accessor: {output}"
+        );
+    }
+
+    /// Two slots recovering the same symbol used to declare the same member
+    /// twice, which does not compile.
+    #[test]
+    fn slots_recovering_the_same_name_are_disambiguated() {
+        let interfaces = InterfaceMap::new();
+        let classes = vec![IfaceClass {
+            module: "client.dll",
+            iface_name: "Client001",
+            instance_rva: Some(0x10),
+            rtti_class: Some(Cow::Borrowed("CClient")),
+            methods: vec![
+                Method {
+                    index: 0,
+                    name: Some("Frame"),
+                },
+                Method {
+                    index: 1,
+                    name: Some("Frame"),
+                },
+            ],
+            manual: false,
+        }];
+        let output = render_hpp(&interfaces, &classes, None);
+        assert_eq!(
+            output.matches("virtual void Frame() = 0").count(),
+            1,
+            "the duplicate must be renamed, not declared twice: {output}"
+        );
+        assert!(output.contains("virtual void Frame_2() = 0"), "{output}");
     }
 }

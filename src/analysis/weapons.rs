@@ -14,7 +14,7 @@
 //! captured (held/dropped weapons + view models). Running the dump inside a
 //! match / deathmatch / practice-with-bots maximises coverage.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
 use memflow::prelude::v1::*;
@@ -85,21 +85,25 @@ pub fn walk<P: MemoryView>(
     }
 
     let layout = entity_list::detect_layout(process, list);
-    let mut seen_names = BTreeSet::new();
+    // Every `weapon_*` entity, not just the first of each name. The lowest entity
+    // index may be a view model or one that is still spawning, whose vdata
+    // pointer is not written yet — de-duplicating before validating dropped the
+    // weapon outright instead of falling through to the next instance. It also
+    // gave `select_vdata_offset` one vote per weapon name rather than one per
+    // entity, weakening the consensus it is there to build.
     let entities: Vec<(String, u64)> = entity_list::live_entities(process, list, layout)
         .into_iter()
-        .filter_map(|entity| {
-            if entity.classname.starts_with("weapon_") && seen_names.insert(entity.classname.clone()) {
-                Some((entity.classname, entity.instance))
-            } else {
-                None
-            }
-        })
+        .filter(|entity| entity.classname.starts_with("weapon_"))
+        .map(|entity| (entity.classname, entity.instance))
         .collect();
 
     let preferred = select_vdata_offset(process, &entities, offsets);
     let mut by_name: BTreeMap<String, Weapon> = BTreeMap::new();
     for (name, inst) in entities {
+        // First instance that validates wins; a later one only fills a gap.
+        if by_name.contains_key(&name) {
+            continue;
+        }
         if let Some(w) = read_weapon(process, &name, inst, offsets, preferred) {
             by_name.insert(name, w);
         }
@@ -398,6 +402,28 @@ mod tests {
         let global = list.global(&mut mem);
         let found = walk(&mut mem, global, &schemas()).expect("walk");
         assert_eq!(found.len(), 1);
+    }
+
+    /// The lowest-index instance of a weapon can be a view model or one that is
+    /// still spawning, with no vdata pointer written yet. De-duplicating by name
+    /// before validating dropped the weapon; falling through to the next
+    /// instance keeps it.
+    #[test]
+    fn a_weapon_whose_first_instance_has_no_vdata_is_read_from_the_second() {
+        let mut mem = FakeMemory::new();
+        let mut list = ListBuilder::new(&mut mem);
+        // index 20 is walked first and carries no vdata pointer at all.
+        list.place(&mut mem, 20, "weapon_ak47");
+        spawn_weapon(&mut mem, &mut list, 21, "weapon_ak47", 0x340, 36);
+
+        let global = list.global(&mut mem);
+        let found = walk(&mut mem, global, &schemas()).expect("walk");
+        assert_eq!(
+            found.len(),
+            1,
+            "the readable instance must still produce the weapon"
+        );
+        assert_eq!(found[0].damage, 36);
     }
 
     /// The whole point of the candidate list: a build that moved the vdata

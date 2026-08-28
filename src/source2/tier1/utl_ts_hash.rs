@@ -67,7 +67,7 @@ impl<D: Pod, const C: usize, K: Pod> UtlTsHash<D, C, K> {
         let mut elements = Vec::with_capacity(used_count);
         let mut seen_nodes = HashSet::new();
 
-        for bucket in &self.buckets {
+        'buckets: for bucket in &self.buckets {
             let mut node_ptr = bucket.first_uncommitted;
 
             while !node_ptr.is_null() {
@@ -83,12 +83,32 @@ impl<D: Pod, const C: usize, K: Pod> UtlTsHash<D, C, K> {
                     elements.push(node.data);
                 }
 
+                // The pool counts blocks across every bucket, so reaching that
+                // total means the walk is finished — not that this bucket is.
+                // Leaving the outer loop running read one head per remaining
+                // bucket and pushed elements past the count.
                 if elements.len() >= used_count {
-                    break;
+                    break 'buckets;
                 }
 
                 node_ptr = node.next;
             }
+        }
+
+        // `blocks_allocated` is also a lower bound, and this is the only place
+        // that can say so. The walk starts at `first_uncommitted`, which points
+        // *into* each bucket's chain rather than at its head, so a hash whose
+        // `Commit()` has run loses every node before that point — and nothing
+        // downstream can tell a scope that really has 40 classes from one with
+        // 4000 of which 3960 were unreachable.
+        if elements.len() < used_count {
+            log::warn!(
+                "hash walk reached {} of {} allocated node(s) (needs_commit = {}); \
+                 the rest are absent from this dump, not absent from the game",
+                elements.len(),
+                used_count,
+                self.needs_commit,
+            );
         }
 
         elements

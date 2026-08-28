@@ -163,6 +163,25 @@ fn schemas_from_system<P: Process + MemoryView>(
 ) -> Result<SchemaMap> {
     let type_scopes = read_type_scopes(process, &schema_system)?;
 
+    // The schema system counts its own registrations, which makes this the one
+    // number in the dump that can show the walk was complete. A run that
+    // produced a fraction of them is not "a small schema" — it is a short walk,
+    // and the only other symptom is an SDK quietly missing classes. The count is
+    // already in the struct that was read to get here, so this costs no reads.
+    let produced: usize = type_scopes
+        .iter()
+        .map(|scope| scope.classes.len() + scope.enums.len())
+        .sum();
+    let registered = usize::try_from(schema_system.registration_count).unwrap_or(0);
+    if registered > 0 && produced * 10 < registered * 9 {
+        warn!(
+            "schema walk produced {produced} binding(s) but the schema system \
+             registered {registered}; this dump is incomplete"
+        );
+    } else {
+        debug!("schema walk produced {produced} of {registered} registered binding(s)");
+    }
+
     Ok(type_scopes
         .into_iter()
         .map(|type_scope| {
