@@ -7,6 +7,8 @@
 //! These are hand-curated constants (like `verified_features`), not read from
 //! live memory — struct layouts aren't values. Re-verify after a CS2 update.
 
+use std::fmt::Write;
+
 use serde_json::json;
 
 pub struct EField {
@@ -95,7 +97,10 @@ fn instance_rva_of(s: &EStruct, live_csgo_input: Option<u32>) -> Option<u32> {
 /// `live_csgo_input` overlays the baked CCSGOInput instance RVA with the
 /// value recovered from this run's offset/pattern pass. Field layouts stay
 /// curated because they are not schema-exported.
-pub fn render_json(build: Option<u32>, live_csgo_input: Option<u32>) -> String {
+pub fn render_json(
+    build: Option<u32>,
+    live_csgo_input: Option<u32>,
+) -> Result<String, serde_json::Error> {
     let structs: Vec<_> = ENGINE_STRUCTS
         .iter()
         .map(|s| {
@@ -133,23 +138,27 @@ pub fn render_json(build: Option<u32>, live_csgo_input: Option<u32>) -> String {
         "struct_count": ENGINE_STRUCTS.len(),
         "structs": structs,
     }))
-    .unwrap_or_else(|_| "{}".into())
 }
 
 /// Generate a drop-in C++ header for a single struct (offset constants + notes).
 pub fn render_header(s: &EStruct, build: Option<u32>, live_instance_rva: Option<u32>) -> String {
     let mut out = String::new();
     let guard = s.name.to_ascii_uppercase();
-    out.push_str(&format!(
-        "// {}.h  ·  CS2{}  ·  cs2-dumper\n",
+    let _ = writeln!(
+        out,
+        "// {}.h  ·  CS2{}  ·  cs2-dumper",
         lower(s.name),
         build.map(|b| format!(" build {b}")).unwrap_or_default()
-    ));
-    out.push_str(&format!("// {}\n", s.desc));
+    );
+    let _ = writeln!(out, "// {}", s.desc);
     out.push_str("// Reverse-engineered from ");
     out.push_str(s.module);
     out.push_str("; field offsets drift between builds — re-verify after a CS2 update.\n");
-    out.push_str(&format!("#pragma once\n#include <cstdint>\n\nnamespace {} {{\n", s.name));
+    let _ = writeln!(
+        out,
+        "#pragma once\n#include <cstdint>\n\nnamespace {} {{",
+        s.name
+    );
 
     if let Some(rva) = live_instance_rva.or(s.instance_rva) {
         let source = if live_instance_rva.is_some() {
@@ -157,30 +166,36 @@ pub fn render_header(s: &EStruct, build: Option<u32>, live_instance_rva: Option<
         } else {
             "curated (re-verify)"
         };
-        out.push_str(&format!(
-            "\n// instance ({source}):  {}\ninline constexpr std::ptrdiff_t kInstance_rva = 0x{:X};\n",
+        let _ = writeln!(
+            out,
+            "\n// instance ({source}):  {}\ninline constexpr std::ptrdiff_t kInstance_rva = 0x{:X};",
             s.instance_note, rva
-        ));
+        );
     } else {
-        out.push_str(&format!("\n// instance:  {}\n", s.instance_note));
+        let _ = writeln!(out, "\n// instance:  {}", s.instance_note);
     }
     for fn_ in s.functions {
-        out.push_str(&format!(
-            "inline constexpr std::ptrdiff_t k{}_rva = 0x{:X};\n",
+        let _ = writeln!(
+            out,
+            "inline constexpr std::ptrdiff_t k{}_rva = 0x{:X};",
             fn_.name, fn_.rva
-        ));
+        );
     }
 
     out.push_str("\n// --- fields ---\n");
     let w = s.fields.iter().map(|f| f.name.len()).max().unwrap_or(0);
     for f in s.fields {
-        out.push_str(&format!(
-            "inline constexpr std::ptrdiff_t {:<w$} = 0x{:<4X}; // {} — {}\n",
-            f.name, f.offset, f.ty, f.note,
+        let _ = writeln!(
+            out,
+            "inline constexpr std::ptrdiff_t {:<w$} = 0x{:<4X}; // {} — {}",
+            f.name,
+            f.offset,
+            f.ty,
+            f.note,
             w = w
-        ));
+        );
     }
-    out.push_str(&format!("}} // namespace {}\n", s.name));
+    let _ = writeln!(out, "}} // namespace {}", s.name);
     let _ = guard;
     out
 }

@@ -29,7 +29,7 @@
 //! of hidden/dev flags. All reads are best-effort — a bad pointer yields an
 //! empty field, never a panic.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use memflow::prelude::v1::*;
 use serde::Serialize;
 
@@ -40,6 +40,11 @@ const LIST_END: u16 = 0xFFFF;
 /// Hard cap on chain length — guards against a corrupt `next` pointer looping
 /// forever. Comfortably above CS2's real convar count (~5k).
 const MAX_WALK: usize = 200_000;
+
+#[inline]
+fn indexed_addr(base: u64, stride: u64, index: u64) -> Option<u64> {
+    stride.checked_mul(index).and_then(|delta| base.checked_add(delta))
+}
 
 // --- CCvar instance offsets ------------------------------------------------
 const OFF_CV_BASE: u64 = 0x50; // convar list array base ptr
@@ -178,16 +183,27 @@ pub fn walk<P: MemoryView>(process: &mut P, registry_global_va: u64) -> Result<C
         ..Default::default()
     };
 
-    let cv_base = rd_u64(process, inst + layout.cv_base);
+    let Some(cv_base_addr) = inst.checked_add(layout.cv_base) else {
+        bail!("convar base address overflow");
+    };
+    let Some(cv_head_addr) = inst.checked_add(layout.cv_head) else {
+        bail!("convar head address overflow");
+    };
+    let cv_base = rd_u64(process, cv_base_addr);
     if cv_base != 0 {
-        let mut idx = rd_u16(process, inst + layout.cv_head);
+        let mut idx = rd_u16(process, cv_head_addr);
         let mut seen = 0usize;
         let mut indexes = std::collections::BTreeSet::new();
         while idx != LIST_END && seen < MAX_WALK && indexes.insert(idx) {
             seen += 1;
-            let elem = cv_base + layout.cv_stride * idx as u64;
+            let Some(elem) = indexed_addr(cv_base, layout.cv_stride, idx as u64) else {
+                break;
+            };
             let data = rd_u64(process, elem);
-            let next = rd_u16(process, elem + layout.cv_next);
+            let Some(next_addr) = elem.checked_add(layout.cv_next) else {
+                break;
+            };
+            let next = rd_u16(process, next_addr);
             if data != 0
                 && let Ok(cv) = read_convar(process, data)
             {
@@ -197,15 +213,26 @@ pub fn walk<P: MemoryView>(process: &mut P, registry_global_va: u64) -> Result<C
         }
     }
 
-    let cc_base = rd_u64(process, inst + layout.cc_base);
+    let Some(cc_base_addr) = inst.checked_add(layout.cc_base) else {
+        bail!("concommand base address overflow");
+    };
+    let Some(cc_head_addr) = inst.checked_add(layout.cc_head) else {
+        bail!("concommand head address overflow");
+    };
+    let cc_base = rd_u64(process, cc_base_addr);
     if cc_base != 0 {
-        let mut idx = rd_u16(process, inst + layout.cc_head);
+        let mut idx = rd_u16(process, cc_head_addr);
         let mut seen = 0usize;
         let mut indexes = std::collections::BTreeSet::new();
         while idx != LIST_END && seen < MAX_WALK && indexes.insert(idx) {
             seen += 1;
-            let elem = cc_base + layout.cc_stride * idx as u64;
-            let next = rd_u16(process, elem + layout.cc_next);
+            let Some(elem) = indexed_addr(cc_base, layout.cc_stride, idx as u64) else {
+                break;
+            };
+            let Some(next_addr) = elem.checked_add(layout.cc_next) else {
+                break;
+            };
+            let next = rd_u16(process, next_addr);
             if let Ok(cc) = read_concommand(process, elem) {
                 dump.commands.push(cc);
             }
@@ -260,8 +287,14 @@ fn best_layout<P: MemoryView>(process: &mut P, inst: u64) -> (RegistryLayout, us
 
 fn score_layout<P: MemoryView>(process: &mut P, inst: u64, layout: RegistryLayout) -> usize {
     let mut score = 0usize;
-    let cv_base = rd_u64(process, inst + layout.cv_base);
-    let cv_head = rd_u16(process, inst + layout.cv_head);
+    let Some(cv_base_addr) = inst.checked_add(layout.cv_base) else {
+        return 0;
+    };
+    let Some(cv_head_addr) = inst.checked_add(layout.cv_head) else {
+        return 0;
+    };
+    let cv_base = rd_u64(process, cv_base_addr);
+    let cv_head = rd_u16(process, cv_head_addr);
     if cv_base >= 0x10000 && cv_head != LIST_END && cv_head < 0x8000 {
         let mut idx = cv_head;
         let mut seen = std::collections::BTreeSet::new();
@@ -270,18 +303,29 @@ fn score_layout<P: MemoryView>(process: &mut P, inst: u64, layout: RegistryLayou
                 score += 1;
                 break;
             }
-            let elem = cv_base.saturating_add(layout.cv_stride.saturating_mul(idx as u64));
+            let Some(elem) = indexed_addr(cv_base, layout.cv_stride, idx as u64) else {
+                break;
+            };
             let data = rd_u64(process, elem);
             if data < 0x10000 {
                 break;
             }
-            let name = rd_cstr_at(process, data + CVI_NAME);
-            let type_id = rd_u16(process, data + CVI_TYPE);
+            let Some(name_addr) = data.checked_add(CVI_NAME) else {
+                break;
+            };
+            let Some(type_addr) = data.checked_add(CVI_TYPE) else {
+                break;
+            };
+            let name = rd_cstr_at(process, name_addr);
+            let type_id = rd_u16(process, type_addr);
             if !plausible_name(&name) || type_id > 14 {
                 break;
             }
             score += 2;
-            let next = rd_u16(process, elem + layout.cv_next);
+            let Some(next_addr) = elem.checked_add(layout.cv_next) else {
+                break;
+            };
+            let next = rd_u16(process, next_addr);
             if next == LIST_END {
                 score += 1;
                 break;
@@ -292,8 +336,14 @@ fn score_layout<P: MemoryView>(process: &mut P, inst: u64, layout: RegistryLayou
             idx = next;
         }
     }
-    let cc_base = rd_u64(process, inst + layout.cc_base);
-    let cc_head = rd_u16(process, inst + layout.cc_head);
+    let Some(cc_base_addr) = inst.checked_add(layout.cc_base) else {
+        return score;
+    };
+    let Some(cc_head_addr) = inst.checked_add(layout.cc_head) else {
+        return score;
+    };
+    let cc_base = rd_u64(process, cc_base_addr);
+    let cc_head = rd_u16(process, cc_head_addr);
     if cc_base >= 0x10000 && cc_head != LIST_END && cc_head < 0x8000 {
         let mut idx = cc_head;
         let mut seen = std::collections::BTreeSet::new();
@@ -302,19 +352,30 @@ fn score_layout<P: MemoryView>(process: &mut P, inst: u64, layout: RegistryLayou
                 score += 1;
                 break;
             }
-            let elem = cc_base.saturating_add(layout.cc_stride.saturating_mul(idx as u64));
-            let name = rd_cstr_at(process, elem + CC_NAME);
+            let Some(elem) = indexed_addr(cc_base, layout.cc_stride, idx as u64) else {
+                break;
+            };
+            let Some(name_addr) = elem.checked_add(CC_NAME) else {
+                break;
+            };
+            let name = rd_cstr_at(process, name_addr);
             if !plausible_name(&name) {
                 break;
             }
             score += 2;
-            let flags = rd_u32(process, elem + CC_FLAGS);
+            let Some(flags_addr) = elem.checked_add(CC_FLAGS) else {
+                break;
+            };
+            let flags = rd_u32(process, flags_addr);
             // FCVAR is a bit field; this rejects the common all-ones garbage
             // pattern while allowing future flags unknown to this dumper.
             if flags != u32::MAX {
                 score += 1;
             }
-            let next = rd_u16(process, elem + layout.cc_next);
+            let Some(next_addr) = elem.checked_add(layout.cc_next) else {
+                break;
+            };
+            let next = rd_u16(process, next_addr);
             if next == LIST_END {
                 score += 1;
                 break;
@@ -403,24 +464,36 @@ fn gate_registry<P: MemoryView>(process: &mut P, head: &Head) -> bool {
             if base < 0x10000 || index >= 0x8000 {
                 return false;
             }
-            let elem = base.saturating_add(cv_stride.saturating_mul(index as u64));
+            let Some(elem) = indexed_addr(base, cv_stride, index as u64) else {
+                return false;
+            };
             let data = rd_u64(process, elem);
             data >= 0x10000
-                && plausible_name(&rd_cstr_at(process, data + CVI_NAME))
-                && rd_u16(process, data + CVI_TYPE) <= 14
+                && data
+                    .checked_add(CVI_NAME)
+                    .is_some_and(|va| plausible_name(&rd_cstr_at(process, va)))
+                && data
+                    .checked_add(CVI_TYPE)
+                    .is_some_and(|va| rd_u16(process, va) <= 14)
         })
 }
 fn read_convar<P: MemoryView>(process: &mut P, data_va: u64) -> Result<ConVar> {
-    let name = rd_cstr_at(process, data_va + CVI_NAME);
+    let field = |offset| {
+        data_va
+            .checked_add(offset)
+            .ok_or_else(|| anyhow!("convar field address overflow"))
+    };
+    let name = rd_cstr_at(process, field(CVI_NAME)?);
     if name.is_empty() {
         bail!("empty convar name");
     }
-    let description = rd_cstr_at(process, data_va + CVI_DESC);
-    let type_id = rd_u16(process, data_va + CVI_TYPE);
-    let flags = rd_u32(process, data_va + CVI_FLAGS);
+    let description = rd_cstr_at(process, field(CVI_DESC)?);
+    let type_id = rd_u16(process, field(CVI_TYPE)?);
+    let flags = rd_u32(process, field(CVI_FLAGS)?);
+    let value_addr = field(CVI_VALUE)?;
     Ok(ConVar {
         name,
-        value: decode_value(process, data_va + CVI_VALUE, type_id),
+        value: decode_value(process, value_addr, type_id),
         type_id,
         type_name: type_name(type_id),
         flags,
@@ -431,12 +504,17 @@ fn read_convar<P: MemoryView>(process: &mut P, data_va: u64) -> Result<ConVar> {
 }
 
 fn read_concommand<P: MemoryView>(process: &mut P, elem_va: u64) -> Result<ConCommand> {
-    let name = rd_cstr_at(process, elem_va + CC_NAME);
+    let field = |offset| {
+        elem_va
+            .checked_add(offset)
+            .ok_or_else(|| anyhow!("concommand field address overflow"))
+    };
+    let name = rd_cstr_at(process, field(CC_NAME)?);
     if name.is_empty() {
         bail!("empty concommand name");
     }
-    let description = rd_cstr_at(process, elem_va + CC_DESC);
-    let flags = rd_u32(process, elem_va + CC_FLAGS);
+    let description = rd_cstr_at(process, field(CC_DESC)?);
+    let flags = rd_u32(process, field(CC_FLAGS)?);
     Ok(ConCommand {
         name,
         flags,
@@ -517,8 +595,14 @@ fn decode_value<P: MemoryView>(process: &mut P, va: u64, type_id: u16) -> String
 fn read_vec<P: MemoryView>(process: &mut P, va: u64, n: u64) -> String {
     (0..n)
         .map(|i| {
+            let Some(offset) = 4u64.checked_mul(i) else {
+                return String::new();
+            };
+            let Some(element_va) = va.checked_add(offset) else {
+                return String::new();
+            };
             process
-                .read::<f32>(Address::from(va + 4 * i))
+                .read::<f32>(Address::from(element_va))
                 .data_part()
                 .map(fmt_f32)
                 .unwrap_or_default()
@@ -538,40 +622,19 @@ fn decode_flags(flags: u32) -> Vec<&'static str> {
 // --- small read helpers (best-effort, never panic) -------------------------
 
 fn rd_u64<P: MemoryView>(process: &mut P, va: u64) -> u64 {
-    process
-        .read::<u64>(Address::from(va))
-        .data_part()
-        .unwrap_or(0)
+    crate::analysis::read::u64_va(process, va)
 }
 
 fn rd_u32<P: MemoryView>(process: &mut P, va: u64) -> u32 {
-    process
-        .read::<u32>(Address::from(va))
-        .data_part()
-        .unwrap_or(0)
+    crate::analysis::read::u32_va(process, va)
 }
 
 fn rd_u16<P: MemoryView>(process: &mut P, va: u64) -> u16 {
-    process
-        .read::<u16>(Address::from(va))
-        .data_part()
-        .unwrap_or(LIST_END)
+    crate::analysis::read::or(process, va, LIST_END)
 }
 
-fn rd_cstr<P: MemoryView>(process: &mut P, ptr: u64) -> String {
-    if ptr == 0 {
-        return String::new();
-    }
-    process
-        .read_utf8_lossy(Address::from(ptr), 256)
-        .data_part()
-        .unwrap_or_default()
-}
-
-/// Read a `char*` field at `ptr_field_va`, then the C-string it points to.
 fn rd_cstr_at<P: MemoryView>(process: &mut P, ptr_field_va: u64) -> String {
-    let ptr = rd_u64(process, ptr_field_va);
-    rd_cstr(process, ptr)
+    crate::analysis::read::cstr_at(process, ptr_field_va)
 }
 
 fn num<T: std::fmt::Display, E>(r: Result<T, E>) -> String {
@@ -762,6 +825,14 @@ mod tests {
         let info = mem.alloc(0x80);
         assert!(read_convar(&mut mem, info).is_err());
         assert!(read_concommand(&mut mem, info).is_err());
+    }
+
+    #[test]
+    fn vector_value_reads_decline_cleanly_at_address_space_end() {
+        let mut mem = FakeMemory::new();
+        // FakeMemory models a short read at the last mapped byte as a zero
+        // filled value; only the overflowing elements are omitted.
+        assert_eq!(read_vec(&mut mem, u64::MAX - 1, 4), "0   ");
     }
 
     /// Base VA of the synthetic tier0 image, away from where [`FakeMemory`]

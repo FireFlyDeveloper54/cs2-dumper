@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use memflow::prelude::v1::*;
 
 #[repr(C)]
@@ -13,8 +15,34 @@ impl<T: Pod> UtlVector<T> {
             return Err(ErrorKind::OutOfBounds.into());
         }
 
-        mem.read_ptr(self.data.at(index as _)).data_part()
+        let stride = size_of::<T>() as u64;
+        let offset = stride
+            .checked_mul(index as u64)
+            .ok_or(ErrorKind::OutOfBounds)?;
+        let address = self
+            .data
+            .to_umem()
+            .checked_add(offset)
+            .ok_or(ErrorKind::OutOfBounds)?;
+        mem.read_ptr(Pointer64::from(Address::from(address))).data_part()
     }
 }
 
 unsafe impl<T: 'static> Pod for UtlVector<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::UtlVector;
+    use crate::memory::fake::FakeMemory;
+    use memflow::prelude::v1::*;
+
+    #[test]
+    fn rejects_wrapping_element_addresses() {
+        let vector = UtlVector::<u32> {
+            count: 2,
+            pad_0: [0; 4],
+            data: Pointer64::from(u64::MAX - 1),
+        };
+        assert!(vector.element(&mut FakeMemory::new(), 1).is_err());
+    }
+}

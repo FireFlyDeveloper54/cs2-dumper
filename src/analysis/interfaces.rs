@@ -10,6 +10,7 @@ use pelite::pe64::exports::Export;
 use pelite::pe64::{Pe, PeView};
 
 use crate::memory::address;
+use crate::analysis::module_data;
 use crate::source2::InterfaceReg;
 
 pub type InterfaceMap = BTreeMap<String, BTreeMap<String, umem>>;
@@ -21,10 +22,7 @@ pub fn interfaces<P: Process + MemoryView>(process: &mut P) -> Result<InterfaceM
         .module_list()?
         .iter()
         .filter_map(|module| {
-            let buf = process
-                .read_raw(module.base, module.size as _)
-                .data_part()
-                .ok()?;
+            let (_, buf) = module_data::read_image(process, module.name.as_ref()).ok()?;
 
             let view = PeView::from_bytes(&buf).ok()?;
 
@@ -38,13 +36,18 @@ pub fn interfaces<P: Process + MemoryView>(process: &mut P) -> Result<InterfaceM
 
             match ci_export {
                 Export::Symbol(symbol) => {
-                    let list_ptr = address::resolve_rip(process, module.base + symbol).ok()?;
+                    let symbol_address = module
+                        .base
+                        .to_umem()
+                        .checked_add(*symbol as u64)
+                        .map(Address::from)?;
+                    let list_ptr = address::resolve_rip(process, symbol_address).ok()?;
                     let list_head = process.read_addr64(list_ptr).data_part().ok()?;
 
-                    return read_interfaces(process, module, list_head)
+                    read_interfaces(process, module, list_head)
                         .ok()
                         .filter(|ifaces| !ifaces.is_empty())
-                        .map(|ifaces| Ok((module.name.to_string().to_ascii_lowercase(), ifaces)));
+                        .map(|ifaces| Ok((module.name.to_string().to_ascii_lowercase(), ifaces)))
                 }
                 _ => None,
             }

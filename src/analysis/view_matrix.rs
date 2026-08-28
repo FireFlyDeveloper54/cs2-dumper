@@ -42,16 +42,24 @@ pub fn find_in_image(image: &[u8], base: u64, ranges: &[(u64, u64)]) -> Option<u
     let mut found: Vec<u64> = Vec::new();
 
     for &(rva, size) in ranges {
-        let start = rva as usize;
+        let start = (rva as usize).min(image.len());
         let end = start.saturating_add(size as usize).min(image.len());
         let mut offset = start.next_multiple_of(4);
 
-        while offset + 64 <= end && found.len() < MAX_CANDIDATES {
+        while offset
+            .checked_add(64)
+            .is_some_and(|candidate_end| candidate_end <= end)
+            && found.len() < MAX_CANDIDATES
+        {
             let block = &image[offset..offset + 64];
             if let Some(matrix) = floats(block)
                 && is_projection(&matrix)
             {
-                found.push(base + offset as u64);
+                let Some(va) = base.checked_add(offset as u64) else {
+                    offset += 4;
+                    continue;
+                };
+                found.push(va);
                 // A shifted window over the same matrix is a different matrix,
                 // but never a plausible one, so the scan does not skip ahead.
             }

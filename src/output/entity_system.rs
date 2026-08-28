@@ -12,6 +12,25 @@ pub fn render_hpp(build_number: Option<u32>) -> String {
     writeln!(s, "#include <cstddef>").ok();
     writeln!(s, "#include <Windows.h>").ok();
     writeln!(s, "#include \"offsets_merged.hpp\"\n").ok();
+    // The helpers below are written against the same `CS2_OFF_*` names
+    // `impl/entity_system.hpp` uses, but this is the root header and nothing
+    // else defines them for it — so bind them to the symbols
+    // `offsets_merged.hpp` actually provides. `#ifndef` keeps a translation unit
+    // that pulls in both headers from redefining them.
+    writeln!(s, "#ifndef CS2_OFF_GAME_ENTITY_SYSTEM").ok();
+    writeln!(
+        s,
+        "#define CS2_OFF_GAME_ENTITY_SYSTEM offsets::client::GameEntitySystem"
+    )
+    .ok();
+    writeln!(s, "#endif").ok();
+    writeln!(s, "#ifndef CS2_OFF_LOCAL_PLAYER_CONTROLLER").ok();
+    writeln!(
+        s,
+        "#define CS2_OFF_LOCAL_PLAYER_CONTROLLER offsets::client::LocalPlayerController"
+    )
+    .ok();
+    writeln!(s, "#endif\n").ok();
     if let Some(build) = build_number {
         writeln!(
             s,
@@ -43,7 +62,7 @@ pub fn render_hpp(build_number: Option<u32>) -> String {
     writeln!(s, "    if (!base) return 0;").ok();
     writeln!(
         s,
-        "    return *reinterpret_cast<std::uintptr_t*>(base + offsets::client::GameEntitySystem);"
+        "    return *reinterpret_cast<std::uintptr_t*>(base + CS2_OFF_GAME_ENTITY_SYSTEM);"
     )
     .ok();
     writeln!(s, "}}").ok();
@@ -93,7 +112,7 @@ pub fn render_hpp(build_number: Option<u32>) -> String {
     writeln!(s, "    if (!base) return nullptr;").ok();
     writeln!(
         s,
-        "    return *reinterpret_cast<void**>(base + offsets::client::LocalPlayerController);"
+        "    return *reinterpret_cast<void**>(base + CS2_OFF_LOCAL_PLAYER_CONTROLLER);"
     )
     .ok();
     writeln!(s, "}}").ok();
@@ -111,12 +130,18 @@ pub fn render_impl_hpp(_offsets: &OffsetMap, build_number: Option<u32>) -> Strin
     writeln!(s).ok();
     writeln!(s, "#include <cstdint>").ok();
     writeln!(s, "#include <windows.h>").ok();
-    writeln!(s, "#if __has_include(\"../offsets/offsets.hpp\")").ok();
-    writeln!(s, "#include \"../offsets/offsets.hpp\"").ok();
-    writeln!(s, "#elif __has_include(\"../offsets_merged.hpp\")").ok();
+    writeln!(s, "#if __has_include(\"../offsets_merged.hpp\")").ok();
     writeln!(s, "#include \"../offsets_merged.hpp\"").ok();
-    writeln!(s, "#else").ok();
+    writeln!(s, "#define CS2_OFF_GAME_ENTITY_SYSTEM offsets::client::GameEntitySystem").ok();
+    writeln!(s, "#define CS2_OFF_GAME_ENTITY_SYSTEM_HIGHEST offsets::client::GameEntitySystem_highestEntityIndex").ok();
+    writeln!(s, "#define CS2_OFF_LOCAL_PLAYER_CONTROLLER offsets::client::LocalPlayerController").ok();
+    writeln!(s, "#elif __has_include(\"../offsets.hpp\")").ok();
     writeln!(s, "#include \"../offsets.hpp\"").ok();
+    writeln!(s, "#define CS2_OFF_GAME_ENTITY_SYSTEM cs2_dumper::offsets::client_dll::dwGameEntitySystem").ok();
+    writeln!(s, "#define CS2_OFF_GAME_ENTITY_SYSTEM_HIGHEST cs2_dumper::offsets::client_dll::dwGameEntitySystem_highestEntityIndex").ok();
+    writeln!(s, "#define CS2_OFF_LOCAL_PLAYER_CONTROLLER cs2_dumper::offsets::client_dll::dwLocalPlayerController").ok();
+    writeln!(s, "#else").ok();
+    writeln!(s, "#error \"entity helper needs offsets_merged.hpp or offsets.hpp\"").ok();
     writeln!(s, "#endif").ok();
     writeln!(s, "#if __has_include(\"../schemas/client_dll.hpp\")").ok();
     writeln!(s, "#include \"../schemas/client_dll.hpp\"").ok();
@@ -133,34 +158,74 @@ pub fn render_impl_hpp(_offsets: &OffsetMap, build_number: Option<u32>) -> Strin
     }
 
     writeln!(s, "struct CGameEntitySystem {{").ok();
-    writeln!(s, "    // Offset of the entity-list chunk-pointer array within CGameEntitySystem.").ok();
-    writeln!(s, "    static constexpr std::size_t kEntityListOffset = 0x10;").ok();
-    writeln!(s, "    static constexpr std::size_t kIdentityStride    = 0x70;").ok();
-    writeln!(s, "    static constexpr int          kChunkSize         = 512;").ok();
-    writeln!(s, "    static constexpr int          kMaxEntities       = 32768;").ok();
+    writeln!(
+        s,
+        "    // Offset of the entity-list chunk-pointer array within CGameEntitySystem."
+    )
+    .ok();
+    writeln!(
+        s,
+        "    static constexpr std::size_t kEntityListOffset = 0x10;"
+    )
+    .ok();
+    writeln!(
+        s,
+        "    static constexpr std::size_t kIdentityStride    = 0x70;"
+    )
+    .ok();
+    writeln!(
+        s,
+        "    static constexpr int          kChunkSize         = 512;"
+    )
+    .ok();
+    writeln!(
+        s,
+        "    static constexpr int          kMaxEntities       = 32768;"
+    )
+    .ok();
     writeln!(s).ok();
 
     writeln!(s, "    static int GetHighestEntityIndex() noexcept {{").ok();
-    writeln!(s, "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));").ok();
+    writeln!(
+        s,
+        "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));"
+    )
+    .ok();
     writeln!(s, "        if (!client) return 0;").ok();
-    writeln!(s, "        auto es = *reinterpret_cast<uintptr_t*>(client + offsets::client::GameEntitySystem);").ok();
+    writeln!(s, "        auto es = *reinterpret_cast<uintptr_t*>(client + CS2_OFF_GAME_ENTITY_SYSTEM);").ok();
     writeln!(s, "        if (!es) return 0;").ok();
-    writeln!(s, "        return *reinterpret_cast<int*>(es + offsets::client::GameEntitySystem_highestEntityIndex);").ok();
+    writeln!(s, "        return *reinterpret_cast<int*>(es + CS2_OFF_GAME_ENTITY_SYSTEM_HIGHEST);").ok();
     writeln!(s, "    }}").ok();
     writeln!(s).ok();
 
     writeln!(s, "#if CS2_DUMPER_HAS_CLIENT_SCHEMA").ok();
-    writeln!(s, "    static client::CCSPlayerController* GetLocalPlayer() noexcept {{").ok();
-    writeln!(s, "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));").ok();
+    writeln!(
+        s,
+        "    static client::CCSPlayerController* GetLocalPlayer() noexcept {{"
+    )
+    .ok();
+    writeln!(
+        s,
+        "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));"
+    )
+    .ok();
     writeln!(s, "        if (!client) return nullptr;").ok();
-    writeln!(s, "        return *reinterpret_cast<client::CCSPlayerController**>(client + offsets::client::LocalPlayerController);").ok();
+    writeln!(s, "        return *reinterpret_cast<client::CCSPlayerController**>(client + CS2_OFF_LOCAL_PLAYER_CONTROLLER);").ok();
     writeln!(s, "    }}").ok();
     writeln!(s).ok();
-    writeln!(s, "    static client::CEntityIdentity* GetIdentityByIndex(int index) noexcept {{").ok();
+    writeln!(
+        s,
+        "    static client::CEntityIdentity* GetIdentityByIndex(int index) noexcept {{"
+    )
+    .ok();
     writeln!(s, "        if (index < 0) return nullptr;").ok();
-    writeln!(s, "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));").ok();
+    writeln!(
+        s,
+        "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));"
+    )
+    .ok();
     writeln!(s, "        if (!client) return nullptr;").ok();
-    writeln!(s, "        auto entity_system = *reinterpret_cast<uintptr_t*>(client + offsets::client::GameEntitySystem);").ok();
+    writeln!(s, "        auto entity_system = *reinterpret_cast<uintptr_t*>(client + CS2_OFF_GAME_ENTITY_SYSTEM);").ok();
     writeln!(s, "        if (!entity_system) return nullptr;").ok();
     writeln!(s, "        auto chunk = *reinterpret_cast<uintptr_t*>(entity_system + kEntityListOffset + static_cast<std::size_t>(index / kChunkSize) * 8);").ok();
     writeln!(s, "        if (!chunk) return nullptr;").ok();
@@ -168,23 +233,39 @@ pub fn render_impl_hpp(_offsets: &OffsetMap, build_number: Option<u32>) -> Strin
     writeln!(s, "    }}").ok();
     writeln!(s, "#else").ok();
     writeln!(s, "    static void* GetLocalPlayer() noexcept {{").ok();
-    writeln!(s, "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));").ok();
+    writeln!(
+        s,
+        "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));"
+    )
+    .ok();
     writeln!(s, "        if (!client) return nullptr;").ok();
-    writeln!(s, "        return *reinterpret_cast<void**>(client + offsets::client::LocalPlayerController);").ok();
+    writeln!(s, "        return *reinterpret_cast<void**>(client + CS2_OFF_LOCAL_PLAYER_CONTROLLER);").ok();
     writeln!(s, "    }}").ok();
     writeln!(s, "#endif").ok();
     writeln!(s).ok();
 
-    writeln!(s, "    static void* GetEntityByIndex(int index) noexcept {{").ok();
-    writeln!(s, "        if (index < 0 || index >= kMaxEntities) return nullptr;").ok();
+    writeln!(
+        s,
+        "    static void* GetEntityByIndex(int index) noexcept {{"
+    )
+    .ok();
+    writeln!(
+        s,
+        "        if (index < 0 || index >= kMaxEntities) return nullptr;"
+    )
+    .ok();
     writeln!(s, "#if CS2_DUMPER_HAS_CLIENT_SCHEMA").ok();
     writeln!(s, "        auto* identity = GetIdentityByIndex(index);").ok();
     writeln!(s, "        if (!identity) return nullptr;").ok();
     writeln!(s, "        return *reinterpret_cast<void**>(identity);").ok();
     writeln!(s, "#else").ok();
-    writeln!(s, "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));").ok();
+    writeln!(
+        s,
+        "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));"
+    )
+    .ok();
     writeln!(s, "        if (!client) return nullptr;").ok();
-    writeln!(s, "        auto entity_system = *reinterpret_cast<uintptr_t*>(client + offsets::client::GameEntitySystem);").ok();
+    writeln!(s, "        auto entity_system = *reinterpret_cast<uintptr_t*>(client + CS2_OFF_GAME_ENTITY_SYSTEM);").ok();
     writeln!(s, "        if (!entity_system) return nullptr;").ok();
     writeln!(s, "        auto chunk = *reinterpret_cast<uintptr_t*>(entity_system + kEntityListOffset + static_cast<std::size_t>(index / kChunkSize) * 8);").ok();
     writeln!(s, "        if (!chunk) return nullptr;").ok();
@@ -194,22 +275,42 @@ pub fn render_impl_hpp(_offsets: &OffsetMap, build_number: Option<u32>) -> Strin
     writeln!(s, "    }}").ok();
     writeln!(s).ok();
 
-    writeln!(s, "    static const char* GetDesignerName(int index) noexcept {{").ok();
+    writeln!(
+        s,
+        "    static const char* GetDesignerName(int index) noexcept {{"
+    )
+    .ok();
     writeln!(s, "#if CS2_DUMPER_HAS_CLIENT_SCHEMA").ok();
     writeln!(s, "        auto* identity = GetIdentityByIndex(index);").ok();
-    writeln!(s, "        if (!identity || !GetEntityByIndex(index)) return nullptr;").ok();
-    writeln!(s, "        return *reinterpret_cast<const char**>(&identity->m_designerName());").ok();
+    writeln!(
+        s,
+        "        if (!identity || !GetEntityByIndex(index)) return nullptr;"
+    )
+    .ok();
+    writeln!(
+        s,
+        "        return identity->m_designerName().String();"
+    )
+    .ok();
     writeln!(s, "#else").ok();
     writeln!(s, "        auto* entity = GetEntityByIndex(index);").ok();
     writeln!(s, "        if (!entity) return nullptr;").ok();
-    writeln!(s, "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));").ok();
+    writeln!(
+        s,
+        "        auto client = reinterpret_cast<uintptr_t>(GetModuleHandleA(\"client.dll\"));"
+    )
+    .ok();
     writeln!(s, "        if (!client) return nullptr;").ok();
-    writeln!(s, "        auto entity_system = *reinterpret_cast<uintptr_t*>(client + offsets::client::GameEntitySystem);").ok();
+    writeln!(s, "        auto entity_system = *reinterpret_cast<uintptr_t*>(client + CS2_OFF_GAME_ENTITY_SYSTEM);").ok();
     writeln!(s, "        if (!entity_system) return nullptr;").ok();
     writeln!(s, "        auto chunk = *reinterpret_cast<uintptr_t*>(entity_system + kEntityListOffset + static_cast<std::size_t>(index / kChunkSize) * 8);").ok();
     writeln!(s, "        if (!chunk) return nullptr;").ok();
     writeln!(s, "        auto identity = chunk + static_cast<std::size_t>(index % kChunkSize) * kIdentityStride;").ok();
-    writeln!(s, "        return *reinterpret_cast<const char**>(identity + 0x20);").ok();
+    writeln!(
+        s,
+        "        return *reinterpret_cast<const char**>(identity + 0x20);"
+    )
+    .ok();
     writeln!(s, "#endif").ok();
     writeln!(s, "    }}").ok();
     writeln!(s).ok();
@@ -217,4 +318,52 @@ pub fn render_impl_hpp(_offsets: &OffsetMap, build_number: Option<u32>) -> Strin
     writeln!(s, "}};").ok();
     writeln!(s).ok();
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::OffsetMap;
+
+    #[test]
+    fn impl_helper_reads_designer_name_through_utl_symbol() {
+        let body = render_impl_hpp(&OffsetMap::new(), Some(1));
+        assert!(
+            body.contains("m_designerName().String()"),
+            "typed designer-name path must use CUtlSymbolLarge::String: {body}"
+        );
+        assert!(
+            !body.contains("const char**>(&identity->m_designerName())"),
+            "must not take the address of a SCHEMA_FIELD temporary: {body}"
+        );
+        let merged = body.find("offsets_merged.hpp").expect("prefer merged offsets");
+        let legacy = body.find("../offsets.hpp").expect("legacy offsets fallback");
+        assert!(
+            merged < legacy,
+            "merged offsets must be preferred over a2x offsets.hpp: {body}"
+        );
+        assert!(body.contains("cs2_dumper::offsets::client_dll::dwGameEntitySystem"));
+        assert!(body.contains("CS2_OFF_GAME_ENTITY_SYSTEM_HIGHEST"));
+    }
+
+    /// The root header is emitted on every dump and consumers include it
+    /// directly, so every `CS2_OFF_*` it dereferences has to be defined by the
+    /// header itself — `impl/entity_system.hpp` is a different file and
+    /// `offsets_merged.hpp` only provides `offsets::<module>::` constants.
+    #[test]
+    fn root_helper_defines_every_offset_macro_it_uses() {
+        let body = render_hpp(Some(1));
+        for macro_name in ["CS2_OFF_GAME_ENTITY_SYSTEM", "CS2_OFF_LOCAL_PLAYER_CONTROLLER"] {
+            assert!(
+                body.contains(&format!("#define {macro_name} ")),
+                "{macro_name} is used but never defined in the root header: {body}"
+            );
+        }
+        // Guarded, so including this next to impl/entity_system.hpp is legal.
+        assert_eq!(
+            body.matches("#ifndef CS2_OFF_").count(),
+            body.matches("#define CS2_OFF_").count(),
+            "each definition needs its own guard: {body}"
+        );
+    }
 }

@@ -147,25 +147,22 @@ pattern_map! {
 fn second_store_global(view: &PeView<'_>, view_render: Rva) -> Option<Rva> {
     let pat = pattern!("488905${'} 488bc8 4885c0");
     let mut save = vec![0; save_len(pat)];
-    let mut others = Vec::new();
+    let mut hits = Vec::new();
     let mut iter = view.scanner().matches_code(pat);
     while iter.next(&mut save) {
-        if save[1] != view_render {
-            others.push(save[1]);
-        }
+        hits.push(save[1]);
     }
-    match others.as_slice() {
-        [only] => Some(*only),
-        _ => {
-            if others.len() > 1 {
-                debug!(
-                    "dwVPhys2World skipped: {} extra hits of the ViewRender store idiom",
-                    others.len()
-                );
-            }
-            None
-        }
+    if let Some(phys) = unique_extra_hit(view_render, &hits) {
+        return Some(phys);
     }
+    let extra = hits.iter().filter(|&&hit| hit != view_render).count();
+    if extra > 1 {
+        debug!(
+            "dwVPhys2World skipped: {} extra hits of the ViewRender store idiom",
+            extra
+        );
+    }
+    None
 }
 
 /// Unique extra hit of a repeated pattern, excluding `first`. Used so
@@ -178,22 +175,50 @@ pub fn unique_extra_hit(first: u32, hits: &[u32]) -> Option<u32> {
     }
 }
 
+type OffsetScanner = for<'a> fn(PeView<'a>) -> BTreeMap<String, u32>;
+
+const OFFSET_MODULES: [(&str, OffsetScanner); 6] = [
+    ("client.dll", client::offsets),
+    ("engine2.dll", engine2::offsets),
+    ("inputsystem.dll", input_system::offsets),
+    ("matchmaking.dll", matchmaking::offsets),
+    ("soundsystem.dll", soundsystem::offsets),
+    ("tier0.dll", tier0::offsets),
+];
+
+/// Insert one module's scanned offsets. An unreadable image or invalid PE is
+/// skipped so a missing optional DLL cannot empty the rest of the map.
+pub(crate) fn absorb_module_offsets(
+    map: &mut OffsetMap,
+    module_name: &str,
+    image: Result<&[u8], anyhow::Error>,
+    scan: fn(PeView<'_>) -> BTreeMap<String, u32>,
+) {
+    let buf = match image {
+        Ok(buf) => buf,
+        Err(err) => {
+            log::warn!("offset scan skipped for {module_name}: {err}");
+            return;
+        }
+    };
+    match PeView::from_bytes(buf) {
+        Ok(view) => {
+            map.insert(module_name.to_string(), scan(view));
+        }
+        Err(err) => {
+            log::warn!("invalid PE for {module_name}: {err}");
+        }
+    }
+}
+
 pub fn offsets<P: Process + MemoryView>(process: &mut P) -> Result<OffsetMap> {
     let mut map = BTreeMap::new();
 
-    let modules: [(&str, fn(PeView) -> BTreeMap<String, u32>); 6] = [
-        ("client.dll", client::offsets),
-        ("engine2.dll", engine2::offsets),
-        ("inputsystem.dll", input_system::offsets),
-        ("matchmaking.dll", matchmaking::offsets),
-        ("soundsystem.dll", soundsystem::offsets),
-        ("tier0.dll", tier0::offsets),
-    ];
-
-    for (module_name, offsets) in &modules {
-        let (_base, buf) = crate::analysis::module_data::read_pe_image(process, module_name)?;
-        let view = PeView::from_bytes(&buf)?;
-        map.insert(module_name.to_string(), offsets(view));
+    for (module_name, scan) in OFFSET_MODULES {
+        match crate::analysis::module_data::read_pe_image(process, module_name) {
+            Ok((_base, buf)) => absorb_module_offsets(&mut map, module_name, Ok(&buf), scan),
+            Err(err) => absorb_module_offsets(&mut map, module_name, Err(err), scan),
+        }
     }
 
     Ok(map)
@@ -345,6 +370,29 @@ mod tests {
         assert_eq!(unique_extra_hit(0x1000, &[0x1000, 0x2000]), Some(0x2000));
         assert_eq!(unique_extra_hit(0x1000, &[0x1000, 0x2000, 0x3000]), None);
         assert_eq!(unique_extra_hit(0x1000, &[0x2000, 0x1000]), Some(0x2000));
+    }
+
+    #[test]
+    fn a_failed_module_image_leaves_other_offsets_in_the_map() {
+        let mut map = OffsetMap::from([(
+            "client.dll".to_string(),
+            BTreeMap::from([("dwEntityList".to_string(), 0x10u32)]),
+        )]);
+        absorb_module_offsets(
+            &mut map,
+            "soundsystem.dll",
+            Err(anyhow::anyhow!("file not found")),
+            soundsystem::offsets,
+        );
+        absorb_module_offsets(&mut map, "engine2.dll", Ok(b"MZ"), engine2::offsets);
+        assert_eq!(
+            map.get("client.dll")
+                .and_then(|m| m.get("dwEntityList"))
+                .copied(),
+            Some(0x10)
+        );
+        assert!(!map.contains_key("soundsystem.dll"));
+        assert!(!map.contains_key("engine2.dll"));
     }
 
     fn setup() -> Result<IntoProcessInstanceArcBox<'static>> {

@@ -99,7 +99,7 @@ pub const KNOWN_SCHEMA_MODULES: &[&str] = &[
     "host.dll",
     "panorama.dll",
     "panorama_text_pango.dll",
-    "panorama_ui_client.dll",
+    "panoramauiclient.dll",
     "rendersystemdx11.dll",
     "resourcesystem.dll",
     "worldrenderer.dll",
@@ -211,5 +211,25 @@ mod tests {
         assert!(missing.iter().any(|m| m == "meshsystem.dll"));
         assert!(missing.iter().any(|m| m == "vscript.dll"));
         assert!(!missing.iter().any(|m| m == "client.dll"));
+    }
+
+    #[test]
+    fn missing_schema_modules_names_the_real_panorama_ui_client_dll() {
+        let schemas = SchemaMap::from([(
+            "panoramauiclient.dll".into(),
+            (Vec::new(), Vec::new()),
+        )]);
+        let missing = missing_schema_modules(&schemas);
+        assert!(
+            !missing.iter().any(|m| m == "panoramauiclient.dll"),
+            "loaded panoramauiclient.dll must not be reported missing: {missing:?}"
+        );
+        assert!(
+            !missing.iter().any(|m| m == "panorama_ui_client.dll"),
+            "underscore alias is not a real module: {missing:?}"
+        );
+        let empty = missing_schema_modules(&SchemaMap::new());
+        assert!(empty.iter().any(|m| m == "panoramauiclient.dll"));
+        assert!(!empty.iter().any(|m| m == "panorama_ui_client.dll"));
     }
 }

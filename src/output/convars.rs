@@ -5,12 +5,16 @@
 //!                   aren't hookable types, so there's nothing to `#include`
 //!                   for — the value is the reference itself).
 
+use std::fmt::Write;
+
 use serde_json::json;
 
 use crate::analysis::convars::ConVarsDump;
 
+use super::comment_text;
+
 /// Structured JSON: `{ build_number, convar_count, command_count, convars[], commands[] }`.
-pub fn render_json(dump: &ConVarsDump, build: Option<u32>) -> String {
+pub fn render_json(dump: &ConVarsDump, build: Option<u32>) -> Result<String, serde_json::Error> {
     let convars: Vec<_> = dump
         .convars
         .iter()
@@ -59,7 +63,6 @@ pub fn render_json(dump: &ConVarsDump, build: Option<u32>) -> String {
         "convars": convars,
         "commands": commands,
     }))
-    .unwrap_or_else(|_| "{}".into())
 }
 
 /// Reference `.hpp` — an aligned, commented table of every convar/command.
@@ -67,13 +70,14 @@ pub fn render_hpp(dump: &ConVarsDump, build: Option<u32>) -> String {
     let mut s = String::new();
     s.push_str("// convars.hpp — CS2 ConVar / ConCommand catalogue (auto-generated)\n");
     if let Some(b) = build {
-        s.push_str(&format!("// build: {b}\n"));
+        let _ = writeln!(s, "// build: {b}");
     }
-    s.push_str(&format!(
-        "// {} convars, {} commands. Read-only snapshot of the tier0 CCvar registry.\n",
+    let _ = writeln!(
+        s,
+        "// {} convars, {} commands. Read-only snapshot of the tier0 CCvar registry.",
         dump.convars.len(),
         dump.commands.len()
-    ));
+    );
     s.push_str("#pragma once\n\n");
 
     // ---- convars --------------------------------------------------------
@@ -107,15 +111,16 @@ pub fn render_hpp(dump: &ConVarsDump, build: Option<u32>) -> String {
         } else {
             c.flag_names.join("|")
         };
-        s.push_str(&format!(
+        let _ = write!(
+            s,
             "// {:name_w$}  {:type_w$}  {:val_w$}  {}",
-            c.name,
-            c.type_name,
-            trunc(&c.value, 20),
-            flags,
-        ));
+            comment_text(&c.name),
+            comment_text(c.type_name),
+            comment_text(&trunc(&c.value, 20)),
+            comment_text(&flags),
+        );
         if !c.description.is_empty() {
-            s.push_str(&format!("  // {}", c.description));
+            let _ = write!(s, "  // {}", comment_text(&c.description));
         }
         s.push('\n');
     }
@@ -129,9 +134,14 @@ pub fn render_hpp(dump: &ConVarsDump, build: Option<u32>) -> String {
         } else {
             c.flag_names.join("|")
         };
-        s.push_str(&format!("// {:name_w$}  {}", c.name, flags));
+        let _ = write!(
+            s,
+            "// {:name_w$}  {}",
+            comment_text(&c.name),
+            comment_text(&flags)
+        );
         if !c.description.is_empty() {
-            s.push_str(&format!("  // {}", c.description));
+            let _ = write!(s, "  // {}", comment_text(&c.description));
         }
         s.push('\n');
     }
@@ -152,17 +162,45 @@ fn trunc(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::convars::{ConCommand, ConVar};
 
     #[test]
     fn json_keeps_legacy_fields_and_reports_layout() {
-        let report: serde_json::Value =
-            serde_json::from_str(&render_json(&ConVarsDump::default(), Some(1)))
-                .expect("valid convars json");
+        let report: serde_json::Value = serde_json::from_str(
+            &render_json(&ConVarsDump::default(), Some(1)).expect("serialize"),
+        )
+        .expect("valid convars json");
         assert_eq!(report["build_number"], 1);
         assert_eq!(report["convar_count"], 0);
         assert_eq!(report["command_count"], 0);
         assert_eq!(report["registry_layout"]["cv_base"], "0x50");
         assert!(report["convars"].is_array());
         assert!(report["commands"].is_array());
+    }
+
+    #[test]
+    fn hpp_keeps_runtime_strings_inside_comments() {
+        let dump = ConVarsDump {
+            convars: vec![ConVar {
+                name: "test\n#define NAME_INJECTED 1".into(),
+                value: "1\n#define VALUE_INJECTED 1".into(),
+                type_id: 0,
+                type_name: "bool",
+                flags: 0,
+                flag_names: Vec::new(),
+                description: "desc\n#define DESC_INJECTED 1".into(),
+                address: 0,
+            }],
+            commands: vec![ConCommand {
+                name: "cmd\n#define COMMAND_INJECTED 1".into(),
+                flags: 0,
+                flag_names: Vec::new(),
+                description: "desc\n#define COMMAND_DESC_INJECTED 1".into(),
+                address: 0,
+            }],
+            ..Default::default()
+        };
+        let hpp = render_hpp(&dump, None);
+        assert!(!hpp.contains("\n#define"), "runtime text escaped a comment: {hpp}");
     }
 }

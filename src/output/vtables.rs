@@ -4,18 +4,19 @@
 //! The headers expose per-slot indices so a consumer can hook by index
 //! without baking absolute addresses.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
-use anyhow::Result;
 use serde_json::json;
 
 use crate::analysis::{VTableInfo, VTableMap};
 
-use super::ident::{sanitize_ident, slugify};
+use super::ident::{cpp_csharp_identifier, sanitize_ident};
+use super::comment_text;
 
-fn module_ns(module: &str) -> String {
-    slugify(module)
+fn module_ns(module: &str) -> Cow<'_, str> {
+    sanitize_ident(module)
 }
 
 fn iface_ns(info: &VTableInfo, iface_name: &str, used: &mut BTreeSet<String>) -> String {
@@ -23,12 +24,23 @@ fn iface_ns(info: &VTableInfo, iface_name: &str, used: &mut BTreeSet<String>) ->
         .rtti_class
         .as_deref()
         .filter(|name| !name.is_empty())
-        .map(sanitize_ident)
-        .unwrap_or_else(|| sanitize_ident(iface_name));
-    if used.insert(preferred.clone()) {
+        .map(cpp_csharp_identifier)
+        .unwrap_or_else(|| cpp_csharp_identifier(iface_name));
+    if !used.contains(&preferred) {
+        used.insert(preferred.clone());
         return preferred;
     }
-    let alt = sanitize_ident(&format!("{preferred}_{iface_name}"));
+    let alt = cpp_csharp_identifier(&format!("{preferred}_{iface_name}"));
+    used.insert(alt.clone());
+    alt
+}
+
+fn intern_unique_ident(candidate: String, used: &mut BTreeSet<String>, index: usize) -> String {
+    if !used.contains(&candidate) {
+        used.insert(candidate.clone());
+        return candidate;
+    }
+    let alt = format!("{candidate}_{index}");
     used.insert(alt.clone());
     alt
 }
@@ -36,91 +48,15 @@ fn iface_ns(info: &VTableInfo, iface_name: &str, used: &mut BTreeSet<String>) ->
 fn slot_ident(index: usize, recovered: Option<&str>, used: &mut BTreeSet<String>) -> String {
     let candidate = recovered
         .filter(|name| !name.is_empty())
-        .map(sanitize_ident)
-        .filter(|name| !is_keyword(name))
-        .unwrap_or_else(|| format!("method_{index}"));
-    if used.insert(candidate.clone()) {
-        candidate
-    } else {
-        let alt = format!("{candidate}_{index}");
-        used.insert(alt.clone());
-        alt
+        .map(cpp_csharp_identifier);
+    if let Some(candidate) = candidate {
+        if !used.contains(&candidate) {
+            used.insert(candidate.clone());
+            return candidate;
+        }
+        return intern_unique_ident(format!("{candidate}_{index}"), used, index);
     }
-}
-
-fn is_keyword(name: &str) -> bool {
-    matches!(
-        name,
-        "alignas"
-            | "alignof"
-            | "asm"
-            | "auto"
-            | "bool"
-            | "break"
-            | "case"
-            | "catch"
-            | "char"
-            | "class"
-            | "const"
-            | "consteval"
-            | "constexpr"
-            | "constinit"
-            | "continue"
-            | "decltype"
-            | "default"
-            | "delete"
-            | "do"
-            | "double"
-            | "else"
-            | "enum"
-            | "explicit"
-            | "export"
-            | "extern"
-            | "false"
-            | "float"
-            | "for"
-            | "friend"
-            | "goto"
-            | "if"
-            | "inline"
-            | "int"
-            | "long"
-            | "mutable"
-            | "namespace"
-            | "new"
-            | "noexcept"
-            | "nullptr"
-            | "operator"
-            | "private"
-            | "protected"
-            | "public"
-            | "register"
-            | "reinterpret_cast"
-            | "return"
-            | "short"
-            | "signed"
-            | "sizeof"
-            | "static"
-            | "static_assert"
-            | "static_cast"
-            | "struct"
-            | "switch"
-            | "template"
-            | "this"
-            | "throw"
-            | "true"
-            | "try"
-            | "typedef"
-            | "typeid"
-            | "typename"
-            | "union"
-            | "unsigned"
-            | "using"
-            | "virtual"
-            | "void"
-            | "volatile"
-            | "while"
-    )
+    intern_unique_ident(format!("method_{index}"), used, index)
 }
 
 /// Per-slot index header. Namespace is the RTTI class when recovered,
@@ -145,11 +81,12 @@ pub fn render_hpp(map: &VTableMap, build_number: Option<u32>) -> String {
         let mut used_ns = BTreeSet::new();
         for (iface_name, info) in ifaces {
             let class_ns = iface_ns(info, iface_name, &mut used_ns);
-            let rtti = info.rtti_class.as_deref().unwrap_or(iface_name);
+            let rtti = comment_text(info.rtti_class.as_deref().unwrap_or(iface_name));
+            let iface_name = comment_text(iface_name);
             writeln!(
                 s,
                 "        // {rtti} (iface: {iface_name}) | vtable @ {}+{:#X} ({} methods)",
-                info.vtable_module,
+                comment_text(&info.vtable_module),
                 info.vtable_rva,
                 info.methods.len()
             )
@@ -161,7 +98,8 @@ pub fn render_hpp(map: &VTableMap, build_number: Option<u32>) -> String {
                 writeln!(
                     s,
                     "            inline constexpr std::ptrdiff_t {ident} = {index}; // {}+{:#X}",
-                    method.module, method.rva
+                    comment_text(&method.module),
+                    method.rva
                 )
                 .ok();
             }
@@ -178,7 +116,11 @@ pub fn render_cs(map: &VTableMap, build_number: Option<u32>) -> String {
     s.push_str("// Generated using https://github.com/a2x/cs2-dumper\n");
     s.push_str("namespace CS2.VTables {\n");
     if let Some(bn) = build_number {
-        writeln!(s, "    public static class Build {{ public const uint Number = {bn}; }}").ok();
+        writeln!(
+            s,
+            "    public static class Build {{ public const uint Number = {bn}; }}"
+        )
+        .ok();
     }
     for (module, ifaces) in map {
         if ifaces.is_empty() {
@@ -189,11 +131,12 @@ pub fn render_cs(map: &VTableMap, build_number: Option<u32>) -> String {
         let mut used_ns = BTreeSet::new();
         for (iface_name, info) in ifaces {
             let class_ns = iface_ns(info, iface_name, &mut used_ns);
-            let rtti = info.rtti_class.as_deref().unwrap_or(iface_name);
+            let rtti = comment_text(info.rtti_class.as_deref().unwrap_or(iface_name));
+            let iface_name = comment_text(iface_name);
             writeln!(
                 s,
                 "        // {rtti} (iface: {iface_name}) | vtable @ {}+0x{:X} ({} methods)",
-                info.vtable_module,
+                comment_text(&info.vtable_module),
                 info.vtable_rva,
                 info.methods.len()
             )
@@ -205,7 +148,8 @@ pub fn render_cs(map: &VTableMap, build_number: Option<u32>) -> String {
                 writeln!(
                     s,
                     "            public const int {ident} = {index}; // {}+0x{:X}",
-                    method.module, method.rva
+                    comment_text(&method.module),
+                    method.rva
                 )
                 .ok();
             }
@@ -217,7 +161,7 @@ pub fn render_cs(map: &VTableMap, build_number: Option<u32>) -> String {
     s
 }
 
-pub fn render_json(map: &VTableMap) -> Result<String> {
+pub fn render_json(map: &VTableMap) -> Result<String, serde_json::Error> {
     let modules: serde_json::Map<String, serde_json::Value> = map
         .iter()
         .map(|(module, ifaces)| {
@@ -231,9 +175,9 @@ pub fn render_json(map: &VTableMap) -> Result<String> {
                         .map(|(index, m)| {
                             json!({
                                 "index": index,
-                                "module": m.module,
+                                "module": m.module.as_ref(),
                                 "rva": m.rva,
-                                "name": m.name,
+                                "name": m.name.as_deref(),
                             })
                         })
                         .collect();
@@ -241,7 +185,7 @@ pub fn render_json(map: &VTableMap) -> Result<String> {
                         iface_name.clone(),
                         json!({
                             "vtable_rva": info.vtable_rva,
-                            "vtable_module": info.vtable_module,
+                            "vtable_module": info.vtable_module.as_ref(),
                             "rtti_class": info.rtti_class,
                             "methods": methods,
                         }),
@@ -257,13 +201,14 @@ pub fn render_json(map: &VTableMap) -> Result<String> {
         "modules": serde_json::Value::Object(modules),
     });
 
-    Ok(serde_json::to_string_pretty(&root)?)
+    serde_json::to_string_pretty(&root)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::{VTableMethod, VTableMap};
+    use crate::analysis::{VTableMap, VTableMethod};
+    use std::borrow::Cow;
     use std::collections::BTreeMap;
 
     fn sample() -> VTableMap {
@@ -306,5 +251,15 @@ mod tests {
         let cs = render_cs(&sample(), None);
         assert!(cs.contains("public const int Connect = 0"));
         assert!(cs.contains("public const int method_1 = 1"));
+    }
+
+    #[test]
+    fn module_ns_rewrites_dll_suffix() {
+        assert_eq!(module_ns("client.dll").as_ref(), "client_dll");
+        assert_eq!(module_ns("engine2").as_ref(), "engine2");
+        let clean = "engine2";
+        let ns = module_ns(clean);
+        assert!(matches!(ns, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(ns.as_ref().as_ptr(), clean.as_ptr()));
     }
 }

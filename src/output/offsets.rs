@@ -2,20 +2,33 @@ use std::fmt::{self, Write};
 
 use heck::{AsPascalCase, AsSnakeCase};
 
-use super::{CodeWriter, Formatter, OffsetMap, slugify, zig_ident};
+use super::ident::{
+    csharp_identifier, cpp_identifier, rust_identifier, IdentifierAllocator,
+};
+use super::{comment_text, slugify, zig_ident, CodeWriter, Formatter, OffsetMap};
 
 impl CodeWriter for OffsetMap {
     fn write_cs(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
         fmt.block("namespace CS2Dumper.Offsets", false, |fmt| {
+            let mut modules = IdentifierAllocator::default();
             for (module_name, offsets) in self {
-                writeln!(fmt, "// Module: {}", module_name)?;
+                writeln!(fmt, "// Module: {}", comment_text(module_name))?;
+                let module_ident = modules.allocate(
+                    AsPascalCase(csharp_identifier(module_name)).to_string(),
+                );
 
                 fmt.block(
-                    &format!("public static class {}", AsPascalCase(slugify(module_name))),
+                    format_args!("public static class {module_ident}"),
                     false,
                     |fmt| {
+                        let mut names = IdentifierAllocator::default();
                         for (name, value) in offsets {
-                            writeln!(fmt, "public const nint {} = {:#X};", name, value)?;
+                            writeln!(
+                                fmt,
+                                "public const nint {} = {:#X};",
+                                names.allocate(csharp_identifier(name)),
+                                value
+                            )?;
                         }
 
                         Ok(())
@@ -34,15 +47,25 @@ impl CodeWriter for OffsetMap {
 
         fmt.block("namespace cs2_dumper", false, |fmt| {
             fmt.block("namespace offsets", false, |fmt| {
+                let mut modules = IdentifierAllocator::default();
                 for (module_name, offsets) in self {
-                    writeln!(fmt, "// Module: {}", module_name)?;
+                    writeln!(fmt, "// Module: {}", comment_text(module_name))?;
+                    let module_ident = modules.allocate(cpp_identifier(
+                        &AsSnakeCase(slugify(module_name)).to_string(),
+                    ));
 
                     fmt.block(
-                        &format!("namespace {}", AsSnakeCase(slugify(module_name))),
+                        format_args!("namespace {module_ident}"),
                         false,
                         |fmt| {
+                            let mut names = IdentifierAllocator::default();
                             for (name, value) in offsets {
-                                writeln!(fmt, "constexpr std::ptrdiff_t {} = {:#X};", name, value)?;
+                                writeln!(
+                                    fmt,
+                                    "constexpr std::ptrdiff_t {} = {:#X};",
+                                    names.allocate(cpp_identifier(name)),
+                                    value
+                                )?;
                             }
 
                             Ok(())
@@ -56,7 +79,7 @@ impl CodeWriter for OffsetMap {
     }
 
     fn write_json(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
-        fmt.write_str(&serde_json::to_string_pretty(self).unwrap())
+        super::formatter::write_pretty_json(fmt, self)
     }
 
     fn write_rs(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
@@ -64,15 +87,25 @@ impl CodeWriter for OffsetMap {
 
         fmt.block("pub mod cs2_dumper", false, |fmt| {
             fmt.block("pub mod offsets", false, |fmt| {
+                let mut modules = IdentifierAllocator::default();
                 for (module_name, offsets) in self {
-                    writeln!(fmt, "// Module: {}", module_name)?;
+                    writeln!(fmt, "// Module: {}", comment_text(module_name))?;
+                    let module_ident = modules.allocate(rust_identifier(
+                        &AsSnakeCase(slugify(module_name)).to_string(),
+                    ));
 
                     fmt.block(
-                        &format!("pub mod {}", AsSnakeCase(slugify(module_name))),
+                        format_args!("pub mod {module_ident}"),
                         false,
                         |fmt| {
+                            let mut names = IdentifierAllocator::default();
                             for (name, value) in offsets {
-                                writeln!(fmt, "pub const {}: usize = {:#X};", name, value)?;
+                                writeln!(
+                                    fmt,
+                                    "pub const {}: usize = {:#X};",
+                                    names.allocate(rust_identifier(name)),
+                                    value
+                                )?;
                             }
 
                             Ok(())
@@ -89,12 +122,13 @@ impl CodeWriter for OffsetMap {
         fmt.block("pub const cs2_dumper = struct", true, |fmt| {
             fmt.block("pub const offsets = struct", true, |fmt| {
                 for (module_name, offsets) in self {
-                    writeln!(fmt, "// Module: {}", module_name)?;
+                    writeln!(fmt, "// Module: {}", comment_text(module_name))?;
 
-                    let module_name = zig_ident(&AsSnakeCase(slugify(module_name)).to_string());
+                    let snake = AsSnakeCase(slugify(module_name).as_ref()).to_string();
+                    let module_name = zig_ident(&snake);
 
                     fmt.block(
-                        &format!("pub const {} = struct", module_name),
+                        format_args!("pub const {} = struct", module_name),
                         true,
                         |fmt| {
                             for (name, value) in offsets {

@@ -4,7 +4,7 @@ use serde_json::json;
 
 use crate::analysis::weapons::Weapon;
 
-pub fn render_json(weapons: &[Weapon], build: Option<u32>) -> String {
+pub fn render_json(weapons: &[Weapon], build: Option<u32>) -> Result<String, serde_json::Error> {
     let rows: Vec<_> = weapons
         .iter()
         .map(|w| {
@@ -37,7 +37,6 @@ pub fn render_json(weapons: &[Weapon], build: Option<u32>) -> String {
         "entity_index_max": 32767,
         "weapons": rows,
     }))
-    .unwrap_or_else(|_| "{}".into())
 }
 
 #[cfg(test)]
@@ -46,7 +45,8 @@ mod tests {
 
     #[test]
     fn reports_full_entity_handle_space() {
-        let report: serde_json::Value = serde_json::from_str(&render_json(&[], None)).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&render_json(&[], None).expect("serialize")).unwrap();
         assert_eq!(report["entity_handle_capacity"], 32768);
         assert_eq!(report["entity_index_max"], 32767);
     }

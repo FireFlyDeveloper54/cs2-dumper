@@ -14,13 +14,13 @@
 //! captured (held/dropped weapons + view models). Running the dump inside a
 //! match / deathmatch / practice-with-bots maximises coverage.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, bail};
 use memflow::prelude::v1::*;
 use serde::Serialize;
 
-use crate::analysis::{SchemaMap, entity_list, field_offset};
+use crate::analysis::{SchemaMap, class_index, entity_list, field_offset_in};
 
 /// Candidate offsets of the `CCSWeaponBaseVData*` within a weapon entity. The
 /// generic `GetVData()` reads +0x340 on 14169; older builds used +0x388. We try
@@ -85,35 +85,17 @@ pub fn walk<P: MemoryView>(
     }
 
     let layout = entity_list::detect_layout(process, list);
-    let mut entities: Vec<(String, u64)> = Vec::new();
-    let mut cached_chunk_index = u32::MAX;
-    let mut cached_chunk = 0;
-    for idx in 0..entity_list::MAX_ENTITY_INDEX {
-        let i = idx & entity_list::HANDLE_INDEX_MASK;
-        let chunk_index = i >> 9;
-        if chunk_index != cached_chunk_index {
-            cached_chunk_index = chunk_index;
-            cached_chunk = rd_u64(
-                process,
-                list + layout.chunk_array_base + layout.chunk_ptr_stride * chunk_index as u64,
-            );
-        }
-        let chunk = cached_chunk;
-        if chunk == 0 {
-            continue;
-        }
-        let ident = chunk + layout.chunk_entry_stride * (i & entity_list::SLOT_INDEX_MASK) as u64;
-        let inst = rd_u64(process, ident + layout.identity_instance);
-        if inst == 0 {
-            continue;
-        }
-        let name_ptr = rd_u64(process, ident + layout.identity_designer_name);
-        let name = rd_cstr(process, name_ptr);
-        if !name.starts_with("weapon_") || entities.iter().any(|(known, _)| known == &name) {
-            continue;
-        }
-        entities.push((name, inst));
-    }
+    let mut seen_names = BTreeSet::new();
+    let entities: Vec<(String, u64)> = entity_list::live_entities(process, list, layout)
+        .into_iter()
+        .filter_map(|entity| {
+            if entity.classname.starts_with("weapon_") && seen_names.insert(entity.classname.clone()) {
+                Some((entity.classname, entity.instance))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     let preferred = select_vdata_offset(process, &entities, offsets);
     let mut by_name: BTreeMap<String, Weapon> = BTreeMap::new();
@@ -143,13 +125,25 @@ fn read_weapon<P: MemoryView>(
             .filter(|off| Some(*off) != preferred),
     );
     for off in candidates {
-        let vd = rd_u64(process, entity + off);
+        let Some(vdata_ptr) = entity.checked_add(off) else {
+            continue;
+        };
+        let vd = rd_u64(process, vdata_ptr);
         if vd < 0x10000 {
             continue;
         }
-        let damage = rd_i32(process, vd + offsets.damage);
-        let penetration = rd_f32(process, vd + offsets.penetration);
-        let price = rd_i32(process, vd + offsets.price);
+        let Some(damage_addr) = vd.checked_add(offsets.damage) else {
+            continue;
+        };
+        let Some(penetration_addr) = vd.checked_add(offsets.penetration) else {
+            continue;
+        };
+        let Some(price_addr) = vd.checked_add(offsets.price) else {
+            continue;
+        };
+        let damage = rd_i32(process, damage_addr);
+        let penetration = rd_f32(process, penetration_addr);
+        let price = rd_i32(process, price_addr);
         if (1..=1000).contains(&damage)
             && (0.0..=10.0).contains(&penetration)
             && (0..=20000).contains(&price)
@@ -157,19 +151,19 @@ fn read_weapon<P: MemoryView>(
             return Some(Weapon {
                 name: name.to_string(),
                 damage,
-                headshot_multiplier: rd_f32(process, vd + offsets.headshot_multiplier),
-                armor_ratio: rd_f32(process, vd + offsets.armor_ratio),
+                headshot_multiplier: rd_f32_at(process, vd, offsets.headshot_multiplier)?,
+                armor_ratio: rd_f32_at(process, vd, offsets.armor_ratio)?,
                 penetration,
-                range: rd_f32(process, vd + offsets.range),
-                range_modifier: rd_f32(process, vd + offsets.range_modifier),
-                cycle_time: rd_f32(process, vd + offsets.cycle_time),
+                range: rd_f32_at(process, vd, offsets.range)?,
+                range_modifier: rd_f32_at(process, vd, offsets.range_modifier)?,
+                cycle_time: rd_f32_at(process, vd, offsets.cycle_time)?,
                 price,
-                num_bullets: rd_i32(process, vd + offsets.num_bullets),
-                max_speed: rd_f32(process, vd + offsets.max_speed),
-                spread: rd_f32(process, vd + offsets.spread),
-                inaccuracy_stand: rd_f32(process, vd + offsets.inaccuracy_stand),
-                inaccuracy_move: rd_f32(process, vd + offsets.inaccuracy_move),
-                recoil_magnitude: rd_f32(process, vd + offsets.recoil_magnitude),
+                num_bullets: rd_i32_at(process, vd, offsets.num_bullets)?,
+                max_speed: rd_f32_at(process, vd, offsets.max_speed)?,
+                spread: rd_f32_at(process, vd, offsets.spread)?,
+                inaccuracy_stand: rd_f32_at(process, vd, offsets.inaccuracy_stand)?,
+                inaccuracy_move: rd_f32_at(process, vd, offsets.inaccuracy_move)?,
+                recoil_magnitude: rd_f32_at(process, vd, offsets.recoil_magnitude)?,
                 address: vd,
                 vdata_ptr_offset: off,
             });
@@ -189,13 +183,23 @@ fn select_vdata_offset<P: MemoryView>(
         let score = entities
             .iter()
             .filter(|(_, entity)| {
-                let vd = rd_u64(process, *entity + candidate);
+                let Some(vdata_ptr) = entity.checked_add(candidate) else {
+                    return false;
+                };
+                let vd = rd_u64(process, vdata_ptr);
                 if vd < 0x10000 {
                     return false;
                 }
-                let damage = rd_i32(process, vd + offsets.damage);
-                let penetration = rd_f32(process, vd + offsets.penetration);
-                let price = rd_i32(process, vd + offsets.price);
+                let (Some(damage_addr), Some(penetration_addr), Some(price_addr)) = (
+                    vd.checked_add(offsets.damage),
+                    vd.checked_add(offsets.penetration),
+                    vd.checked_add(offsets.price),
+                ) else {
+                    return false;
+                };
+                let damage = rd_i32(process, damage_addr);
+                let penetration = rd_f32(process, penetration_addr);
+                let price = rd_i32(process, price_addr);
                 (1..=1000).contains(&damage)
                     && (0.0..=10.0).contains(&penetration)
                     && (0..=20000).contains(&price)
@@ -209,7 +213,8 @@ fn select_vdata_offset<P: MemoryView>(
     best
 }
 fn weapon_offsets(schemas: &SchemaMap) -> Option<WeaponOffsets> {
-    let get = |name| field_offset(schemas, "CCSWeaponBaseVData", name);
+    let classes = class_index(schemas);
+    let get = |name| field_offset_in(&classes, "CCSWeaponBaseVData", name);
     Some(WeaponOffsets {
         price: get("m_nPrice")?,
         num_bullets: get("m_nNumBullets")?,
@@ -230,31 +235,21 @@ fn weapon_offsets(schemas: &SchemaMap) -> Option<WeaponOffsets> {
 // --- read helpers (best-effort) --------------------------------------------
 
 fn rd_u64<P: MemoryView>(process: &mut P, va: u64) -> u64 {
-    process
-        .read::<u64>(Address::from(va))
-        .data_part()
-        .unwrap_or(0)
+    crate::analysis::read::u64_va(process, va)
 }
 fn rd_i32<P: MemoryView>(process: &mut P, va: u64) -> i32 {
-    process
-        .read::<i32>(Address::from(va))
-        .data_part()
-        .unwrap_or(0)
+    crate::analysis::read::i32_va(process, va)
 }
 fn rd_f32<P: MemoryView>(process: &mut P, va: u64) -> f32 {
-    process
-        .read::<f32>(Address::from(va))
-        .data_part()
-        .unwrap_or(0.0)
+    crate::analysis::read::f32_va(process, va)
 }
-fn rd_cstr<P: MemoryView>(process: &mut P, ptr: u64) -> String {
-    if ptr == 0 {
-        return String::new();
-    }
-    process
-        .read_utf8_lossy(Address::from(ptr), 64)
-        .data_part()
-        .unwrap_or_default()
+
+fn rd_f32_at<P: MemoryView>(process: &mut P, base: u64, offset: u64) -> Option<f32> {
+    Some(rd_f32(process, base.checked_add(offset)?))
+}
+
+fn rd_i32_at<P: MemoryView>(process: &mut P, base: u64, offset: u64) -> Option<i32> {
+    Some(rd_i32(process, base.checked_add(offset)?))
 }
 
 #[cfg(test)]
@@ -306,7 +301,7 @@ mod tests {
             (
                 vec![Class {
                     name: "CCSWeaponBaseVData".to_string(),
-                    module_name: "client.dll".to_string(),
+                    module_name: "client.dll".into(),
                     parent_name: None,
                     size: 0x80,
                     alignment: 8,

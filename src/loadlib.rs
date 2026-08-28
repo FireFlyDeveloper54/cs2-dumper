@@ -5,9 +5,22 @@
 //! `InstallSchemaBindings` export. The rest of the dumper then attaches to
 //! *this* process and walks schema/offsets as usual.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SteamInf {
+    pub client_version: Option<u32>,
+    pub server_version: Option<u32>,
+    pub patch_version: Option<String>,
+    pub product_name: Option<String>,
+    pub app_id: Option<u32>,
+    pub version_date: Option<String>,
+    pub version_time: Option<String>,
+    pub source_revision: Option<u64>,
+}
 
 #[derive(Debug, Default)]
 pub struct LoadLibReport {
@@ -15,6 +28,7 @@ pub struct LoadLibReport {
     pub bindings: Vec<String>,
     pub failed: Vec<(String, String)>,
     pub schema_system: Option<u64>,
+    pub steam_inf: Option<SteamInf>,
 }
 
 /// Relative paths loaded before schema registration.
@@ -59,13 +73,6 @@ const SCHEMA_MODULES: &[&str] = &[
     "game\\csgo\\bin\\win64\\host.dll",
     "game\\csgo\\bin\\win64\\matchmaking.dll",
 ];
-
-pub fn current_process_name() -> Result<String> {
-    let exe = std::env::current_exe().context("failed to resolve current executable")?;
-    exe.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .context("current executable has no file name")
-}
 
 /// True when `dir` looks like a CS2 install root (`game\bin\win64\...`).
 pub fn is_cs2_install(dir: &Path) -> bool {
@@ -193,8 +200,12 @@ fn drive_letters() -> Vec<PathBuf> {
 fn discover_steam_roots_on_drives() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for drive in drive_letters() {
-        for name in ["Steam", "SteamLibrary", "Program Files (x86)\\Steam", "Program Files\\Steam"]
-        {
+        for name in [
+            "Steam",
+            "SteamLibrary",
+            "Program Files (x86)\\Steam",
+            "Program Files\\Steam",
+        ] {
             roots.push(drive.join(name));
         }
         let Ok(top) = std::fs::read_dir(&drive) else {
@@ -222,14 +233,36 @@ fn discover_steam_roots_on_drives() -> Vec<PathBuf> {
     roots
 }
 
-fn all_steam_roots() -> Vec<PathBuf> {
+/// Registry, env, and well-known install prefixes. These are cheap and
+/// usually enough; a full drive walk is the fallback in [`find_install`].
+fn trusted_steam_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     roots.extend(steam_roots_from_registry());
     roots.extend(env_steam_roots());
     roots.extend(well_known_steam_roots());
-    roots.extend(discover_steam_roots_on_drives());
     roots.retain(|path| path.is_dir());
     roots
+}
+
+fn collect_cs2_installs(steam_roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut seen_steam = std::collections::BTreeSet::new();
+    let mut candidates = Vec::new();
+
+    for steam in steam_roots {
+        if !seen_steam.insert(steam.clone()) {
+            continue;
+        }
+        for library in steam_roots_from_vdf(&steam) {
+            let Some(common) = steamapps_common(&library) else {
+                continue;
+            };
+            candidates.extend(cs2_candidates_in_common(&common));
+        }
+    }
+
+    candidates.sort_by(|a, b| install_rank(a).cmp(&install_rank(b)).then_with(|| a.cmp(b)));
+    candidates.dedup();
+    candidates
 }
 
 fn cs2_candidates_in_common(common: &Path) -> Vec<PathBuf> {
@@ -253,37 +286,34 @@ fn cs2_candidates_in_common(common: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// First CS2 folder from `trusted` Steam roots, otherwise from `fallback`.
+/// Drive enumeration is passed as `fallback` so a hit in the registry path
+/// never walks `C:\`…`Z:\`.
+fn first_cs2_install(
+    trusted: impl IntoIterator<Item = PathBuf>,
+    fallback: impl FnOnce() -> Vec<PathBuf>,
+) -> Option<PathBuf> {
+    let mut candidates = collect_cs2_installs(trusted);
+    if candidates.is_empty() {
+        log::info!(
+            "no CS2 install via registry or well-known Steam paths; scanning local drive roots"
+        );
+        candidates = collect_cs2_installs(fallback());
+    }
+    candidates.into_iter().next()
+}
+
 /// Locate the CS2 install root. Uses the Steam registry, `libraryfolders.vdf`,
 /// and a shallow scan of local drives for `steamapps/common/Counter-Strike*`.
+///
+/// Drive-root enumeration is deferred until registry / well-known paths fail,
+/// so a normal Steam install does not walk `C:\`…`Z:\` on every dump.
 pub fn find_install() -> Result<PathBuf> {
-    let mut seen_steam = std::collections::BTreeSet::new();
-    let mut candidates = Vec::new();
-
-    for steam in all_steam_roots() {
-        if !seen_steam.insert(steam.clone()) {
-            continue;
-        }
-        for library in steam_roots_from_vdf(&steam) {
-            let Some(common) = steamapps_common(&library) else {
-                continue;
-            };
-            candidates.extend(cs2_candidates_in_common(&common));
-        }
-    }
-
-    candidates.sort_by(|a, b| {
-        install_rank(a)
-            .cmp(&install_rank(b))
-            .then_with(|| a.cmp(b))
-    });
-    candidates.dedup();
-    if let Some(found) = candidates.into_iter().next() {
-        return Ok(found);
-    }
-
-    bail!(
-        "cs2.exe is not running and no CS2 install was found. Searched Steam (registry, libraryfolders.vdf) and drive roots for steamapps/common/Counter-Strike*"
-    )
+    first_cs2_install(trusted_steam_roots(), discover_steam_roots_on_drives).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cs2.exe is not running and no CS2 install was found. Searched Steam (registry, libraryfolders.vdf) and drive roots for steamapps/common/Counter-Strike*"
+        )
+    })
 }
 
 #[cfg(windows)]
@@ -357,13 +387,51 @@ mod windows_reg {
 pub fn load(game_dir: &Path) -> Result<LoadLibReport> {
     #[cfg(windows)]
     {
-        windows::load(game_dir)
+        let mut report = windows::load(game_dir)?;
+        report.steam_inf = read_steam_inf(game_dir);
+        Ok(report)
     }
     #[cfg(not(windows))]
     {
         let _ = game_dir;
         bail!("LoadLibrary dump is only supported on Windows")
     }
+}
+
+/// Parse Valve `steam.inf` key=value lines (CS2: `game/csgo/steam.inf`).
+pub fn parse_steam_inf(text: &str) -> SteamInf {
+    let mut inf = SteamInf::default();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "ClientVersion" => inf.client_version = value.parse().ok(),
+            "ServerVersion" => inf.server_version = value.parse().ok(),
+            "PatchVersion" => inf.patch_version = Some(value.to_string()),
+            "ProductName" => inf.product_name = Some(value.to_string()),
+            "appID" => inf.app_id = value.parse().ok(),
+            "VersionDate" => inf.version_date = Some(value.to_string()),
+            "VersionTime" => inf.version_time = Some(value.to_string()),
+            "SourceRevision" => inf.source_revision = value.parse().ok(),
+            _ => {}
+        }
+    }
+    inf
+}
+
+pub(crate) fn already_bound(bindings: &[String], file_name: &str) -> bool {
+    bindings
+        .iter()
+        .any(|bound| bound.eq_ignore_ascii_case(file_name))
+}
+
+pub fn read_steam_inf(game_dir: &Path) -> Option<SteamInf> {
+    let path = resolve_game_file(game_dir, "game\\csgo\\steam.inf");
+    let inf = parse_steam_inf(&fs::read_to_string(path).ok()?);
+    (inf != SteamInf::default()).then_some(inf)
 }
 
 fn resolve_game_file(game_dir: &Path, relative: &str) -> PathBuf {
@@ -379,9 +447,9 @@ fn resolve_game_file(game_dir: &Path, relative: &str) -> PathBuf {
 #[cfg(windows)]
 mod windows {
     use super::*;
+    use crate::memory::win::{last_error, to_wide_path, GetProcAddress};
     use std::collections::BTreeMap;
     use std::ffi::CString;
-    use std::os::windows::ffi::OsStrExt;
 
     use log::{info, warn};
 
@@ -390,34 +458,20 @@ mod windows {
     const SCHEMA_BINDINGS_OK: u64 = 0x0000_0000_C000_0001;
 
     type CreateInterfaceFn = unsafe extern "C" fn(*const i8, *mut i32) -> *mut core::ffi::c_void;
-    type InstallSchemaBindingsFn =
-        unsafe extern "C" fn(*const i8, *mut core::ffi::c_void) -> usize;
+    type InstallSchemaBindingsFn = unsafe extern "C" fn(*const i8, *mut core::ffi::c_void) -> usize;
 
     unsafe extern "system" {
         fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
-        fn GetProcAddress(
-            module: *mut core::ffi::c_void,
-            name: *const i8,
-        ) -> *const core::ffi::c_void;
         fn SetDllDirectoryW(path: *const u16) -> i32;
         fn SetDefaultDllDirectories(directory_flags: u32) -> i32;
         fn AddDllDirectory(path: *const u16) -> *mut core::ffi::c_void;
-        fn GetLastError() -> u32;
-    }
-
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
     }
 
     fn load_library(path: &Path) -> Result<*mut core::ffi::c_void> {
-        let wide = wide(path);
+        let wide = to_wide_path(path);
         let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
         if handle.is_null() {
-            let err = unsafe { GetLastError() };
-            bail!("LoadLibraryW({}) failed: {err}", path.display());
+            bail!("LoadLibraryW({}) failed: {}", path.display(), last_error());
         }
         Ok(handle)
     }
@@ -433,12 +487,32 @@ mod windows {
         }
         let flags = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS;
         unsafe {
-            SetDefaultDllDirectories(flags);
-            SetDllDirectoryW(wide(&bin64).as_ptr());
-            if csgo64.is_dir() {
-                AddDllDirectory(wide(&csgo64).as_ptr());
+            if SetDefaultDllDirectories(flags) == 0 {
+                bail!("SetDefaultDllDirectories failed: {}", last_error());
             }
-            AddDllDirectory(wide(&bin64).as_ptr());
+            if SetDllDirectoryW(to_wide_path(&bin64).as_ptr()) == 0 {
+                bail!(
+                    "SetDllDirectoryW({}) failed: {}",
+                    bin64.display(),
+                    last_error()
+                );
+            }
+            if csgo64.is_dir()
+                && AddDllDirectory(to_wide_path(&csgo64).as_ptr()).is_null()
+            {
+                bail!(
+                    "AddDllDirectory({}) failed: {}",
+                    csgo64.display(),
+                    last_error()
+                );
+            }
+            if AddDllDirectory(to_wide_path(&bin64).as_ptr()).is_null() {
+                bail!(
+                    "AddDllDirectory({}) failed: {}",
+                    bin64.display(),
+                    last_error()
+                );
+            }
         }
         Ok(())
     }
@@ -464,9 +538,7 @@ mod windows {
         const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
         const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
         unsafe {
-            SetErrorMode(
-                SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX,
-            );
+            SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
         }
         setup_search_path(game_dir)?;
         let mut report = LoadLibReport::default();
@@ -500,7 +572,11 @@ mod windows {
         for module in SCHEMA_MODULES {
             load_one(game_dir, module, false, &mut handles, &mut report)?;
             if let Some(name) = module.rsplit(['\\', '/']).next() {
-                install_bindings(&name.to_ascii_lowercase(), schema_system, &handles, &mut report);
+                let name = name.to_ascii_lowercase();
+                if super::already_bound(&report.bindings, &name) {
+                    continue;
+                }
+                install_bindings(&name, schema_system, &handles, &mut report);
             }
         }
 
@@ -559,6 +635,9 @@ mod windows {
         handles: &BTreeMap<String, *mut core::ffi::c_void>,
         report: &mut LoadLibReport,
     ) {
+        if super::already_bound(&report.bindings, file_name) {
+            return;
+        }
         let Some(&handle) = handles.get(file_name) else {
             return;
         };
@@ -590,10 +669,7 @@ mod tests {
 
     #[test]
     fn detects_cs2_install_layout() {
-        let root = std::env::temp_dir().join(format!(
-            "cs2-dumper-install-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("cs2-dumper-install-{}", std::process::id()));
         let dll = super::resolve_game_file(&root, "game\\bin\\win64\\schemasystem.dll");
         std::fs::create_dir_all(dll.parent().unwrap()).unwrap();
         std::fs::write(&dll, b"mz").unwrap();
@@ -613,11 +689,9 @@ mod tests {
 }
 "#;
         let paths = super::parse_libraryfolders(vdf);
-        assert!(
-            paths
-                .iter()
-                .any(|p| p.to_string_lossy().contains("Program Files"))
-        );
+        assert!(paths
+            .iter()
+            .any(|p| p.to_string_lossy().contains("Program Files")));
     }
 
     #[test]
@@ -638,6 +712,48 @@ mod tests {
     }
 
     #[test]
+    fn collect_cs2_installs_is_empty_without_steam_roots() {
+        assert!(super::collect_cs2_installs(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn first_cs2_install_skips_fallback_when_trusted_roots_have_cs2() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let steam = std::env::temp_dir().join(format!(
+            "cs2-dumper-trusted-steam-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let game = steam
+            .join("steamapps")
+            .join("common")
+            .join("Counter-Strike 2");
+        let dll = super::resolve_game_file(&game, "game\\bin\\win64\\schemasystem.dll");
+        std::fs::create_dir_all(dll.parent().unwrap()).unwrap();
+        std::fs::write(&dll, b"mz").unwrap();
+        let mut fallback_calls = 0u32;
+        let found = super::first_cs2_install(vec![steam.clone()], || {
+            fallback_calls += 1;
+            Vec::new()
+        });
+        let _ = std::fs::remove_dir_all(&steam);
+        assert_eq!(fallback_calls, 0, "drive scan must not run after a trusted hit");
+        assert_eq!(found.as_deref(), Some(game.as_path()));
+    }
+
+    #[test]
+    fn first_cs2_install_invokes_fallback_when_trusted_roots_are_empty() {
+        let mut fallback_calls = 0u32;
+        let found = super::first_cs2_install(Vec::new(), || {
+            fallback_calls += 1;
+            Vec::new()
+        });
+        assert_eq!(fallback_calls, 1);
+        assert!(found.is_none());
+    }
+
+    #[test]
     fn ranks_counter_strike_folder_names() {
         assert!(super::is_counter_strike_folder(Path::new(
             "steamapps/common/Counter-Strike Global Offensive"
@@ -655,12 +771,72 @@ mod tests {
     }
 
     #[test]
+    fn parses_cs2_steam_inf_versions() {
+        let inf = super::parse_steam_inf(
+            "ClientVersion=2000885\n\
+             ServerVersion=2000885\n\
+             PatchVersion=1.41.7.6\n\
+             ProductName=cs2\n\
+             appID=730\n\
+             SourceRevision=10924896\n\
+             VersionDate=Aug 19 2026\n\
+             VersionTime=16:02:03\n",
+        );
+        assert_eq!(inf.client_version, Some(2000885));
+        assert_eq!(inf.server_version, Some(2000885));
+        assert_eq!(inf.patch_version.as_deref(), Some("1.41.7.6"));
+        assert_eq!(inf.product_name.as_deref(), Some("cs2"));
+        assert_eq!(inf.app_id, Some(730));
+        assert_eq!(inf.source_revision, Some(10924896));
+        assert_eq!(inf.version_date.as_deref(), Some("Aug 19 2026"));
+        assert_eq!(inf.version_time.as_deref(), Some("16:02:03"));
+    }
+
+    #[test]
+    fn read_steam_inf_skips_missing_or_empty_files() {
+        let root =
+            std::env::temp_dir().join(format!("cs2-dumper-steam-inf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(super::read_steam_inf(&root).is_none());
+        let path = super::resolve_game_file(&root, "game\\csgo\\steam.inf");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"\n# empty\n").unwrap();
+        assert!(super::read_steam_inf(&root).is_none());
+        std::fs::write(&path, b"PatchVersion=1.40.0.0\nClientVersion=42\n").unwrap();
+        let inf = super::read_steam_inf(&root).expect("parsed");
+        assert_eq!(inf.patch_version.as_deref(), Some("1.40.0.0"));
+        assert_eq!(inf.client_version, Some(42));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_schema_bindings_skips_an_already_bound_module() {
+        let bindings = vec!["schemasystem.dll".to_string()];
+        assert!(super::already_bound(&bindings, "schemasystem.dll"));
+        assert!(super::already_bound(&bindings, "SchemaSystem.dll"));
+        assert!(!super::already_bound(&bindings, "client.dll"));
+        let schema_rel = super::SCHEMA_MODULES[0]
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert_eq!(schema_rel, "schemasystem.dll");
+        assert!(
+            super::already_bound(&bindings, &schema_rel),
+            "LoadLibrary must not InstallSchemaBindings(schemasystem.dll) a second time"
+        );
+    }
+
+    #[test]
     fn joins_cs2_relative_module_paths() {
         let path = resolve_game_file(
             Path::new("D:/Steam/steamapps/common/Counter-Strike Global Offensive"),
             "game\\csgo\\bin\\win64\\client.dll",
         );
-        let text = path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        let text = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
         assert!(text.ends_with("game/csgo/bin/win64/client.dll"));
     }
 }

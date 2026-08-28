@@ -38,7 +38,9 @@ const ALLOC_ALIGN: u64 = 0x10;
 
 #[derive(Debug)]
 pub struct FakeMemory {
-    bytes: BTreeMap<u64, u8>,
+    /// Disjoint mapped runs, keyed by start address. Adjacent writes are
+    /// merged so a later read does not walk one BTree node per byte.
+    runs: BTreeMap<u64, Vec<u8>>,
     next: u64,
 }
 
@@ -51,16 +53,49 @@ impl Default for FakeMemory {
 impl FakeMemory {
     pub fn new() -> Self {
         Self {
-            bytes: BTreeMap::new(),
+            runs: BTreeMap::new(),
             next: ALLOC_BASE,
         }
     }
 
     /// Map `data` at `addr`, overwriting whatever was there.
     pub fn put(&mut self, addr: u64, data: &[u8]) -> &mut Self {
-        for (i, byte) in data.iter().enumerate() {
-            self.bytes.insert(addr + i as u64, *byte);
+        if data.is_empty() {
+            return self;
         }
+        let Some(end) = addr.checked_add(data.len() as u64) else {
+            return self;
+        };
+        let mut lo = addr;
+        let mut hi = end;
+        let mut keys = Vec::new();
+        if let Some((&start, bytes)) = self.runs.range(..addr).next_back() {
+            let run_end = start + bytes.len() as u64;
+            // Touching (`run_end == addr`) merges; a hole in between does not.
+            if run_end >= addr {
+                keys.push(start);
+                lo = lo.min(start);
+                hi = hi.max(run_end);
+            }
+        }
+        keys.extend(self.runs.range(addr..=end).map(|(&start, _)| start));
+        for &start in &keys {
+            if let Some(bytes) = self.runs.get(&start) {
+                lo = lo.min(start);
+                hi = hi.max(start + bytes.len() as u64);
+            }
+        }
+        let mut merged = vec![0u8; (hi - lo) as usize];
+        for start in keys {
+            let Some(bytes) = self.runs.remove(&start) else {
+                continue;
+            };
+            let offset = (start - lo) as usize;
+            merged[offset..offset + bytes.len()].copy_from_slice(&bytes);
+        }
+        let offset = (addr - lo) as usize;
+        merged[offset..offset + data.len()].copy_from_slice(data);
+        self.runs.insert(lo, merged);
         self
     }
 
@@ -119,8 +154,8 @@ impl FakeMemory {
     pub fn alloc(&mut self, len: usize) -> u64 {
         let addr = self.next;
         self.next = (self.next + len as u64).next_multiple_of(ALLOC_ALIGN);
-        for i in 0..len as u64 {
-            self.bytes.insert(addr + i, 0);
+        if len > 0 {
+            self.put(addr, &vec![0u8; len]);
         }
         addr
     }
@@ -141,20 +176,30 @@ impl FakeMemory {
     }
 
     pub fn is_mapped(&self, addr: u64) -> bool {
-        self.bytes.contains_key(&addr)
+        self.covering(addr).is_some()
+    }
+
+    fn covering(&self, addr: u64) -> Option<(u64, &[u8])> {
+        let (&start, bytes) = self.runs.range(..=addr).next_back()?;
+        let end = start + bytes.len() as u64;
+        (addr < end).then_some((start, bytes.as_slice()))
     }
 
     /// Number of contiguous mapped bytes starting at `addr`, capped at `len`.
     fn readable_run(&self, addr: u64, len: usize) -> usize {
-        (0..len)
-            .take_while(|i| self.bytes.contains_key(&(addr + *i as u64)))
-            .count()
+        let Some((start, bytes)) = self.covering(addr) else {
+            return 0;
+        };
+        let offset = (addr - start) as usize;
+        (bytes.len() - offset).min(len)
     }
 
     fn copy_out(&self, addr: u64, out: &mut [u8]) -> bool {
         let run = self.readable_run(addr, out.len());
-        for (i, slot) in out.iter_mut().take(run).enumerate() {
-            *slot = self.bytes[&(addr + i as u64)];
+        if run > 0 {
+            let (start, bytes) = self.covering(addr).expect("readable run is mapped");
+            let offset = (addr - start) as usize;
+            out[..run].copy_from_slice(&bytes[offset..offset + run]);
         }
         // A read that could not touch a single mapped byte is a failed read;
         // one that ran off the end of a region keeps what it got.
@@ -213,7 +258,7 @@ impl MemoryView for FakeMemory {
     fn metadata(&self) -> MemoryViewMetadata {
         MemoryViewMetadata {
             max_address: Address::from(u64::MAX),
-            real_size: self.bytes.len() as umem,
+            real_size: self.runs.values().map(Vec::len).sum::<usize>() as umem,
             readonly: false,
             little_endian: true,
             arch_bits: 64,
@@ -301,6 +346,21 @@ mod tests {
     }
 
     #[test]
+    fn rip_relative_underflow_is_rejected() {
+        let mut mem = FakeMemory::new();
+        let code = 0x10000u64;
+        mem.put_i32(code + 3, -0x10008);
+        assert!(address::resolve_rip(&mut mem, Address::from(code)).is_err());
+    }
+
+    #[test]
+    fn rip_relative_displacement_address_overflow_is_rejected() {
+        let mut mem = FakeMemory::new();
+        let code = u64::MAX - 1;
+        assert!(address::resolve_rip(&mut mem, Address::from(code)).is_err());
+    }
+
+    #[test]
     fn allocations_do_not_overlap_and_stay_aligned() {
         let mut mem = FakeMemory::new();
         let first = mem.alloc_cstr("a");
@@ -309,5 +369,55 @@ mod tests {
         assert_eq!(second % 0x10, 0);
         assert!(mem.is_mapped(first));
         assert!(mem.is_mapped(second));
+    }
+
+    #[test]
+    fn adjacent_puts_merge_into_one_readable_run() {
+        let mut mem = FakeMemory::new();
+        mem.put(0x1000, &[1, 2, 3, 4]);
+        mem.put(0x1004, &[5, 6, 7, 8]);
+        let mut buf = [0u8; 8];
+        mem.read_raw_into(Address::from(0x1000u64), &mut buf)
+            .expect("merged run is readable");
+        assert_eq!(buf, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(mem.is_mapped(0x1000));
+        assert!(mem.is_mapped(0x1007));
+        assert!(!mem.is_mapped(0x1008));
+    }
+
+    #[test]
+    fn put_overwrites_the_middle_of_an_existing_run() {
+        let mut mem = FakeMemory::new();
+        mem.put(0x2000, &[1, 1, 1, 1]);
+        mem.put(0x2001, &[9, 9]);
+        let mut buf = [0u8; 4];
+        mem.read_raw_into(Address::from(0x2000u64), &mut buf)
+            .expect("overwritten run is readable");
+        assert_eq!(buf, [1, 9, 9, 1]);
+    }
+
+    #[test]
+    fn a_gap_between_runs_stays_unmapped() {
+        let mut mem = FakeMemory::new();
+        mem.put(0x1000, &[0x11, 0x22, 0x33, 0x44]);
+        mem.put(0x1010, &[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        let mut left = [0u8; 4];
+        mem.read_raw_into(Address::from(0x1000u64), &mut left)
+            .expect("first run still readable");
+        assert_eq!(left, [0x11, 0x22, 0x33, 0x44]);
+
+        let mut right = [0u8; 4];
+        mem.read_raw_into(Address::from(0x1010u64), &mut right)
+            .expect("second run still readable");
+        assert_eq!(right, [0xAA, 0xBB, 0xCC, 0xDD]);
+
+        assert!(!mem.is_mapped(0x1008), "the hole must not be filled by a merge");
+        let mut hole = [0u8; 4];
+        assert!(
+            mem.read_raw_into(Address::from(0x1008u64), &mut hole)
+                .is_err(),
+            "a raw read that starts in the gap must fail"
+        );
     }
 }

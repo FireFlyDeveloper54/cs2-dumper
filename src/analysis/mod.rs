@@ -1,9 +1,9 @@
-pub use buttons::*;
-pub use interfaces::*;
-pub use offsets::*;
-pub use protobufs::*;
-pub use schemas::*;
-pub use vtables::*;
+pub(crate) use buttons::*;
+pub(crate) use interfaces::*;
+pub(crate) use offsets::*;
+pub(crate) use protobufs::*;
+pub(crate) use schemas::*;
+pub(crate) use vtables::*;
 
 use std::any::type_name;
 
@@ -14,29 +14,30 @@ use log::{error, info};
 use memflow::prelude::v1::*;
 
 mod buttons;
-pub mod convars;
-pub mod dyn_offsets;
-pub mod entities;
-pub mod entity_anchor;
-pub mod entity_list;
-pub mod gameevents;
-pub mod global_anchor;
+pub(crate) mod convars;
+pub(crate) mod dyn_offsets;
+pub(crate) mod entities;
+pub(crate) mod entity_anchor;
+pub(crate) mod entity_list;
+pub(crate) mod gameevents;
+pub(crate) mod global_anchor;
 mod interfaces;
-pub mod manual_iface;
+pub(crate) mod manual_iface;
 pub mod module_data;
 mod offsets;
 mod protobufs;
-pub mod rtti;
-pub mod schema_anchor;
-pub mod schema_flags;
+pub(crate) mod rtti;
+pub mod read;
+pub(crate) mod schema_anchor;
+pub(crate) mod schema_flags;
 mod schemas;
-pub mod static_fields;
-pub mod view_matrix;
+pub(crate) mod static_fields;
+pub(crate) mod view_matrix;
 mod vtables;
-pub mod weapons;
+pub(crate) mod weapons;
 
 #[derive(Debug)]
-pub struct AnalysisResult {
+pub(crate) struct AnalysisResult {
     pub buttons: ButtonMap,
     pub interfaces: InterfaceMap,
     pub offsets: OffsetMap,
@@ -44,7 +45,7 @@ pub struct AnalysisResult {
     pub vtables: VTableMap,
 }
 
-pub fn analyze_all<P: Process + MemoryView>(process: &mut P) -> Result<AnalysisResult> {
+pub(crate) fn analyze_all<P: Process + MemoryView>(process: &mut P) -> Result<AnalysisResult> {
     let buttons = analyze(process, buttons);
 
     info!("found {} buttons", buttons.len());
@@ -53,10 +54,7 @@ pub fn analyze_all<P: Process + MemoryView>(process: &mut P) -> Result<AnalysisR
 
     info!(
         "found {} interfaces across {} modules",
-        interfaces
-            .iter()
-            .map(|(_, ifaces)| ifaces.len())
-            .sum::<usize>(),
+        interfaces.values().map(|ifaces| ifaces.len()).sum::<usize>(),
         interfaces.len()
     );
 
@@ -64,10 +62,7 @@ pub fn analyze_all<P: Process + MemoryView>(process: &mut P) -> Result<AnalysisR
 
     info!(
         "found {} offsets across {} modules",
-        offsets
-            .iter()
-            .map(|(_, offsets)| offsets.len())
-            .sum::<usize>(),
+        offsets.values().map(|offsets| offsets.len()).sum::<usize>(),
         offsets.len()
     );
 

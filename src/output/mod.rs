@@ -3,10 +3,9 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
+use rayon::prelude::*;
 
 use chrono::{DateTime, Utc};
-
-use memflow::prelude::v1::*;
 
 use serde_json::json;
 
@@ -14,38 +13,40 @@ use formatter::Formatter;
 
 use crate::analysis::*;
 
-pub mod amalgamation;
+pub(crate) mod amalgamation;
 mod buttons;
-pub mod convars;
-pub mod engine_structs;
-pub mod entities;
-pub mod entity_system;
+pub(crate) mod convars;
+pub(crate) mod cpp_types;
+pub(crate) mod engine_structs;
+pub(crate) mod entities;
+pub(crate) mod entity_system;
 mod formatter;
-pub mod gameevents;
-pub mod guessed_structs;
+pub(crate) mod gameevents;
+pub(crate) mod guessed_structs;
 pub mod ident;
-pub mod include_tree;
-pub mod interface_classes;
-pub mod interface_diff;
+pub(crate) use ident::slugify;
+pub(crate) mod include_tree;
+pub(crate) mod interface_classes;
+pub(crate) mod interface_diff;
 mod interfaces;
-pub mod netvars;
+pub(crate) mod netvars;
 mod offsets;
-pub mod pattern_diff;
-pub mod protobufs;
-pub mod schema_diff;
-pub mod schema_index;
+pub(crate) mod pattern_diff;
+pub(crate) mod protobufs;
+pub(crate) mod schema_diff;
+pub(crate) mod schema_index;
 mod schemas;
 mod sdk;
-pub mod sdk_classes;
-pub mod verified;
-pub mod vtables;
-pub mod weapons;
+pub(crate) mod sdk_classes;
+pub(crate) mod verified;
+pub(crate) mod vtables;
+pub(crate) mod weapons;
 
 enum Item<'a> {
     Buttons(&'a ButtonMap),
     Interfaces(&'a InterfaceMap),
     Offsets(&'a OffsetMap),
-    Schemas(&'a SchemaMap),
+    SchemaModule(schemas::SchemaModule<'a>),
 }
 
 impl<'a> Item<'a> {
@@ -56,7 +57,7 @@ impl<'a> Item<'a> {
             "json" => self.write_json(fmt),
             "rs" => self.write_rs(fmt),
             "zig" => self.write_zig(fmt),
-            _ => unimplemented!(),
+            _ => Err(fmt::Error),
         }
     }
 }
@@ -75,7 +76,7 @@ impl<'a> CodeWriter for Item<'a> {
             Item::Buttons(buttons) => buttons.write_cs(fmt),
             Item::Interfaces(ifaces) => ifaces.write_cs(fmt),
             Item::Offsets(offsets) => offsets.write_cs(fmt),
-            Item::Schemas(schemas) => schemas.write_cs(fmt),
+            Item::SchemaModule(module) => module.write_cs(fmt),
         }
     }
 
@@ -84,7 +85,7 @@ impl<'a> CodeWriter for Item<'a> {
             Item::Buttons(buttons) => buttons.write_hpp(fmt),
             Item::Interfaces(ifaces) => ifaces.write_hpp(fmt),
             Item::Offsets(offsets) => offsets.write_hpp(fmt),
-            Item::Schemas(schemas) => schemas.write_hpp(fmt),
+            Item::SchemaModule(module) => module.write_hpp(fmt),
         }
     }
 
@@ -93,7 +94,7 @@ impl<'a> CodeWriter for Item<'a> {
             Item::Buttons(buttons) => buttons.write_json(fmt),
             Item::Interfaces(ifaces) => ifaces.write_json(fmt),
             Item::Offsets(offsets) => offsets.write_json(fmt),
-            Item::Schemas(schemas) => schemas.write_json(fmt),
+            Item::SchemaModule(module) => module.write_json(fmt),
         }
     }
 
@@ -102,7 +103,7 @@ impl<'a> CodeWriter for Item<'a> {
             Item::Buttons(buttons) => buttons.write_rs(fmt),
             Item::Interfaces(ifaces) => ifaces.write_rs(fmt),
             Item::Offsets(offsets) => offsets.write_rs(fmt),
-            Item::Schemas(schemas) => schemas.write_rs(fmt),
+            Item::SchemaModule(module) => module.write_rs(fmt),
         }
     }
 
@@ -111,12 +112,22 @@ impl<'a> CodeWriter for Item<'a> {
             Item::Buttons(buttons) => buttons.write_zig(fmt),
             Item::Interfaces(ifaces) => ifaces.write_zig(fmt),
             Item::Offsets(offsets) => offsets.write_zig(fmt),
-            Item::Schemas(schemas) => schemas.write_zig(fmt),
+            Item::SchemaModule(module) => module.write_zig(fmt),
         }
     }
 }
 
-pub struct Output<'a> {
+pub(crate) struct ManifestExtra<'a> {
+    pub backend: &'a str,
+    pub load_lib: bool,
+    pub shade_bindings: &'a [String],
+    pub module_fingerprints: serde_json::Value,
+    pub missing_schema_modules: Vec<String>,
+    pub pattern_summary: Option<serde_json::Value>,
+    pub steam_inf: Option<serde_json::Value>,
+}
+
+pub(crate) struct Output<'a> {
     file_types: &'a [String],
     indent_size: usize,
     out_dir: &'a Path,
@@ -133,7 +144,7 @@ impl<'a> Output<'a> {
         result: &'a AnalysisResult,
         build_number: Option<u32>,
     ) -> Result<Self> {
-        fs::create_dir_all(&out_dir)?;
+        fs::create_dir_all(out_dir)?;
 
         Ok(Self {
             file_types,
@@ -145,25 +156,58 @@ impl<'a> Output<'a> {
         })
     }
 
-    pub fn dump_all<P: MemoryView + Process>(&self, process: &mut P) -> Result<()> {
+    pub fn dump_all(&self) -> Result<()> {
         let items = [
             ("buttons", Item::Buttons(&self.result.buttons)),
             ("interfaces", Item::Interfaces(&self.result.interfaces)),
             ("offsets", Item::Offsets(&self.result.offsets)),
         ];
 
-        for (file_name, item) in &items {
-            self.dump_item(file_name, item)?;
+        let mut first_err = items
+            .par_iter()
+            .filter_map(|(file_name, item)| {
+                self.dump_item(file_name, item).err().map(|err| {
+                    log::warn!("dump-all write failed: {err}");
+                    err
+                })
+            })
+            .reduce_with(|first, _| first);
+
+        let ((schema_res, sdk_res), info_res) = rayon::join(
+            || {
+                rayon::join(
+                    || self.dump_schemas(),
+                    || sdk::dump_sdk(self.out_dir, &self.result.schemas, self.build_number),
+                )
+            },
+            || self.dump_info(),
+        );
+        if let Err(err) = schema_res {
+            log::warn!("dump-all write failed: {err}");
+            if first_err.is_none() {
+                first_err = Some(err);
+            }
+        }
+        if let Err(err) = sdk_res {
+            log::warn!("failed to write sdk/: {err}");
+            if first_err.is_none() {
+                first_err = Some(err.into());
+            }
+        }
+        if let Err(err) = info_res {
+            log::warn!("dump-all write failed: {err}");
+            if first_err.is_none() {
+                first_err = Some(err);
+            }
         }
 
-        self.dump_schemas()?;
-        sdk::dump_sdk(self.out_dir, &self.result.schemas, self.build_number)?;
-        self.dump_info(process)?;
-
-        Ok(())
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
-    pub fn dump_manifest(&self) -> Result<()> {
+    pub fn dump_manifest(&self, extra: &ManifestExtra<'_>) -> Result<()> {
         let class_count: usize = self
             .result
             .schemas
@@ -178,66 +222,76 @@ impl<'a> Output<'a> {
             .sum();
 
         let exists = |relative: &str| self.out_dir.join(relative).exists();
+        let mut outputs = serde_json::Map::new();
+        let output_flags = [
+            ("buttons", exists("buttons.hpp") || exists("buttons.json")),
+            ("offsets", exists("offsets.hpp")),
+            (
+                "interfaces",
+                exists("interfaces.hpp") || exists("interfaces/interfaces.hpp"),
+            ),
+            ("schemas", exists("client_dll.hpp")),
+            ("sdk", exists("sdk/sdk.hpp")),
+            ("sdk_modules", exists("sdk/modules.hpp")),
+            ("sdk_class_headers", exists("sdk/classes")),
+            ("schema_index", exists("schema_index.json")),
+            ("schema_index_diff", exists("schema_index.diff.json")),
+            ("interface_diff", exists("interfaces.diff.json")),
+            ("patterns", exists("patterns.json")),
+            ("pattern_headers", exists("patterns.hpp")),
+            ("pattern_markdown", exists("patterns.md")),
+            (
+                "pattern_language_outputs",
+                exists("patterns.cs") || exists("patterns.rs") || exists("patterns.zig"),
+            ),
+            ("pattern_diff", exists("patterns.diff.json")),
+            ("pattern_repair", exists("patterns.repair.json")),
+            ("pattern_repair_patch", exists("patterns.repair.patch.json")),
+            ("netvars", exists("netvars/netvars.json")),
+            ("convars", exists("convars/convars.json")),
+            ("gameevents", exists("gameevents/gameevents.json")),
+            ("vtables", exists("vtables.json")),
+            ("vtable_headers", exists("vtables.hpp")),
+            ("typed_interfaces", exists("interfaces/interfaces.hpp")),
+            ("protobufs", exists("protobufs/protobufs.json")),
+            ("entity_snapshot", exists("entities/entities.json")),
+            ("weapon_vdata", exists("weapons/weapons.json")),
+            ("include_tree", exists("macros.hpp") && exists("cs2.hpp")),
+            ("schema_headers", exists("schemas")),
+            ("engine_structs", exists("engine/engine_structs.json")),
+            ("verified_features", exists("verified_features.json")),
+            ("impl_entity_system", exists("impl/entity_system.hpp")),
+            ("schema_inventory", exists("schemas/info.txt")),
+            ("guessed_structs", exists("structs.hpp")),
+        ];
+        for (key, present) in output_flags {
+            outputs.insert(key.to_string(), json!(present));
+        }
+
         let content = serde_json::to_string_pretty(&json!({
             "generated_at": self.timestamp.to_rfc3339(),
+            "build_number": self.build_number,
+            "backend": extra.backend,
+            "load_lib": extra.load_lib,
+            "shade_bindings": extra.shade_bindings,
+            "steam_inf": extra.steam_inf,
+            "module_fingerprints": extra.module_fingerprints,
+            "modules_list": self.result.schemas.keys().collect::<Vec<_>>(),
+            "missing_schema_modules": extra.missing_schema_modules,
+            "pattern_summary": extra.pattern_summary,
             "modules": self.result.schemas.len(),
             "classes": class_count,
             "enums": enum_count,
-            "outputs": {
-                "buttons": exists("buttons.hpp") || exists("buttons.json"),
-                "offsets": exists("offsets.hpp"),
-                "interfaces": exists("interfaces.hpp") || exists("interfaces/interfaces.hpp"),
-                "schemas": exists("client_dll.hpp"),
-                "sdk": exists("sdk/sdk.hpp"),
-                "schema_index": exists("schema_index.json"),
-                "schema_index_diff": exists("schema_index.diff.json"),
-                "interface_diff": exists("interfaces.diff.json"),
-                "sdk_modules": exists("sdk/modules.hpp"),
-                "sdk_class_headers": exists("sdk/classes"),
-                "patterns": exists("patterns.json"),
-                "pattern_headers": exists("patterns.hpp"),
-                "pattern_markdown": exists("patterns.md"),
-                "pattern_language_outputs": exists("patterns.cs") || exists("patterns.rs") || exists("patterns.zig"),
-                "pattern_diff": exists("patterns.diff.json"),
-                "pattern_repair": exists("patterns.repair.json"),
-                "pattern_repair_patch": exists("patterns.repair.patch.json"),
-                "pattern_summary": exists("patterns.json"),
-                "netvars": exists("netvars/netvars.json"),
-                "convars": exists("convars/convars.json"),
-                "gameevents": exists("gameevents/gameevents.json"),
-                "vtables": exists("vtables.json"),
-                "vtable_headers": exists("vtables.hpp"),
-                "typed_interfaces": exists("interfaces/interfaces.hpp"),
-                "protobufs": exists("protobufs/protobufs.json"),
-                "entity_snapshot": exists("entities/entities.json"),
-                "weapon_vdata": exists("weapons/weapons.json"),
-                "include_tree": exists("macros.hpp") && exists("cs2.hpp"),
-                "schema_headers": exists("schemas"),
-                "engine_structs": exists("engine/engine_structs.json"),
-                "verified_features": exists("verified_features.json"),
-                "impl_entity_system": exists("impl/entity_system.hpp"),
-                "schema_inventory": exists("schemas/info.txt"),
-                "guessed_structs": exists("structs.hpp"),
-            },
+            "outputs": outputs,
         }))?;
 
         fs::write(self.out_dir.join("manifest.json"), content)?;
         Ok(())
     }
-    fn dump_info<P: MemoryView + Process>(&self, process: &mut P) -> Result<()> {
+    fn dump_info(&self) -> Result<()> {
         let file_path = self.out_dir.join("info.json");
 
-        let build_number = self.build_number.or_else(|| {
-            self.result
-                .offsets
-                .iter()
-                .find_map(|(module_name, offsets)| {
-                    let module = process.module_by_name(module_name).ok()?;
-                    let offset = offsets.iter().find(|(name, _)| *name == "dwBuildNumber")?.1;
-
-                    process.read::<u32>(module.base + offset).data_part().ok()
-                })
-        });
+        let build_number = self.build_number;
 
         let content = serde_json::to_string_pretty(&json!({
             "timestamp": self.timestamp.to_rfc3339(),
@@ -249,33 +303,72 @@ impl<'a> Output<'a> {
         Ok(())
     }
 
-    fn dump_item(&self, file_name: &str, item: &Item) -> Result<()> {
-        for file_type in self.file_types {
-            let mut out = String::new();
-            let mut fmt = Formatter::new(&mut out, self.indent_size);
+    fn write_item_file(&self, file_name: &str, item: &Item, file_type: &str) -> Result<()> {
+        let mut out = String::with_capacity(match item {
+            Item::SchemaModule(module) => (module.classes.len().saturating_mul(384)
+                + module.enums.len().saturating_mul(128))
+            .max(8192),
+            _ => 4096,
+        });
+        let mut fmt = Formatter::new(&mut out, self.indent_size);
 
-            if file_type != "json" {
-                self.write_banner(&mut fmt)?;
-            }
-
-            item.write(&mut fmt, file_type)?;
-
-            let file_path = self.out_dir.join(format!("{}.{}", file_name, file_type));
-
-            fs::write(&file_path, out)?;
+        if file_type != "json" {
+            self.write_banner(&mut fmt)?;
         }
 
+        item.write(&mut fmt, file_type)?;
+        let mut path = self.out_dir.join(file_name);
+        path.set_extension(file_type);
+        fs::write(path, out)?;
         Ok(())
     }
 
-    fn dump_schemas(&self) -> Result<()> {
-        for (module_name, (classes, enums)) in &self.result.schemas {
-            let map = SchemaMap::from([(module_name.clone(), (classes.clone(), enums.clone()))]);
+    fn dump_item(&self, file_name: &str, item: &Item) -> Result<()> {
+        let first_err = self
+            .file_types
+            .par_iter()
+            .filter_map(|file_type| {
+                self.write_item_file(file_name, item, file_type)
+                    .err()
+                    .map(|err| {
+                        log::warn!("failed to write {file_name}.{file_type}: {err}");
+                        err
+                    })
+            })
+            .reduce_with(|first, _| first);
 
-            self.dump_item(&slugify(&module_name), &Item::Schemas(&map))?;
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
+    }
 
-        Ok(())
+    fn dump_schemas(&self) -> Result<()> {
+        let first_err = self
+            .result
+            .schemas
+            .par_iter()
+            .filter_map(|(module_name, (classes, enums))| {
+                self.dump_item(
+                    ident::slugify(module_name).as_ref(),
+                    &Item::SchemaModule(schemas::SchemaModule {
+                        module_name,
+                        classes,
+                        enums,
+                    }),
+                )
+                .err()
+                .map(|err| {
+                    log::warn!("failed to write schema module {module_name}: {err}");
+                    err
+                })
+            })
+            .reduce_with(|first, _| first);
+
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     fn write_banner(&self, fmt: &mut Formatter<'_>) -> Result<()> {
@@ -287,19 +380,29 @@ impl<'a> Output<'a> {
 }
 
 #[inline]
-fn slugify(input: &str) -> String {
-    input.replace(|c: char| !c.is_alphanumeric(), "_")
-}
-
-#[inline]
-fn zig_ident(input: &str) -> String {
+pub(crate) fn zig_ident(input: &str) -> std::borrow::Cow<'_, str> {
+    if input.is_empty() {
+        return std::borrow::Cow::Borrowed("anonymous");
+    }
     if is_zig_identifier(input) && !is_zig_keyword(input) {
-        input.to_string()
+        std::borrow::Cow::Borrowed(input)
     } else {
         let escaped = input.replace('\\', "\\\\").replace('"', "\\\"");
-
-        format!("@\"{}\"", escaped)
+        std::borrow::Cow::Owned(format!("@\"{}\"", escaped))
     }
+}
+
+/// Preserve generated line-comment structure when schema text is malformed.
+pub(crate) fn comment_text(input: &str) -> std::borrow::Cow<'_, str> {
+    if !input.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    std::borrow::Cow::Owned(
+        input
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect(),
+    )
 }
 
 #[inline]
@@ -371,4 +474,351 @@ fn is_zig_keyword(input: &str) -> bool {
             | "volatile"
             | "while"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::{AnalysisResult, Class, ClassField, SchemaMap};
+
+    #[test]
+    fn dump_all_writes_slugified_schema_file_from_borrowed_module() {
+        let health_offset: i32 = 0x4A8;
+        let class_name = "C_TestPawn";
+        let field_name = "m_iHealth";
+        let module = "client.dll";
+
+        let schemas = SchemaMap::from([(
+            module.to_string(),
+            (
+                vec![Class {
+                    name: class_name.to_string(),
+                    module_name: module.into(),
+                    parent_name: None,
+                    size: 0x500,
+                    alignment: 8,
+                    metadata: Vec::new(),
+                    fields: vec![ClassField {
+                        name: field_name.to_string(),
+                        type_name: "int32".to_string(),
+                        offset: health_offset,
+                        metadata: Vec::new(),
+                    }],
+                    static_fields: Vec::new(),
+                    flags: Vec::new(),
+                }],
+                Vec::new(),
+            ),
+        )]);
+
+        let result = AnalysisResult {
+            buttons: Default::default(),
+            interfaces: Default::default(),
+            offsets: Default::default(),
+            schemas,
+            vtables: Default::default(),
+        };
+
+        let out_dir =
+            std::env::temp_dir().join(format!("cs2-dumper-schema-borrow-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out_dir);
+        let file_types = ["cs", "hpp", "json", "rs", "zig"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let output =
+            Output::new(&file_types, 4, &out_dir, &result, Some(12345)).expect("create output dir");
+        output.dump_all().expect("shipped dump_all path");
+
+        let hpp = fs::read_to_string(out_dir.join("client_dll.hpp")).expect("client_dll.hpp");
+        assert!(
+            hpp.contains(class_name),
+            "missing class {class_name} in {hpp}"
+        );
+        assert!(
+            hpp.contains(field_name),
+            "missing field {field_name} in {hpp}"
+        );
+        let offset_text = format!("{:#X}", health_offset);
+        assert!(
+            hpp.contains(&offset_text),
+            "missing offset {offset_text} in {hpp}"
+        );
+
+        let json_raw =
+            fs::read_to_string(out_dir.join("client_dll.json")).expect("client_dll.json");
+        let json: serde_json::Value =
+            serde_json::from_str(&json_raw).expect("client_dll.json must parse");
+        assert_eq!(
+            json[module]["classes"][class_name]["fields"][field_name], health_offset,
+            "json missing {class_name}.{field_name}={health_offset}: {json_raw}"
+        );
+
+        assert!(
+            out_dir.join("sdk").join("sdk.hpp").is_file(),
+            "default dump_all must still emit sdk/sdk.hpp"
+        );
+
+        output
+            .dump_manifest(&ManifestExtra {
+                backend: "loadlib",
+                load_lib: true,
+                shade_bindings: &[],
+                module_fingerprints: json!({}),
+                missing_schema_modules: Vec::new(),
+                pattern_summary: None,
+                steam_inf: Some(json!({
+                    "patch_version": "1.41.7.6",
+                    "client_version": 2000885,
+                })),
+            })
+            .expect("dump_manifest");
+        let manifest_raw =
+            fs::read_to_string(out_dir.join("manifest.json")).expect("manifest.json");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&manifest_raw).expect("manifest.json must parse");
+        assert_eq!(manifest["backend"], "loadlib");
+        assert_eq!(manifest["steam_inf"]["patch_version"], "1.41.7.6");
+        assert_eq!(manifest["steam_inf"]["client_version"], 2000885);
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn dump_all_unknown_file_type_still_emits_sdk_and_returns_error() {
+        let schemas = SchemaMap::from([(
+            "client.dll".to_string(),
+            (
+                vec![Class {
+                    name: "C_TestPawn".to_string(),
+                    module_name: "client.dll".into(),
+                    parent_name: None,
+                    size: 0x500,
+                    alignment: 8,
+                    metadata: Vec::new(),
+                    fields: vec![ClassField {
+                        name: "m_iHealth".to_string(),
+                        type_name: "int32".to_string(),
+                        offset: 0x4A8,
+                        metadata: Vec::new(),
+                    }],
+                    static_fields: Vec::new(),
+                    flags: Vec::new(),
+                }],
+                Vec::new(),
+            ),
+        )]);
+        let result = AnalysisResult {
+            buttons: Default::default(),
+            interfaces: Default::default(),
+            offsets: Default::default(),
+            schemas,
+            vtables: Default::default(),
+        };
+        let out_dir =
+            std::env::temp_dir().join(format!("cs2-dumper-unknown-type-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out_dir);
+        let file_types = vec!["json".to_string(), "lua".to_string()];
+        let output =
+            Output::new(&file_types, 4, &out_dir, &result, Some(12345)).expect("create output dir");
+        output
+            .dump_all()
+            .expect_err("unknown file type must be a write error, not a panic");
+        assert!(
+            out_dir.join("sdk").join("sdk.hpp").is_file(),
+            "sdk/ must still be written when a language writer fails"
+        );
+        assert!(
+            out_dir.join("client_dll.json").is_file(),
+            "a failed language must not skip the others"
+        );
+        assert!(
+            !out_dir.join("client_dll.lua").is_file(),
+            "unknown language must not emit a file"
+        );
+        assert!(
+            out_dir.join("info.json").is_file(),
+            "info.json is independent of file_types"
+        );
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn dump_all_propagates_sdk_write_failures() {
+        let out_dir = std::env::temp_dir().join(format!(
+            "cs2-dumper-sdk-write-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&out_dir);
+        fs::create_dir_all(&out_dir).expect("create output dir");
+        // A file where the SDK directory must be created makes only the SDK
+        // writer fail; the ordinary root-level writers remain usable.
+        fs::write(out_dir.join("sdk"), b"occupied").expect("occupy sdk path");
+
+        let result = AnalysisResult {
+            buttons: Default::default(),
+            interfaces: Default::default(),
+            offsets: Default::default(),
+            schemas: Default::default(),
+            vtables: Default::default(),
+        };
+        let file_types = vec!["json".to_string()];
+        let output = Output::new(&file_types, 4, &out_dir, &result, None)
+            .expect("create output writer");
+
+        let error = output
+            .dump_all()
+            .expect_err("SDK filesystem failures must reach the caller");
+        assert!(!error.to_string().is_empty());
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn schema_languages_escape_keyword_identifiers() {
+        let schemas = SchemaMap::from([(
+            "class.dll".to_string(),
+            (
+                vec![Class {
+                    name: "class".to_string(),
+                    module_name: "class.dll".into(),
+                    parent_name: None,
+                    size: 0x10,
+                    alignment: 4,
+                    metadata: Vec::new(),
+                    fields: vec![ClassField {
+                        name: "class".to_string(),
+                        type_name: "int32\nINJECTED".to_string(),
+                        offset: 0,
+                        metadata: Vec::new(),
+                    }],
+                    static_fields: Vec::new(),
+                    flags: Vec::new(),
+                }],
+                vec![Enum {
+                    name: "enum".to_string(),
+                    alignment: 4,
+                    size: 4,
+                    members: vec![EnumMember {
+                        name: "operator".to_string(),
+                        value: 0,
+                    }],
+                    flags: Vec::new(),
+                }],
+            ),
+        )]);
+
+        for kind in ["hpp", "cs", "rs"] {
+            let mut body = String::new();
+            let mut fmt = Formatter::new(&mut body, 4);
+            match kind {
+                "hpp" => schemas.write_hpp(&mut fmt),
+                "cs" => schemas.write_cs(&mut fmt),
+                "rs" => schemas.write_rs(&mut fmt),
+                _ => unreachable!(),
+            }
+            .expect("schema writer");
+            assert!(
+                !body.contains("\nINJECTED"),
+                "{kind} allowed comment text to escape its line: {body}"
+            );
+            if kind == "rs" {
+                assert!(body.contains("class: usize") || body.contains("operator ="));
+            } else {
+                assert!(body.contains("_class"), "{kind} did not escape class: {body}");
+                assert!(
+                    body.contains("_operator"),
+                    "{kind} did not escape enum member: {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_languages_disambiguate_sanitized_identifier_collisions() {
+        let schemas = SchemaMap::from([(
+            "client.dll".to_string(),
+            (
+                vec![Class {
+                    name: "foo_bar".to_string(),
+                    module_name: "client.dll".into(),
+                    parent_name: None,
+                    size: 0x10,
+                    alignment: 4,
+                    metadata: Vec::new(),
+                    fields: vec![
+                        ClassField {
+                            name: "x-y".to_string(),
+                            type_name: "int32".to_string(),
+                            offset: 0,
+                            metadata: Vec::new(),
+                        },
+                        ClassField {
+                            name: "x_y".to_string(),
+                            type_name: "int32".to_string(),
+                            offset: 4,
+                            metadata: Vec::new(),
+                        },
+                    ],
+                    static_fields: Vec::new(),
+                    flags: Vec::new(),
+                }],
+                vec![Enum {
+                    name: "foo-bar".to_string(),
+                    alignment: 4,
+                    size: 4,
+                    members: vec![
+                        EnumMember {
+                            name: "value-a".to_string(),
+                            value: 0,
+                        },
+                        EnumMember {
+                            name: "value_a".to_string(),
+                            value: 1,
+                        },
+                    ],
+                    flags: Vec::new(),
+                }],
+            ),
+        )]);
+
+        for kind in ["hpp", "cs", "rs", "zig"] {
+            let mut body = String::new();
+            let mut fmt = Formatter::new(&mut body, 4);
+            match kind {
+                "hpp" => schemas.write_hpp(&mut fmt),
+                "cs" => schemas.write_cs(&mut fmt),
+                "rs" => schemas.write_rs(&mut fmt),
+                "zig" => schemas.write_zig(&mut fmt),
+                _ => unreachable!(),
+            }
+            .expect("schema writer");
+            assert!(body.contains("foo_bar_2"), "{kind} type collision: {body}");
+            assert!(body.contains("x_y_2"), "{kind} field collision: {body}");
+            assert!(
+                body.contains("value_a_2"),
+                "{kind} enum-member collision: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn zig_ident_borrows_plain_identifiers() {
+        let name = "dwEntityList";
+        let out = zig_ident(name);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert!(std::ptr::eq(out.as_ref().as_ptr(), name.as_ptr()));
+        assert!(zig_ident("align").as_ref().starts_with("@\""));
+    }
+
+    #[test]
+    fn comment_text_keeps_untrusted_schema_text_on_one_line() {
+        let input = format!(
+            "C_Test{}#define injected 1{}",
+            char::from(10),
+            char::from(9)
+        );
+        assert_eq!(comment_text(&input).as_ref(), "C_Test #define injected 1 ");
+        let clean = "C_TestPawn";
+        assert!(matches!(comment_text(clean), std::borrow::Cow::Borrowed(_)));
+    }
 }

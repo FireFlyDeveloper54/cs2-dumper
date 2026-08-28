@@ -145,15 +145,14 @@ fn publishing_rva(
     symbol: &str,
     object: u64,
 ) -> Option<u32> {
-    let slots = global_anchor::globals_holding(image, base, ranges, object);
-    if slots.len() != 1 {
+    let Some(slot) = global_anchor::find_publishing_global(image, base, ranges, object) else {
         debug!(
             "{symbol}: object {object:#X} is published through {} slots, declining",
-            slots.len()
+            global_anchor::globals_holding(image, base, ranges, object).len()
         );
         return None;
-    }
-    let rva = u32::try_from(slots[0].checked_sub(base)?).ok()?;
+    };
+    let rva = u32::try_from(slot.checked_sub(base)?).ok()?;
     debug!("{symbol} recovered from a live object at {CLIENT}+{rva:#X}");
     Some(rva)
 }
@@ -173,7 +172,7 @@ fn game_rules<P: MemoryView>(
         .iter()
         .filter(|entity| entity.classname == "cs_gamerules")
         .find_map(|entity| {
-            let rules = rd_u64(process, entity.instance + offset);
+            let rules = rd_u64(process, entity.instance.checked_add(offset)?);
             (0x10000..USER_SPACE_END).contains(&rules).then_some(rules)
         })
 }
@@ -223,10 +222,7 @@ fn is_pawn(classname: &str) -> bool {
 }
 
 fn rd_u64<P: MemoryView>(process: &mut P, va: u64) -> u64 {
-    process
-        .read::<u64>(Address::from(va))
-        .data_part()
-        .unwrap_or(0)
+    crate::analysis::read::u64_va(process, va)
 }
 
 #[cfg(test)]
@@ -265,7 +261,7 @@ mod tests {
             (
                 vec![Class {
                     name: "C_CSGameRulesProxy".to_string(),
-                    module_name: "client.dll".to_string(),
+                    module_name: "client.dll".into(),
                     parent_name: None,
                     size: 0x1000,
                     alignment: 8,
@@ -402,6 +398,17 @@ mod tests {
         let rules = mem.alloc(0x400);
         mem.put_ptr(proxy + OFF_GAME_RULES as u64, rules);
         assert!(recovered(&image, &mut mem, global).is_empty());
+    }
+
+    #[test]
+    fn an_overflowing_rules_field_address_is_ignored() {
+        let mut mem = FakeMemory::new();
+        let entity = entity_list::LiveEntity {
+            index: 1,
+            classname: "cs_gamerules".to_string(),
+            instance: u64::MAX,
+        };
+        assert_eq!(game_rules(&mut mem, &schemas(), &[entity]), None);
     }
 
     /// A null entity-system global means there is no world to read, which is a

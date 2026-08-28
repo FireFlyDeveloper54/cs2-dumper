@@ -69,13 +69,19 @@ pub fn find_schema_system<P: MemoryView>(
     let mut ambiguous = false;
 
     for &(rva, size) in ranges {
-        let start = rva as usize;
+        let start = (rva as usize).min(image.len());
         let end = start.saturating_add(size as usize).min(image.len());
         let mut offset = start.next_multiple_of(8);
 
-        while offset + SPAN <= end {
+        while offset
+            .checked_add(SPAN)
+            .is_some_and(|candidate_end| candidate_end <= end)
+        {
             if let Some((array, score)) = score_candidate(mem, image, offset) {
-                let va = base + offset as u64;
+                let Some(va) = base.checked_add(offset as u64) else {
+                    offset += 8;
+                    continue;
+                };
                 match best {
                     None => best = Some((va, array, score)),
                     Some((_, best_array, best_score)) => {
@@ -106,15 +112,16 @@ fn score_candidate<P: MemoryView>(
     image: &[u8],
     offset: usize,
 ) -> Option<(u64, usize)> {
-    let count = rd_i32(image, offset + TYPE_SCOPES_COUNT)?;
+    let count = crate::analysis::read::i32_le_at(image, offset.checked_add(TYPE_SCOPES_COUNT)?)?;
     if !(1..=MAX_SCOPES).contains(&count) {
         return None;
     }
-    let registrations = rd_i32(image, offset + REGISTRATION_COUNT)?;
+    let registrations =
+        crate::analysis::read::i32_le_at(image, offset.checked_add(REGISTRATION_COUNT)?)?;
     if !(1..=MAX_REGISTRATIONS).contains(&registrations) {
         return None;
     }
-    let array = rd_u64(image, offset + TYPE_SCOPES_DATA)?;
+    let array = crate::analysis::read::u64_le_at(image, offset.checked_add(TYPE_SCOPES_DATA)?)?;
     if array < 0x10000 {
         return None;
     }
@@ -129,11 +136,17 @@ fn score_scopes<P: MemoryView>(mem: &mut P, array: u64, count: i32) -> usize {
     let sampled = (count as usize).min(PROBE_SCOPES);
     let mut names = BTreeSet::new();
     for index in 0..sampled {
-        let scope = read_u64(mem, array + 8 * index as u64);
+        let Some(scope_va) = array.checked_add(8 * index as u64) else {
+            continue;
+        };
+        let scope = read_u64(mem, scope_va);
         if scope < 0x10000 {
             continue;
         }
-        let name = read_cstr(mem, scope + SCOPE_NAME);
+        let Some(name_va) = scope.checked_add(SCOPE_NAME) else {
+            continue;
+        };
+        let name = read_cstr(mem, name_va);
         if plausible_scope_name(&name) {
             names.insert(name);
         }
@@ -146,24 +159,12 @@ fn plausible_scope_name(name: &str) -> bool {
     (1..=64).contains(&name.len()) && name.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-fn rd_i32(image: &[u8], at: usize) -> Option<i32> {
-    let bytes = image.get(at..at + 4)?;
-    Some(i32::from_le_bytes(bytes.try_into().ok()?))
-}
-
-fn rd_u64(image: &[u8], at: usize) -> Option<u64> {
-    let bytes = image.get(at..at + 8)?;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
-}
-
 fn read_u64<P: MemoryView>(mem: &mut P, va: u64) -> u64 {
-    mem.read::<u64>(Address::from(va)).data_part().unwrap_or(0)
+    crate::analysis::read::u64_va(mem, va)
 }
 
 fn read_cstr<P: MemoryView>(mem: &mut P, va: u64) -> String {
-    mem.read_utf8_lossy(Address::from(va), 64)
-        .data_part()
-        .unwrap_or_default()
+    crate::analysis::read::cstr(mem, va)
 }
 
 #[cfg(test)]

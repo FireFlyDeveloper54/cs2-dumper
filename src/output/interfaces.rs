@@ -3,27 +3,41 @@ use std::fmt::{self, Write};
 
 use heck::{AsPascalCase, AsSnakeCase};
 
-use super::{CodeWriter, Formatter, InterfaceMap, slugify, zig_ident};
+use super::ident::{
+    csharp_identifier, cpp_identifier, rust_identifier, IdentifierAllocator,
+};
+use super::{comment_text, slugify, zig_ident, CodeWriter, Formatter, InterfaceMap};
 
 impl CodeWriter for InterfaceMap {
     fn write_cs(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
         fmt.block("namespace CS2Dumper.Interfaces", false, |fmt| {
+            let mut modules = IdentifierAllocator::default();
             for (module_name, ifaces) in self {
-                writeln!(fmt, "// Module: {}", module_name)?;
+                writeln!(fmt, "// Module: {}", comment_text(module_name))?;
+                let module_ident = modules.allocate(
+                    AsPascalCase(csharp_identifier(module_name)).to_string(),
+                );
 
                 fmt.block(
-                    &format!("public static class {}", AsPascalCase(slugify(module_name))),
+                    format_args!("public static class {module_ident}"),
                     false,
                     |fmt| {
+                        let mut names = IdentifierAllocator::default();
                         for (name, value) in ifaces {
                             if *value > i32::MAX as u64 {
                                 writeln!(
                                     fmt,
                                     "public static readonly nint {} = unchecked((nint){:#X});",
-                                    name, value
+                                    names.allocate(csharp_identifier(name)),
+                                    value
                                 )?;
                             } else {
-                                writeln!(fmt, "public const nint {} = {:#X};", name, value)?;
+                                writeln!(
+                                    fmt,
+                                    "public const nint {} = {:#X};",
+                                    names.allocate(csharp_identifier(name)),
+                                    value
+                                )?;
                             };
                         }
 
@@ -43,15 +57,25 @@ impl CodeWriter for InterfaceMap {
 
         fmt.block("namespace cs2_dumper", false, |fmt| {
             fmt.block("namespace interfaces", false, |fmt| {
+                let mut modules = IdentifierAllocator::default();
                 for (module_name, ifaces) in self {
-                    writeln!(fmt, "// Module: {}", module_name)?;
+                    writeln!(fmt, "// Module: {}", comment_text(module_name))?;
+                    let module_ident = modules.allocate(cpp_identifier(
+                        &AsSnakeCase(slugify(module_name)).to_string(),
+                    ));
 
                     fmt.block(
-                        &format!("namespace {}", AsSnakeCase(slugify(module_name))),
+                        format_args!("namespace {module_ident}"),
                         false,
                         |fmt| {
+                            let mut names = IdentifierAllocator::default();
                             for (name, value) in ifaces {
-                                writeln!(fmt, "constexpr std::ptrdiff_t {} = {:#X};", name, value)?;
+                                writeln!(
+                                    fmt,
+                                    "constexpr std::ptrdiff_t {} = {:#X};",
+                                    names.allocate(cpp_identifier(name)),
+                                    value
+                                )?;
                             }
 
                             Ok(())
@@ -68,14 +92,13 @@ impl CodeWriter for InterfaceMap {
         let content: BTreeMap<_, _> = self
             .iter()
             .map(|(module_name, ifaces)| {
-                let ifaces: BTreeMap<_, _> =
-                    ifaces.iter().map(|(name, value)| (name, value)).collect();
+                let ifaces: BTreeMap<_, _> = ifaces.iter().collect();
 
                 (module_name, ifaces)
             })
             .collect();
 
-        fmt.write_str(&serde_json::to_string_pretty(&content).unwrap())
+        super::formatter::write_pretty_json(fmt, &content)
     }
 
     fn write_rs(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
@@ -83,15 +106,25 @@ impl CodeWriter for InterfaceMap {
 
         fmt.block("pub mod cs2_dumper", false, |fmt| {
             fmt.block("pub mod interfaces", false, |fmt| {
+                let mut modules = IdentifierAllocator::default();
                 for (module_name, ifaces) in self {
-                    writeln!(fmt, "// Module: {}", module_name)?;
+                    writeln!(fmt, "// Module: {}", comment_text(module_name))?;
+                    let module_ident = modules.allocate(rust_identifier(
+                        &AsSnakeCase(slugify(module_name)).to_string(),
+                    ));
 
                     fmt.block(
-                        &format!("pub mod {}", AsSnakeCase(slugify(module_name))),
+                        format_args!("pub mod {module_ident}"),
                         false,
                         |fmt| {
+                            let mut names = IdentifierAllocator::default();
                             for (name, value) in ifaces {
-                                writeln!(fmt, "pub const {}: usize = {:#X};", name, value)?;
+                                writeln!(
+                                    fmt,
+                                    "pub const {}: usize = {:#X};",
+                                    names.allocate(rust_identifier(name)),
+                                    value
+                                )?;
                             }
 
                             Ok(())
@@ -108,12 +141,13 @@ impl CodeWriter for InterfaceMap {
         fmt.block("pub const cs2_dumper = struct", true, |fmt| {
             fmt.block("pub const interfaces = struct", true, |fmt| {
                 for (module_name, ifaces) in self {
-                    writeln!(fmt, "// Module: {}", module_name)?;
+                    writeln!(fmt, "// Module: {}", comment_text(module_name))?;
 
-                    let module_name = zig_ident(&AsSnakeCase(slugify(module_name)).to_string());
+                    let snake = AsSnakeCase(slugify(module_name).as_ref()).to_string();
+                    let module_name = zig_ident(&snake);
 
                     fmt.block(
-                        &format!("pub const {} = struct", module_name),
+                        format_args!("pub const {} = struct", module_name),
                         true,
                         |fmt| {
                             for (name, value) in ifaces {

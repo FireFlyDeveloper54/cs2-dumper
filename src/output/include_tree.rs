@@ -4,22 +4,27 @@
 //! friendly header tree so a consumer can `#include "cs2.hpp"` after adding
 //! the output directory to their include path.
 //!
-//!     macros.hpp
-//!     schemas/<module>_dll.hpp
-//!     impl/entity_system.hpp
-//!     engine/*.h
-//!     verified_features.json
+//! ```text
+//! macros.hpp
+//! schemas/<module>_dll.hpp
+//! impl/entity_system.hpp
+//! engine/*.h
+//! verified_features.json
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
 use chrono::Utc;
+use rayon::prelude::*;
 
 use crate::analysis::{AnalysisResult, OffsetMap};
 
 use super::amalgamation::{self, EDITOR_MODULES};
+use super::comment_text;
 use super::engine_structs;
 use super::entity_system;
 use super::sdk_classes;
@@ -33,273 +38,243 @@ pub fn dump(
     result: &AnalysisResult,
     build_number: Option<u32>,
     csgo_input_rva: Option<u32>,
-) -> Result<Vec<String>> {
+) -> Result<usize> {
     let schemas_dir = out_dir.join("schemas");
     fs::create_dir_all(out_dir)?;
     fs::create_dir_all(&schemas_dir)?;
 
     let ts = Utc::now().to_rfc3339();
-    let buttons: BTreeMap<String, u64> = result
-        .buttons
-        .iter()
-        .map(|(name, value)| (name.clone(), *value as u64))
-        .collect();
-
     let module_data =
-        sdk_classes::render_module_headers(&result.schemas, &buttons, build_number, &ts);
+        sdk_classes::render_module_headers(&result.schemas, &result.buttons, build_number, &ts);
 
     let mut macros = sdk_classes::render_macros_header();
-    let mut namespace_blocks: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut enum_underlying: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut namespace_blocks: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    let mut enum_underlying: BTreeMap<(&str, &str), &str> = BTreeMap::new();
 
-    let parse_mod_ns = |body: &str| -> Option<String> {
-        let p = body.find("\nnamespace ")?;
-        let s = p + "\nnamespace ".len();
-        let b = body.as_bytes();
-        let mut e = s;
-        while e < body.len() {
-            let c = b[e] as char;
-            if c.is_whitespace() || c == '{' {
-                break;
-            }
-            e += 1;
-        }
-        Some(body[s..e].to_string())
-    };
-    let module_ns_set: BTreeSet<String> = module_data
+    let module_ns_set: BTreeSet<&str> = module_data
         .iter()
-        .filter_map(|(_, body)| parse_mod_ns(body))
+        .map(|header| header.namespace.as_str())
         .collect();
 
-    for (_file_name, body) in &module_data {
-        let mut current_ns = String::new();
-        if let Some(ns_pos) = body.find("\nnamespace ") {
-            let ns_start = ns_pos + "\nnamespace ".len();
-            let mut ns_end = ns_start;
-            while ns_end < body.len() {
-                let c = body.as_bytes()[ns_end] as char;
-                if c.is_whitespace() || c == '{' {
-                    break;
-                }
-                ns_end += 1;
-            }
-            current_ns = body[ns_start..ns_end].to_string();
+    for header in &module_data {
+        for (name, underlying) in &header.enum_defs {
+            enum_underlying.insert((header.namespace.as_str(), name.as_str()), underlying);
         }
-
-        let mut scan_idx = 0usize;
-        let bytes = body.as_bytes();
-        while let Some(found) = body[scan_idx..].find("enum class") {
-            let pos = scan_idx + found;
-            let mut name_start = pos + "enum class".len();
-            while name_start < bytes.len() && (bytes[name_start] as char).is_whitespace() {
-                name_start += 1;
-            }
-            let mut name_end = name_start;
-            while name_end < bytes.len() {
-                let c = bytes[name_end] as char;
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    name_end += 1;
-                } else {
-                    break;
-                }
-            }
-            if name_end > name_start {
-                let name = body[name_start..name_end].trim().to_string();
-                let rest = &body[name_end..];
-                if let Some(colon_rel) = rest.find(':') {
-                    if let Some(brace_rel) = rest.find('{') {
-                        if brace_rel > colon_rel {
-                            let underlying = rest[colon_rel + 1..brace_rel].trim().to_string();
-                            enum_underlying.insert((current_ns.clone(), name), underlying);
-                        }
-                    }
-                }
-            }
-            scan_idx = pos + 1;
-        }
-
-        let b2 = body.as_bytes();
-        let mut search_idx = 0usize;
-        while let Some(found) = body[search_idx..].find("::") {
-            let ns_start = search_idx + found + 2;
-            let mut ns_end = ns_start;
-            while ns_end < body.len() {
-                let c = b2[ns_end] as char;
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    ns_end += 1;
-                } else {
-                    break;
-                }
-            }
-            let ns = &body[ns_start..ns_end];
-            if ns_end > ns_start
-                && ns_end + 2 <= body.len()
-                && &body[ns_end..ns_end + 2] == "::"
-                && module_ns_set.contains(ns)
-            {
-                let type_start = ns_end + 2;
-                let mut type_end = type_start;
-                while type_end < body.len() {
-                    let c = b2[type_end] as char;
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        type_end += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if type_end > type_start {
-                    let ty = &body[type_start..type_end];
-                    namespace_blocks
-                        .entry(ns.to_string())
-                        .or_default()
-                        .insert(ty.to_string());
-                }
-                search_idx = type_end;
-            } else {
-                search_idx = ns_start;
-            }
+        for (owner_ns, ty) in &header.foreign_types {
+            namespace_blocks
+                .entry(owner_ns.as_ref())
+                .or_default()
+                .insert(ty.as_ref());
         }
     }
 
-    macros.push_str("\n// ============================================================================\n");
+    macros.push_str(
+        "\n// ============================================================================\n",
+    );
     macros.push_str("// Cross-module forward declarations (auto-generated)\n");
     macros.push_str("// These provide declaration-only stubs for types referenced across\n");
     macros.push_str("// different module namespaces so headers can be included in any order.\n\n");
 
     for (ns, types_set) in &namespace_blocks {
-        macros.push_str(&format!("namespace {} {{\n", ns));
+        let _ = writeln!(macros, "namespace {} {{", ns);
         for ty in types_set {
-            if let Some(under) = enum_underlying.get(&(ns.clone(), ty.clone())) {
-                macros.push_str(&format!("    enum class {} : {};\n", ty, under));
+            if let Some(under) = enum_underlying.get(&(*ns, *ty)) {
+                let _ = writeln!(macros, "    enum class {} : {};", ty, under);
             } else {
-                macros.push_str(&format!("    class {};\n", ty));
+                let _ = writeln!(macros, "    class {};", ty);
             }
         }
         macros.push_str("}\n\n");
     }
 
     emit_auto_forward_decls(&mut macros, &module_data, &module_ns_set);
-    fs::write(out_dir.join("macros.hpp"), macros)?;
 
-    let mut module_stems = Vec::new();
-    for (file_name, body) in module_data {
-        let is_empty = !body.contains("class ") && !body.contains("enum class ");
-        if is_empty {
-            continue;
-        }
-        fs::write(schemas_dir.join(&file_name), body)?;
-        if let Some(stem) = file_name.strip_suffix(".hpp") {
-            module_stems.push(stem.to_string());
+    let module_stems: Vec<&str> = module_data
+        .iter()
+        .filter(|header| !header.is_empty())
+        .filter_map(|header| header.file_name.strip_suffix(".hpp"))
+        .collect();
+
+    let impl_dir = out_dir.join("impl");
+    fs::create_dir_all(&impl_dir)?;
+    let engine_dir = out_dir.join("engine");
+    fs::create_dir_all(&engine_dir)?;
+    let offsets_dir = out_dir.join("offsets");
+    fs::create_dir_all(&offsets_dir)?;
+    let patterns_dir = out_dir.join("patterns");
+    fs::create_dir_all(&patterns_dir)?;
+
+    let ((macros_res, headers_res), (catalog_res, (umbrella_res, extras_res))) = rayon::join(
+        || {
+            rayon::join(
+                || fs::write(out_dir.join("macros.hpp"), &macros),
+                || {
+                    module_data.par_iter().try_for_each(|header| {
+                        if header.is_empty() {
+                            Ok(())
+                        } else {
+                            fs::write(schemas_dir.join(&header.file_name), &header.body)
+                        }
+                    })
+                },
+            )
+        },
+        || {
+            rayon::join(
+                || write_schema_catalog(&schemas_dir, result),
+                || {
+                    rayon::join(
+                        || {
+                            write_include_tree_umbrella(
+                                out_dir,
+                                &offsets_dir,
+                                &patterns_dir,
+                                &module_stems,
+                                build_number,
+                            )
+                        },
+                        || {
+                            write_include_tree_extras(
+                                out_dir,
+                                &impl_dir,
+                                &engine_dir,
+                        result,
+                                build_number,
+                                csgo_input_rva,
+                            )
+                        },
+                    )
+                },
+            )
+        },
+    );
+    macros_res?;
+    headers_res?;
+    catalog_res?;
+    umbrella_res?;
+    extras_res?;
+
+    Ok(module_stems.len())
+}
+
+/// Only write an empty amalgamation when `cs2.hpp` is missing or already empty.
+/// A later include-tree error must not clobber a non-empty umbrella.
+pub fn write_empty_cs2_if_missing(
+    out_dir: &Path,
+    build_number: Option<u32>,
+) -> std::io::Result<()> {
+    let path = out_dir.join("cs2.hpp");
+    if path.is_file() {
+        match fs::metadata(&path) {
+            Ok(meta) if meta.len() > 0 => return Ok(()),
+            _ => {}
         }
     }
+    fs::write(path, amalgamation::render_hpp(&[], build_number))
+}
 
-    // schema-dumper-no-process: per-scope inventory for humans.
+fn write_schema_catalog(schemas_dir: &Path, result: &AnalysisResult) -> Result<()> {
     let mut info = String::from("// Schema module inventory\n");
     let mut modules: Vec<_> = result.schemas.iter().collect();
     modules.sort_by(|a, b| a.0.cmp(b.0));
     for (module, (classes, enums)) in modules {
-        info.push_str(&format!(
-            "// {module}: {} classes, {} enums\n",
+        let _ = writeln!(
+            info,
+            "// {}: {} classes, {} enums",
+            comment_text(module),
             classes.len(),
             enums.len()
-        ));
+        );
         for class in classes {
-            info.push_str(&format!(
-                "//   {} ({} fields)\n",
-                class.name,
+            let _ = writeln!(
+                info,
+                "//   {} ({} fields)",
+                comment_text(&class.name),
                 class.fields.len()
-            ));
+            );
         }
     }
     fs::write(schemas_dir.join("info.txt"), info)?;
-
-    fs::write(
-        schemas_dir.join("schemas.json"),
+    write_optional_json(
+        &schemas_dir.join("schemas.json"),
         sdk_classes::render_schemas_json(&result.schemas),
-    )?;
+    )
+}
 
-    let impl_dir = out_dir.join("impl");
-    fs::create_dir_all(&impl_dir)?;
+fn write_include_tree_extras(
+    out_dir: &Path,
+    impl_dir: &Path,
+    engine_dir: &Path,
+    result: &AnalysisResult,
+    build_number: Option<u32>,
+    csgo_input_rva: Option<u32>,
+) -> Result<()> {
     fs::write(
         impl_dir.join("entity_system.hpp"),
         entity_system::render_impl_hpp(&result.offsets, build_number),
     )?;
-
-    let engine_dir = out_dir.join("engine");
-    fs::create_dir_all(&engine_dir)?;
-    fs::write(
-        engine_dir.join("engine_structs.json"),
+    write_optional_json(
+        &engine_dir.join("engine_structs.json"),
         engine_structs::render_json(build_number, csgo_input_rva),
     )?;
-    for s in engine_structs::ENGINE_STRUCTS {
-        let live = if s.name == "CCSGOInput" {
-            csgo_input_rva
-        } else {
-            None
-        };
-        fs::write(
-            engine_dir.join(format!("{}.h", s.name.to_ascii_lowercase())),
-            engine_structs::render_header(s, build_number, live),
-        )?;
-    }
-
-    fs::write(
-        out_dir.join("verified_features.json"),
+    engine_structs::ENGINE_STRUCTS
+        .par_iter()
+        .try_for_each(|s| {
+            let live = if s.name == "CCSGOInput" {
+                csgo_input_rva
+            } else {
+                None
+            };
+            fs::write(
+                engine_dir.join(format!("{}.h", s.name.to_ascii_lowercase())),
+                engine_structs::render_header(s, build_number, live),
+            )
+        })?;
+    write_optional_json(
+        &out_dir.join("verified_features.json"),
         verified::render_json(build_number, Some(&result.schemas)),
-    )?;
-
-    // Prefer the merged offset header for the include tree (canonical +
-    // pattern + interface RVAs). Fall back to the legacy offsets.hpp.
-    let offsets_dir = out_dir.join("offsets");
-    fs::create_dir_all(&offsets_dir)?;
-    let merged = out_dir.join("offsets_merged.hpp");
-    let legacy = out_dir.join("offsets.hpp");
-    if merged.is_file() {
-        fs::copy(&merged, offsets_dir.join("offsets.hpp"))?;
-    } else if legacy.is_file() {
-        fs::copy(&legacy, offsets_dir.join("offsets.hpp"))?;
-    }
-
-    let patterns_dir = out_dir.join("patterns");
-    fs::create_dir_all(&patterns_dir)?;
-    let patterns_hpp = out_dir.join("patterns.hpp");
-    if patterns_hpp.is_file() {
-        fs::copy(&patterns_hpp, patterns_dir.join("patterns.hpp"))?;
-    }
-
-    let vtables_hpp = out_dir.join("vtables.hpp");
-    if vtables_hpp.is_file() {
-        fs::copy(&vtables_hpp, offsets_dir.join("vtables.hpp"))?;
-    }
-
-    fs::write(
-        out_dir.join("cs2.hpp"),
-        amalgamation::render_hpp(&module_stems, build_number),
-    )?;
-
-    Ok(module_stems)
+    )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::live_csgo_input_rva;
-    use crate::analysis::OffsetMap;
-    use std::collections::BTreeMap;
+fn write_include_tree_umbrella(
+    out_dir: &Path,
+    offsets_dir: &Path,
+    patterns_dir: &Path,
+    module_stems: &[&str],
+    build_number: Option<u32>,
+) -> Result<()> {
+    let (copy_res, body) = rayon::join(
+        || -> Result<()> {
+            let merged = out_dir.join("offsets_merged.hpp");
+            let legacy = out_dir.join("offsets.hpp");
+            if merged.is_file() {
+                fs::copy(&merged, offsets_dir.join("offsets.hpp"))?;
+            } else if legacy.is_file() {
+                fs::copy(&legacy, offsets_dir.join("offsets.hpp"))?;
+            }
 
-    #[test]
-    fn prefers_canonical_dw_csgo_input() {
-        let mut client = BTreeMap::new();
-        client.insert("dwCSGOInput".into(), 0x111u32);
-        let mut offsets = OffsetMap::new();
-        offsets.insert("client.dll".into(), client);
-        assert_eq!(live_csgo_input_rva(&offsets, Some(0x222)), Some(0x111));
-    }
+            let patterns_hpp = out_dir.join("patterns.hpp");
+            if patterns_hpp.is_file() {
+                fs::copy(&patterns_hpp, patterns_dir.join("patterns.hpp"))?;
+            }
 
-    #[test]
-    fn falls_back_to_pattern_rva() {
-        assert_eq!(live_csgo_input_rva(&OffsetMap::new(), Some(0xABC)), Some(0xABC));
-        assert_eq!(live_csgo_input_rva(&OffsetMap::new(), None), None);
-    }
+            let vtables_hpp = out_dir.join("vtables.hpp");
+            if vtables_hpp.is_file() {
+                fs::copy(&vtables_hpp, offsets_dir.join("vtables.hpp"))?;
+            }
+            Ok(())
+        },
+        || amalgamation::render_hpp(module_stems, build_number),
+    );
+    copy_res?;
+    fs::write(out_dir.join("cs2.hpp"), body)?;
+    Ok(())
+}
+
+fn write_optional_json(path: &Path, rendered: Result<String, serde_json::Error>) -> Result<()> {
+    let body = rendered?;
+    fs::write(path, body)?;
+    Ok(())
 }
 
 fn is_builtin_type(t: &str) -> bool {
@@ -328,7 +303,7 @@ fn is_builtin_type(t: &str) -> bool {
     )
 }
 
-fn collect_defined(text: &str, set: &mut BTreeSet<String>) {
+fn collect_defined<'a>(text: &'a str, set: &mut BTreeSet<&'a str>) {
     for kw in [
         "class ",
         "struct ",
@@ -354,7 +329,7 @@ fn collect_defined(text: &str, set: &mut BTreeSet<String>) {
                 }
             }
             if i > start {
-                set.insert(text[start..i].to_string());
+                set.insert(&text[start..i]);
             }
             from = from + p + kw.len();
         }
@@ -363,56 +338,44 @@ fn collect_defined(text: &str, set: &mut BTreeSet<String>) {
 
 fn emit_auto_forward_decls(
     macros: &mut String,
-    module_data: &[(String, String)],
-    module_ns_set: &BTreeSet<String>,
+    module_data: &[sdk_classes::ModuleHeader],
+    module_ns_set: &BTreeSet<&str>,
 ) {
     let is_editor = |fname: &str| EDITOR_MODULE_STEMS.iter().any(|e| fname.starts_with(e));
 
-    let mut defined = BTreeSet::<String>::new();
-    collect_defined(macros, &mut defined);
-    for (fname, body) in module_data {
-        if is_editor(fname) {
-            continue;
-        }
-        collect_defined(body, &mut defined);
-    }
+    let (mut plain, templated, qual) = {
+        let mut parsed = BTreeSet::<&str>::new();
+        collect_defined(macros, &mut parsed);
+        let is_defined = |name: &str| {
+            parsed.contains(name)
+                || module_data.iter().any(|header| {
+                    !is_editor(&header.file_name)
+                        && (header.class_names.contains(name)
+                            || header.enum_defs.contains_key(name))
+                })
+        };
 
-    let mut plain = BTreeSet::<String>::new();
-    let mut templated = BTreeSet::<String>::new();
-    let mut qual: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+        let mut plain = BTreeSet::<&str>::new();
+        let mut templated = BTreeSet::<&str>::new();
+        let mut qual: BTreeMap<&str, BTreeMap<&str, bool>> = BTreeMap::new();
 
-    for (fname, body) in module_data {
-        if is_editor(fname) {
-            continue;
-        }
-        let bytes = body.as_bytes();
-        let mut from = 0;
-        const TAG: &str = "SCHEMA_FIELD(";
-        while let Some(p) = body[from..].find(TAG) {
-            let mut i = from + p + TAG.len();
-            let tstart = i;
-            let mut depth = 0i32;
-            while i < body.len() {
-                match bytes[i] as char {
-                    '<' => depth += 1,
-                    '>' => depth -= 1,
-                    ',' if depth <= 0 => break,
-                    _ => {}
-                }
-                i += 1;
+        for header in module_data {
+            if is_editor(&header.file_name) {
+                continue;
             }
-            let targ = &body[tstart..i];
-            extract_type_idents(
-                targ,
-                &defined,
-                module_ns_set,
-                &mut plain,
-                &mut templated,
-                &mut qual,
-            );
-            from = from + p + TAG.len();
+            for targ in &header.schema_field_types {
+                extract_type_idents(
+                    targ,
+                    is_defined,
+                    module_ns_set,
+                    &mut plain,
+                    &mut templated,
+                    &mut qual,
+                );
+            }
         }
-    }
+        (plain, templated, qual)
+    };
     for t in templated.iter() {
         plain.remove(t);
     }
@@ -424,18 +387,18 @@ fn emit_auto_forward_decls(
     macros.push_str("// Auto-generated: forward declarations for types the runtime schemas\n");
     macros.push_str("// reference but that aren't defined in any included header.\n");
     for t in &templated {
-        macros.push_str(&format!("template <class...> class {};\n", t));
+        let _ = writeln!(macros, "template <class...> class {};", t);
     }
     for t in &plain {
-        macros.push_str(&format!("class {};\n", t));
+        let _ = writeln!(macros, "class {};", t);
     }
     for (ns, names) in &qual {
-        macros.push_str(&format!("namespace {} {{ ", ns));
+        let _ = write!(macros, "namespace {} {{ ", ns);
         for (name, is_t) in names {
             if *is_t {
-                macros.push_str(&format!("template <class...> class {}; ", name));
+                let _ = write!(macros, "template <class...> class {}; ", name);
             } else {
-                macros.push_str(&format!("class {}; ", name));
+                let _ = write!(macros, "class {}; ", name);
             }
         }
         macros.push_str("}\n");
@@ -443,13 +406,13 @@ fn emit_auto_forward_decls(
     macros.push('\n');
 }
 
-fn extract_type_idents(
-    arg: &str,
-    defined: &BTreeSet<String>,
-    module_ns_set: &BTreeSet<String>,
-    plain: &mut BTreeSet<String>,
-    templated: &mut BTreeSet<String>,
-    qual: &mut BTreeMap<String, BTreeMap<String, bool>>,
+fn extract_type_idents<'a>(
+    arg: &'a str,
+    is_defined: impl Fn(&str) -> bool,
+    module_ns_set: &BTreeSet<&str>,
+    plain: &mut BTreeSet<&'a str>,
+    templated: &mut BTreeSet<&'a str>,
+    qual: &mut BTreeMap<&'a str, BTreeMap<&'a str, bool>>,
 ) {
     let bytes = arg.as_bytes();
     let mut i = 0;
@@ -477,16 +440,16 @@ fn extract_type_idents(
 
             if let Some((ns, name)) = tok.rsplit_once("::") {
                 let ns = ns.split("::").next().unwrap_or(ns);
-                if !is_builtin_type(ns) && !module_ns_set.contains(ns) && !defined.contains(name) {
-                    let e = qual.entry(ns.to_string()).or_default();
-                    let v = e.entry(name.to_string()).or_insert(false);
+                if !is_builtin_type(ns) && !module_ns_set.contains(ns) && !is_defined(name) {
+                    let e = qual.entry(ns).or_default();
+                    let v = e.entry(name).or_insert(false);
                     *v = *v || is_t;
                 }
-            } else if !is_builtin_type(tok) && !defined.contains(tok) {
+            } else if !is_builtin_type(tok) && !is_defined(tok) {
                 if is_t {
-                    templated.insert(tok.to_string());
+                    templated.insert(tok);
                 } else {
-                    plain.insert(tok.to_string());
+                    plain.insert(tok);
                 }
             }
         } else {
@@ -498,12 +461,113 @@ fn extract_type_idents(
 /// Prefer a live `dwCSGOInput` / `pCSGOInput` RVA over a baked engine-struct constant.
 pub fn live_csgo_input_rva(offsets: &OffsetMap, pattern_rva: Option<u64>) -> Option<u32> {
     offsets
-        .get("client.dll")
-        .and_then(|module| {
+        .iter()
+        .find(|(module, _)| module.eq_ignore_ascii_case("client.dll"))
+        .and_then(|(_, module)| {
             module
-                .get("dwCSGOInput")
-                .or_else(|| module.get("pCSGOInput"))
-                .copied()
+                .iter()
+                .find(|(symbol, _)| {
+                    symbol.eq_ignore_ascii_case("dwCSGOInput")
+                        || symbol.eq_ignore_ascii_case("pCSGOInput")
+                })
+                .map(|(_, rva)| *rva)
         })
         .or_else(|| pattern_rva.and_then(|value| u32::try_from(value).ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_defined, live_csgo_input_rva};
+    use crate::analysis::{AnalysisResult, OffsetMap};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn prefers_canonical_dw_csgo_input() {
+        let mut client = BTreeMap::new();
+        client.insert("dwCSGOInput".into(), 0x111u32);
+        let mut offsets = OffsetMap::new();
+        offsets.insert("client.dll".into(), client);
+        assert_eq!(live_csgo_input_rva(&offsets, Some(0x222)), Some(0x111));
+    }
+
+    #[test]
+    fn live_csgo_input_rva_matches_module_and_symbol_case_insensitively() {
+        let mut client = BTreeMap::new();
+        client.insert("DWCSGOINPUT".into(), 0x111u32);
+        let mut offsets = OffsetMap::new();
+        offsets.insert("CLIENT.DLL".into(), client);
+        assert_eq!(live_csgo_input_rva(&offsets, Some(0x222)), Some(0x111));
+    }
+
+    #[test]
+    fn falls_back_to_pattern_rva() {
+        assert_eq!(
+            live_csgo_input_rva(&OffsetMap::new(), Some(0xABC)),
+            Some(0xABC)
+        );
+        assert_eq!(live_csgo_input_rva(&OffsetMap::new(), None), None);
+    }
+
+    #[test]
+    fn include_tree_failure_does_not_overwrite_a_nonempty_cs2_hpp() {
+        let dir = std::env::temp_dir().join(format!("cs2-dumper-cs2-hpp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("cs2.hpp");
+        std::fs::write(&path, "// keep me\n#include \"macros.hpp\"\n").expect("seed");
+        super::write_empty_cs2_if_missing(&dir, Some(1)).expect("fallback");
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            body.contains("keep me"),
+            "non-empty cs2.hpp must survive a failed include-tree: {body}"
+        );
+        std::fs::write(&path, []).expect("empty");
+        super::write_empty_cs2_if_missing(&dir, Some(1)).expect("empty fallback");
+        let replaced = std::fs::read_to_string(&path).expect("replaced");
+        assert!(
+            replaced.contains("single-include amalgamation"),
+            "empty cs2.hpp may be replaced: {replaced}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_propagates_catalog_and_extra_write_failures() {
+        for (case, blocked) in [
+            ("catalog", "schemas/info.txt"),
+            ("extras", "engine/engine_structs.json"),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "cs2-dumper-include-tree-{case}-failure-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(blocked)).expect("occupy output file path");
+            let result = AnalysisResult {
+                buttons: Default::default(),
+                interfaces: Default::default(),
+                offsets: Default::default(),
+                schemas: Default::default(),
+                vtables: Default::default(),
+            };
+            super::dump(&dir, &result, None, None)
+                .expect_err("include-tree component write failure must propagate");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn collect_defined_borrows_idents_from_macros_text() {
+        let text = "class Foo;\nstruct Bar;\nenum class Baz : int;";
+        let mut set = BTreeSet::new();
+        collect_defined(text, &mut set);
+        assert!(set.contains("Foo"));
+        assert!(set.contains("Bar"));
+        assert!(set.contains("Baz"));
+        let foo = *set.get("Foo").expect("Foo");
+        assert!(std::ptr::eq(
+            foo.as_ptr(),
+            text.find("Foo").map(|i| &text[i..]).unwrap().as_ptr()
+        ));
+    }
 }

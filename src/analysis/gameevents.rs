@@ -56,6 +56,14 @@ const K_NAME: u64 = 0x08;
 const K_DESC: u64 = 0x38;
 const K_TYPE: u64 = 0x40;
 
+#[inline]
+fn indexed_addr(base: u64, stride: u64, index: u64, extra: u64) -> Option<u64> {
+    stride
+        .checked_mul(index)
+        .and_then(|delta| base.checked_add(delta))
+        .and_then(|address| address.checked_add(extra))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct EventLayout {
     manager_count: u64,
@@ -180,11 +188,23 @@ pub fn walk<P: MemoryView>(process: &mut P, manager_global_va: u64) -> Result<Ve
     }
 
     let layout = detect_layout(process, manager);
-    let count = rd_u32(process, manager + layout.manager_count);
-    let desc_base = rd_u64(process, manager + layout.manager_desc_base);
-    let info_size = rd_u32(process, manager + layout.manager_info_flags) & 0x7FFF_FFFF;
+    let Some(count_addr) = manager.checked_add(layout.manager_count) else {
+        bail!("event manager count address overflow");
+    };
+    let Some(desc_base_addr) = manager.checked_add(layout.manager_desc_base) else {
+        bail!("event descriptor base address overflow");
+    };
+    let Some(info_flags_addr) = manager.checked_add(layout.manager_info_flags) else {
+        bail!("event info flags address overflow");
+    };
+    let count = rd_u32(process, count_addr);
+    let desc_base = rd_u64(process, desc_base_addr);
+    let info_size = rd_u32(process, info_flags_addr) & 0x7FFF_FFFF;
     let info_base = if info_size != 0 {
-        rd_u64(process, manager + layout.manager_info_base)
+        let Some(info_base_addr) = manager.checked_add(layout.manager_info_base) else {
+            bail!("event info base address overflow");
+        };
+        rd_u64(process, info_base_addr)
     } else {
         0
     };
@@ -194,14 +214,24 @@ pub fn walk<P: MemoryView>(process: &mut P, manager_global_va: u64) -> Result<Ve
 
     let mut events = Vec::new();
     for id in 0..count {
-        let desc = desc_base + layout.desc_stride * id as u64;
+        let Some(desc) = indexed_addr(desc_base, layout.desc_stride, id as u64, 0) else {
+            break;
+        };
         // Event name via the info-vector, indexed by the descriptor's name-index.
-        let name_idx = rd_u32(process, desc + layout.desc_name_idx);
+        let Some(name_idx_addr) = desc.checked_add(layout.desc_name_idx) else {
+            continue;
+        };
+        let name_idx = rd_u32(process, name_idx_addr);
         let name = if info_base != 0 && name_idx < info_size {
-            let np = rd_u64(
-                process,
-                info_base + layout.info_stride * name_idx as u64 + layout.info_name,
-            );
+            let Some(name_slot) = indexed_addr(
+                info_base,
+                layout.info_stride,
+                name_idx as u64,
+                layout.info_name,
+            ) else {
+                continue;
+            };
+            let np = rd_u64(process, name_slot);
             rd_cstr(process, np)
         } else {
             String::new()
@@ -210,21 +240,41 @@ pub fn walk<P: MemoryView>(process: &mut P, manager_global_va: u64) -> Result<Ve
             continue;
         }
 
-        let local = rd_u8(process, desc + layout.desc_local) != 0;
-        let key_count = rd_u32(process, desc + layout.desc_key_count);
-        let keys_base = rd_u64(process, desc + layout.desc_keys_base);
+        let Some(local_addr) = desc.checked_add(layout.desc_local) else {
+            continue;
+        };
+        let Some(key_count_addr) = desc.checked_add(layout.desc_key_count) else {
+            continue;
+        };
+        let Some(keys_base_addr) = desc.checked_add(layout.desc_keys_base) else {
+            continue;
+        };
+        let local = rd_u8(process, local_addr) != 0;
+        let key_count = rd_u32(process, key_count_addr);
+        let keys_base = rd_u64(process, keys_base_addr);
 
         let mut fields = Vec::new();
         if keys_base != 0 && key_count <= MAX_KEYS {
             for k in 0..key_count {
-                let key = keys_base + layout.key_stride * k as u64;
-                let kname_ptr = rd_u64(process, key + layout.key_name);
+                let Some(key) = indexed_addr(keys_base, layout.key_stride, k as u64, 0) else {
+                    break;
+                };
+                let Some(kname_addr) = key.checked_add(layout.key_name) else {
+                    continue;
+                };
+                let kname_ptr = rd_u64(process, kname_addr);
                 let kname = rd_cstr(process, kname_ptr);
                 if kname.is_empty() {
                     continue;
                 }
-                let ktype = rd_u32(process, key + layout.key_type);
-                let kdesc_ptr = rd_u64(process, key + layout.key_desc);
+                let Some(ktype_addr) = key.checked_add(layout.key_type) else {
+                    continue;
+                };
+                let Some(kdesc_addr) = key.checked_add(layout.key_desc) else {
+                    continue;
+                };
+                let ktype = rd_u32(process, ktype_addr);
+                let kdesc_ptr = rd_u64(process, kdesc_addr);
                 fields.push(GameEventField {
                     name: kname,
                     type_name: type_name(ktype),
@@ -235,7 +285,10 @@ pub fn walk<P: MemoryView>(process: &mut P, manager_global_va: u64) -> Result<Ve
 
         events.push(GameEvent {
             name,
-            id: rd_u32(process, desc + layout.desc_id),
+            id: desc
+                .checked_add(layout.desc_id)
+                .map(|address| rd_u32(process, address))
+                .unwrap_or_default(),
             local,
             fields,
         });
@@ -263,10 +316,22 @@ fn detect_layout<P: MemoryView>(process: &mut P, manager: u64) -> EventLayout {
 }
 
 fn score_layout<P: MemoryView>(process: &mut P, manager: u64, layout: EventLayout) -> usize {
-    let count = rd_u32(process, manager + layout.manager_count);
-    let desc_base = rd_u64(process, manager + layout.manager_desc_base);
-    let info_size = rd_u32(process, manager + layout.manager_info_flags) & 0x7FFF_FFFF;
-    let info_base = rd_u64(process, manager + layout.manager_info_base);
+    let Some(count_addr) = manager.checked_add(layout.manager_count) else {
+        return 0;
+    };
+    let Some(desc_base_addr) = manager.checked_add(layout.manager_desc_base) else {
+        return 0;
+    };
+    let Some(info_flags_addr) = manager.checked_add(layout.manager_info_flags) else {
+        return 0;
+    };
+    let Some(info_base_addr) = manager.checked_add(layout.manager_info_base) else {
+        return 0;
+    };
+    let count = rd_u32(process, count_addr);
+    let desc_base = rd_u64(process, desc_base_addr);
+    let info_size = rd_u32(process, info_flags_addr) & 0x7FFF_FFFF;
+    let info_base = rd_u64(process, info_base_addr);
     if !(1..=MAX_EVENTS).contains(&count)
         || desc_base < 0x10000
         || !(1..=8192).contains(&info_size)
@@ -276,15 +341,25 @@ fn score_layout<P: MemoryView>(process: &mut P, manager: u64, layout: EventLayou
     }
     let mut score = 0;
     for id in 0..count.min(8) {
-        let desc = desc_base + layout.desc_stride * id as u64;
-        let name_idx = rd_u32(process, desc + layout.desc_name_idx);
+        let Some(desc) = indexed_addr(desc_base, layout.desc_stride, id as u64, 0) else {
+            break;
+        };
+        let Some(name_idx_addr) = desc.checked_add(layout.desc_name_idx) else {
+            continue;
+        };
+        let name_idx = rd_u32(process, name_idx_addr);
         if name_idx >= info_size {
             continue;
         }
-        let name_ptr = rd_u64(
-            process,
-            info_base + layout.info_stride * name_idx as u64 + layout.info_name,
-        );
+        let Some(name_slot) = indexed_addr(
+            info_base,
+            layout.info_stride,
+            name_idx as u64,
+            layout.info_name,
+        ) else {
+            continue;
+        };
+        let name_ptr = rd_u64(process, name_slot);
         if plausible_name(&rd_cstr(process, name_ptr)) {
             score += 1;
         }
@@ -384,31 +459,16 @@ fn type_name(t: u32) -> &'static str {
 }
 
 fn rd_u64<P: MemoryView>(process: &mut P, va: u64) -> u64 {
-    process
-        .read::<u64>(Address::from(va))
-        .data_part()
-        .unwrap_or(0)
+    crate::analysis::read::u64_va(process, va)
 }
 fn rd_u32<P: MemoryView>(process: &mut P, va: u64) -> u32 {
-    process
-        .read::<u32>(Address::from(va))
-        .data_part()
-        .unwrap_or(0)
+    crate::analysis::read::u32_va(process, va)
 }
 fn rd_u8<P: MemoryView>(process: &mut P, va: u64) -> u8 {
-    process
-        .read::<u8>(Address::from(va))
-        .data_part()
-        .unwrap_or(0)
+    crate::analysis::read::u8_va(process, va)
 }
 fn rd_cstr<P: MemoryView>(process: &mut P, ptr: u64) -> String {
-    if ptr == 0 {
-        return String::new();
-    }
-    process
-        .read_utf8_lossy(Address::from(ptr), 128)
-        .data_part()
-        .unwrap_or_default()
+    crate::analysis::read::cstr(process, ptr)
 }
 
 #[cfg(test)]

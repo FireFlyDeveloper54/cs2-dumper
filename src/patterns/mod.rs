@@ -9,18 +9,23 @@
 //!       - `Rel32`     : follow E8/E9 disp32 to call/jump target
 //!       - `RipRel`    : follow 48 8B/8D/89 05/0D disp32 to data/global
 //!       - `StringRef` : locate a unique string in `.rdata`, find the
-//!                       `.text` LEA that references it, walk back to the
-//!                       function prologue — the Ghidra "find by string"
-//!                       workflow, robust across CS2 patches.
+//!         `.text` LEA that references it, walk back to the function prologue —
+//!         the Ghidra "find by string" workflow, robust across CS2 patches.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use memflow::prelude::v1::*;
 use pelite::pe64::{Pe, PeView};
+use rayon::prelude::*;
 
+use crate::analysis::module_data::ascii_lower_cow;
+use crate::analysis::read::i32_le_at;
 use crate::ui;
 
 pub mod database;
@@ -70,13 +75,18 @@ pub struct PatternSpec {
     pub prototype: String,
 }
 
-pub(crate) trait PatternLike {
+/// Common accessors for builtin [`Pattern`]s and file-loaded [`PatternSpec`]s.
+///
+/// Public because [`scan_all_with_options`] is generic over this trait.
+pub trait PatternLike {
     fn name(&self) -> &str;
     fn module(&self) -> &str;
     fn needle(&self) -> &str;
     fn resolve(&self) -> ResolveKind;
     fn extra_off(&self) -> i64;
     fn prototype(&self) -> &str;
+    fn needle_cow(&self) -> Cow<'static, str>;
+    fn display_name_cow(&self) -> Cow<'static, str>;
 }
 
 impl PatternLike for Pattern {
@@ -98,6 +108,15 @@ impl PatternLike for Pattern {
     fn prototype(&self) -> &str {
         self.prototype
     }
+    fn needle_cow(&self) -> Cow<'static, str> {
+        Cow::Borrowed(self.needle)
+    }
+    fn display_name_cow(&self) -> Cow<'static, str> {
+        match display_name(self.name) {
+            Cow::Borrowed(s) => Cow::Borrowed(s),
+            Cow::Owned(s) => Cow::Owned(s),
+        }
+    }
 }
 
 impl PatternLike for PatternSpec {
@@ -118,6 +137,12 @@ impl PatternLike for PatternSpec {
     }
     fn prototype(&self) -> &str {
         &self.prototype
+    }
+    fn needle_cow(&self) -> Cow<'static, str> {
+        Cow::Owned(self.needle.clone())
+    }
+    fn display_name_cow(&self) -> Cow<'static, str> {
+        Cow::Owned(display_name(&self.name).into_owned())
     }
 }
 
@@ -186,8 +211,6 @@ pub fn load_pattern_file(path: &Path) -> Result<Vec<PatternSpec>> {
             if entry.name.trim().is_empty() || entry.module.trim().is_empty() {
                 return Err(anyhow!("pattern name and module must not be empty"));
             }
-            parse_ida(&entry.pattern)
-                .with_context(|| format!("invalid pattern {}::{}", entry.module, entry.name))?;
             let resolve = match entry.resolve {
                 ExternalResolve::Raw => ResolveKind::None,
                 ExternalResolve::Rel32 => ResolveKind::Rel32 {
@@ -210,9 +233,28 @@ pub fn load_pattern_file(path: &Path) -> Result<Vec<PatternSpec>> {
                 },
                 ExternalResolve::StringRef => ResolveKind::StringRef,
             };
-            let key = pattern_key(&entry.module, &entry.name);
-            if !keys.insert(key.clone()) {
-                return Err(anyhow!("duplicate external pattern {}", key));
+            match resolve {
+                ResolveKind::StringRef => {
+                    if entry.pattern.is_empty() {
+                        return Err(anyhow!(
+                            "string reference {}::{} must not be empty",
+                            entry.module,
+                            entry.name
+                        ));
+                    }
+                }
+                _ => {
+                    parse_ida(&entry.pattern).with_context(|| {
+                        format!("invalid pattern {}::{}", entry.module, entry.name)
+                    })?;
+                }
+            }
+            if !keys.insert(pattern_key(&entry.module, &entry.name)) {
+                return Err(anyhow!(
+                    "duplicate external pattern {}::{}",
+                    entry.module,
+                    entry.name
+                ));
             }
             Ok(PatternSpec {
                 name: entry.name,
@@ -246,22 +288,96 @@ pub fn merged_patterns(builtins: &[Pattern], external: Vec<PatternSpec>) -> Vec<
 }
 
 fn pattern_key(module: &str, name: &str) -> String {
-    format!(
-        "{}::{}",
-        module.to_ascii_lowercase(),
-        name.to_ascii_lowercase()
-    )
+    format!("{}::{}", ascii_lower_cow(module), ascii_lower_cow(name))
 }
 
-fn canonical_module_name(module: &str) -> String {
-    module.trim().to_ascii_lowercase()
+fn canonical_module_name(module: &str) -> Cow<'_, str> {
+    ascii_lower_cow(module.trim())
+}
+
+thread_local! {
+    static CACHE_LOOKUP_KEY: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn push_ascii_lower(buf: &mut String, text: &str) {
+    buf.extend(text.bytes().map(|b| char::from(b.to_ascii_lowercase())));
+}
+
+fn cache_lookup_key(module: &str, name: &str) -> String {
+    let mut key = String::with_capacity(module.len() + 1 + name.len());
+    push_ascii_lower(&mut key, module);
+    key.push('\0');
+    push_ascii_lower(&mut key, name);
+    key
+}
+
+/// Previous-run `patterns.json` keyed by lowercase `module\0name`.
+/// Built once on the dump thread so the rayon scan is O(1) per signature
+/// instead of a linear walk of every cached hit. Lookups reuse a
+/// thread-local buffer so workers do not allocate a key per signature.
+pub struct PatternCacheIndex<'a> {
+    by_name: HashMap<String, &'a CachedPatternHit>,
+}
+
+impl<'a> PatternCacheIndex<'a> {
+    pub fn from_cache(cache: Option<&'a PatternCache>) -> Self {
+        let Some(cache) = cache else {
+            return Self {
+                by_name: HashMap::new(),
+            };
+        };
+        let mut by_name = HashMap::with_capacity(cache.hits.len());
+        for hit in &cache.hits {
+            by_name.insert(cache_lookup_key(&hit.module, &hit.name), hit);
+        }
+        Self { by_name }
+    }
+
+    pub fn get(&self, module: &str, name: &str, pattern: &str) -> Option<&'a CachedPatternHit> {
+        if self.by_name.is_empty() {
+            return None;
+        }
+        CACHE_LOOKUP_KEY.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            buf.clear();
+            push_ascii_lower(&mut buf, module);
+            buf.push('\0');
+            push_ascii_lower(&mut buf, name);
+            let hit = *self.by_name.get(buf.as_str())?;
+            (hit.pattern == pattern).then_some(hit)
+        })
+    }
+}
+
+fn intern_module_name(name: &str) -> Arc<str> {
+    let canon = canonical_module_name(name);
+    crate::analysis::module_data::intern_loaded_name(canon.as_ref())
+        .unwrap_or_else(|| Arc::from(canon.as_ref()))
+}
+
+fn intern_cached_module(name: &Arc<str>) -> Arc<str> {
+    match canonical_module_name(name.as_ref()) {
+        Cow::Borrowed(s) if std::ptr::eq(s.as_ptr(), name.as_ref().as_ptr()) => {
+            crate::analysis::module_data::intern_loaded_name(s).unwrap_or_else(|| Arc::clone(name))
+        }
+        other => crate::analysis::module_data::intern_loaded_name(other.as_ref())
+            .unwrap_or_else(|| Arc::from(other.as_ref())),
+    }
+}
+
+fn serialize_arc_str<S: serde::Serializer>(
+    value: &Arc<str>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(value)
 }
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PatternHit {
-    pub name: String,
-    pub module: String,
+    pub name: Cow<'static, str>,
+    #[serde(serialize_with = "serialize_arc_str")]
+    pub module: Arc<str>,
     pub resolve: &'static str,
-    pub pattern: String,
+    pub pattern: Cow<'static, str>,
     /// IDA / Hex-Rays C-style function prototype recovered for this
     /// Pattern, e.g. `__int64 __fastcall(__int64 a1, float *a2)`.
     /// Copied verbatim from `Pattern::prototype` so the JSON / hpp / rs
@@ -341,14 +457,6 @@ pub struct PatternCache {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn scan_all<P, S>(process: &mut P, sigs: &[S]) -> Result<PatternReport>
-where
-    P: Process + MemoryView,
-    S: PatternLike,
-{
-    scan_all_with_cache(process, sigs, None)
-}
-
 /// Knobs for one scan pass. Defaults keep the historical behaviour: suggest
 /// repairs for stale patterns, but never act on them.
 #[derive(Clone, Copy, Debug, Default)]
@@ -356,18 +464,6 @@ pub struct ScanOptions {
     /// Re-scan with a repaired pattern and keep the result when it resolves
     /// cleanly, instead of only reporting the suggestion.
     pub auto_repair: bool,
-}
-
-pub fn scan_all_with_cache<P, S>(
-    process: &mut P,
-    sigs: &[S],
-    cache: Option<&PatternCache>,
-) -> Result<PatternReport>
-where
-    P: Process + MemoryView,
-    S: PatternLike,
-{
-    scan_all_with_options(process, sigs, cache, ScanOptions::default())
 }
 
 pub fn scan_all_with_options<P, S>(
@@ -378,19 +474,20 @@ pub fn scan_all_with_options<P, S>(
 ) -> Result<PatternReport>
 where
     P: Process + MemoryView,
-    S: PatternLike,
+    S: PatternLike + Sync,
 {
     let mut module_cache: BTreeMap<String, ModuleCache> = BTreeMap::new();
     for sig in sigs {
-        let key = sig.module().to_ascii_lowercase();
-        if !module_cache.contains_key(&key) {
-            match ModuleCache::load(process, sig.module()) {
-                Ok(mc) => {
-                    module_cache.insert(key, mc);
-                }
-                Err(e) => {
-                    log::warn!("module load failed for {}: {}", sig.module(), e);
-                }
+        let key = canonical_module_name(sig.module());
+        if module_cache.contains_key(key.as_ref()) {
+            continue;
+        }
+        match ModuleCache::load(process, sig.module()) {
+            Ok(mc) => {
+                module_cache.insert(key.into_owned(), mc);
+            }
+            Err(e) => {
+                log::warn!("module load failed for {}: {}", sig.module(), e);
             }
         }
     }
@@ -401,24 +498,25 @@ where
         ..Default::default()
     };
 
+    ui::step(format_args!("scanning {} patterns", sigs.len()));
+    let cache_index = PatternCacheIndex::from_cache(cache);
+    let scanned: Vec<(PatternHit, bool)> = sigs
+        .par_iter()
+        .map(|sig| {
+            let cached = cache_index.get(sig.module(), sig.name(), sig.needle());
+            match module_cache.get(canonical_module_name(sig.module()).as_ref()) {
+                Some(mc) => scan_one_cached(mc, sig, cached),
+                None => (PatternHit::fail(sig, "module not loaded"), false),
+            }
+        })
+        .collect();
+
     let total = sigs.len();
     let mut ambiguous = 0u32;
     let mut repair_attempts = 0usize;
     let mut repairs_skipped = 0usize;
-    for (idx, sig) in sigs.iter().enumerate() {
+    for (idx, (sig, (mut hit, used_cache))) in sigs.iter().zip(scanned).enumerate() {
         ui::progress(idx + 1, total, sig.name());
-
-        let cached = cache.and_then(|report| {
-            report.hits.iter().find(|hit| {
-                hit.name.eq_ignore_ascii_case(sig.name())
-                    && hit.module.eq_ignore_ascii_case(sig.module())
-                    && hit.pattern == sig.needle()
-            })
-        });
-        let (mut hit, used_cache) = match module_cache.get(&sig.module().to_ascii_lowercase()) {
-            Some(mc) => scan_one_cached(mc, sig, cached),
-            None => (PatternHit::fail(sig, "module not loaded"), false),
-        };
 
         if cache.is_some() {
             if used_cache {
@@ -433,7 +531,7 @@ where
                 // A `stringref` needle is a literal, not a byte pattern.
             } else if repair_attempts >= repair::MAX_REPAIR_ATTEMPTS {
                 repairs_skipped += 1;
-            } else if let Some(mc) = module_cache.get(&sig.module().to_ascii_lowercase()) {
+            } else if let Some(mc) = module_cache.get(canonical_module_name(sig.module()).as_ref()) {
                 repair_attempts += 1;
                 if let Some((suggestion, recovered)) = try_repair(mc, sig, options.auto_repair) {
                     log::warn!(
@@ -503,10 +601,11 @@ where
 /// Build a repair suggestion for a pattern that no longer matches its module.
 fn repair_pattern<S: PatternLike>(mc: &ModuleCache, sig: &S) -> Option<repair::PatternRepair> {
     let candidate = repair::suggest(sig.needle(), mc.text())?;
-    let candidate_rva = mc.text_rva as u64 + candidate.offset as u64;
+    let candidate_rva = (mc.text_rva as u64).checked_add(candidate.offset as u64)?;
+    let candidate_va = mc.base.checked_add(candidate_rva)?;
     Some(repair::PatternRepair {
-        name: display_name(sig.name()),
-        module: canonical_module_name(&mc.name),
+        name: display_name(sig.name()).into_owned(),
+        module: intern_cached_module(&mc.name).to_string(),
         original: sig.needle().to_string(),
         repaired: candidate.repaired,
         resolve: kind_name(sig.resolve()),
@@ -516,7 +615,7 @@ fn repair_pattern<S: PatternLike>(mc: &ModuleCache, sig: &S) -> Option<repair::P
             .filter(|proto| !proto.is_empty())
             .map(str::to_string),
         candidate_rva,
-        candidate_va: mc.base + candidate_rva,
+        candidate_va,
         constrained_bytes: candidate.constrained,
         matched_bytes: candidate.matched,
         similarity: candidate.matched as f32 / candidate.constrained.max(1) as f32,
@@ -597,7 +696,7 @@ fn validate_cached_hit<S: PatternLike>(
     {
         return None;
     }
-    let match_va = mc.base + match_rva as u64;
+    let match_va = mc.base.checked_add(match_rva as u64)?;
     let resolved = resolve(mc, sig, match_rva as u32, match_va);
     if resolved.2.is_some()
         || (resolution_score(mc, sig.resolve(), resolved.0) == 0
@@ -606,13 +705,15 @@ fn validate_cached_hit<S: PatternLike>(
         return None;
     }
     Some(PatternHit {
-        name: display_name(sig.name()),
-        module: canonical_module_name(&mc.name),
+        name: sig.display_name_cow(),
+        module: intern_cached_module(&mc.name),
         resolve: kind_name(sig.resolve()),
-        pattern: sig.needle().to_string(),
+        pattern: sig.needle_cow(),
         prototype: opt_proto(sig.name(), sig.prototype()),
         bytes: capture_prologue(mc, resolved.0),
-        pattern_synth: synthesize_pattern(mc, resolved.0),
+        // Local reloc-wildcarded synth from the bytes at this RVA. Uniqueness
+        // walks of `.text` stay on the cold scan that first discovered the hit.
+        pattern_synth: synthesize_pattern_local(mc, resolved.0),
         found: true,
         repaired_from: None,
         match_rva: Some(match_rva as u64),
@@ -630,9 +731,9 @@ fn validate_cached_hit<S: PatternLike>(
 // ---------------------------------------------------------------------------
 
 struct ModuleCache {
-    name: String,
+    name: Arc<str>,
     base: u64,
-    image: Vec<u8>,
+    image: Arc<[u8]>,
     text_rva: u32,
     text_size: u32,
     rdata_rva: u32,
@@ -675,8 +776,8 @@ impl ModuleCache {
         }
 
         Ok(Self {
-            name: canonical_module_name(module),
-            base: info.base.to_umem() as u64,
+            name: intern_module_name(module),
+            base: info.base.to_umem(),
             image,
             text_rva,
             text_size,
@@ -687,7 +788,7 @@ impl ModuleCache {
 
     #[inline]
     fn text(&self) -> &[u8] {
-        let lo = self.text_rva as usize;
+        let lo = (self.text_rva as usize).min(self.image.len());
         let hi = lo.saturating_add(self.text_size as usize);
         if lo >= self.image.len() {
             return &[];
@@ -701,6 +802,9 @@ impl ModuleCache {
             return None;
         }
         let lo = self.rdata_rva as usize;
+        if lo >= self.image.len() {
+            return None;
+        }
         let hi = lo.saturating_add(self.rdata_size as usize);
         self.image.get(lo..hi.min(self.image.len()))
     }
@@ -710,6 +814,15 @@ impl ModuleCache {
 // IDA pattern parser
 // ---------------------------------------------------------------------------
 
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn parse_ida(pattern: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut bytes = Vec::with_capacity(pattern.len() / 3);
     let mut mask = Vec::with_capacity(pattern.len() / 3);
@@ -718,36 +831,29 @@ fn parse_ida(pattern: &str) -> Result<(Vec<u8>, Vec<u8>)> {
         if tok == "?" || tok == "??" {
             bytes.push(0);
             mask.push(0);
-        } else if tok.len() == 2 {
-            let chars: Vec<char> = tok.chars().collect();
-            let hi = chars[0];
-            let lo = chars[1];
-            let (value, nibble_mask) = match (hi, lo) {
-                ('?', c) => {
-                    let low = c
-                        .to_digit(16)
-                        .ok_or_else(|| anyhow!("invalid hex nibble '{}'", tok))?
-                        as u8;
-                    (low, 0x0F)
-                }
-                (c, '?') => {
-                    let high = c
-                        .to_digit(16)
-                        .ok_or_else(|| anyhow!("invalid hex nibble '{}'", tok))?
-                        as u8;
-                    (high << 4, 0xF0)
-                }
-                (a, b) => {
-                    let value = u8::from_str_radix(&format!("{a}{b}"), 16)
-                        .with_context(|| format!("invalid hex byte '{}'", tok))?;
-                    (value, 0xFF)
-                }
-            };
-            bytes.push(value);
-            mask.push(nibble_mask);
-        } else {
+            continue;
+        }
+        let raw = tok.as_bytes();
+        if raw.len() != 2 {
             return Err(anyhow!("invalid pattern token '{}'", tok));
         }
+        let (value, nibble_mask) = match (raw[0], raw[1]) {
+            (b'?', lo) => {
+                let low = hex_nibble(lo).ok_or_else(|| anyhow!("invalid hex nibble '{}'", tok))?;
+                (low, 0x0F)
+            }
+            (hi, b'?') => {
+                let high = hex_nibble(hi).ok_or_else(|| anyhow!("invalid hex nibble '{}'", tok))?;
+                (high << 4, 0xF0)
+            }
+            (hi, lo) => {
+                let high = hex_nibble(hi).ok_or_else(|| anyhow!("invalid hex byte '{}'", tok))?;
+                let low = hex_nibble(lo).ok_or_else(|| anyhow!("invalid hex byte '{}'", tok))?;
+                ((high << 4) | low, 0xFF)
+            }
+        };
+        bytes.push(value);
+        mask.push(nibble_mask);
     }
 
     if bytes.is_empty() {
@@ -763,53 +869,94 @@ fn byte_matches(actual: u8, expected: u8, mask: u8) -> bool {
     (actual & mask) == (expected & mask)
 }
 
-fn find_pattern(hay: &[u8], bytes: &[u8], mask: &[u8]) -> Option<usize> {
+/// IDA-style scan over a raw buffer. This is the inner loop of the module
+/// scanner; benches drive it directly so they measure the shipped matcher.
+pub fn find_ida(hay: &[u8], needle: &str) -> Result<Vec<usize>> {
+    let (bytes, mask) = parse_ida(needle)?;
+    Ok(find_all_pattern(hay, &bytes, &mask))
+}
+
+/// Walk every match of `(bytes, mask)` in `hay`. `visit` returns whether to
+/// keep searching. Full scans and synth uniqueness share this so a first-byte
+/// skip cannot diverge from the reported offsets.
+fn visit_pattern_matches(
+    hay: &[u8],
+    bytes: &[u8],
+    mask: &[u8],
+    mut visit: impl FnMut(usize) -> bool,
+) {
     let need = bytes.len();
-    if hay.len() < need {
-        return None;
+    if need == 0 || hay.len() < need || mask.len() < need {
+        return;
     }
     let first = bytes[0];
-    let first_wild = mask[0] == 0;
-    let end = hay.len() - need;
-    'outer: for i in 0..=end {
-        if !first_wild && !byte_matches(hay[i], first, mask[0]) {
+    let first_mask = mask[0];
+    let first_exact = first_mask == 0xFF;
+    let first_wild = first_mask == 0;
+    let last_start = hay.len() - need;
+    let mut i = 0usize;
+    while i <= last_start {
+        if first_exact {
+            match hay[i..=last_start].iter().position(|&b| b == first) {
+                Some(delta) => i += delta,
+                None => return,
+            }
+        } else if !first_wild && !byte_matches(hay[i], first, first_mask) {
+            i += 1;
             continue;
         }
+
+        let mut ok = true;
         for j in 1..need {
             if !byte_matches(hay[i + j], bytes[j], mask[j]) {
-                continue 'outer;
+                ok = false;
+                break;
             }
         }
-        return Some(i);
+        if ok && !visit(i) {
+            return;
+        }
+        i += 1;
     }
-    None
 }
 
 fn find_all_pattern(hay: &[u8], bytes: &[u8], mask: &[u8]) -> Vec<usize> {
     let mut out = Vec::new();
-    let need = bytes.len();
-    if hay.len() < need {
-        return out;
+    visit_pattern_matches(hay, bytes, mask, |offset| {
+        out.push(offset);
+        true
+    });
+    out
+}
+
+/// Exact byte search used by `StringRef`. Same first-byte skip as the IDA
+/// matcher, including overlapping matches.
+fn visit_exact_matches(hay: &[u8], needle: &[u8], mut visit: impl FnMut(usize) -> bool) {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return;
     }
-    let first = bytes[0];
-    let first_wild = mask[0] == 0;
-    let end = hay.len() - need;
+    let first = needle[0];
+    let last_start = hay.len() - needle.len();
     let mut i = 0usize;
-    while i <= end {
-        if first_wild || byte_matches(hay[i], first, mask[0]) {
-            let mut ok = true;
-            for j in 1..need {
-                if !byte_matches(hay[i + j], bytes[j], mask[j]) {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                out.push(i);
-            }
+    while i <= last_start {
+        match hay[i..=last_start].iter().position(|&b| b == first) {
+            Some(delta) => i += delta,
+            None => return,
+        }
+        if hay[i..].starts_with(needle) && !visit(i) {
+            return;
         }
         i += 1;
     }
+}
+
+#[cfg(test)]
+fn find_all_exact(hay: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    visit_exact_matches(hay, needle, |offset| {
+        out.push(offset);
+        true
+    });
     out
 }
 
@@ -835,20 +982,28 @@ fn scan_pattern<S: PatternLike>(mc: &ModuleCache, sig: &S) -> PatternHit {
     // candidate from being selected.
     let text_hits = find_all_pattern(mc.text(), &bytes, &mask)
         .into_iter()
-        .map(|offset| mc.text_rva.saturating_add(offset as u32))
+        .filter_map(|offset| {
+            u32::try_from(offset)
+                .ok()
+                .and_then(|offset| mc.text_rva.checked_add(offset))
+        })
         .collect::<Vec<_>>();
     let rdata_hits = mc
         .rdata()
         .map(|rd| {
             find_all_pattern(rd, &bytes, &mask)
                 .into_iter()
-                .map(|offset| mc.rdata_rva.saturating_add(offset as u32))
+                .filter_map(|offset| {
+                    u32::try_from(offset)
+                        .ok()
+                        .and_then(|offset| mc.rdata_rva.checked_add(offset))
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     let image_hits = find_all_pattern(&mc.image, &bytes, &mask)
         .into_iter()
-        .map(|offset| offset as u32)
+        .filter_map(|offset| u32::try_from(offset).ok())
         .collect::<Vec<_>>();
 
     let mut candidates = Vec::new();
@@ -873,7 +1028,9 @@ fn scan_pattern<S: PatternLike>(mc: &ModuleCache, sig: &S) -> PatternHit {
     let mut selected_score = i32::MIN;
     let mut first_error = None;
     for (match_rva, region_score) in candidates {
-        let match_va = mc.base + match_rva as u64;
+        let Some(match_va) = mc.base.checked_add(match_rva as u64) else {
+            continue;
+        };
         let resolved = resolve(mc, sig, match_rva, match_va);
         if let Some(error) = resolved.2.as_ref() {
             first_error.get_or_insert_with(|| error.clone());
@@ -897,13 +1054,15 @@ fn scan_pattern<S: PatternLike>(mc: &ModuleCache, sig: &S) -> PatternHit {
         );
     };
 
-    let match_va = mc.base + match_rva as u64;
+    let Some(match_va) = mc.base.checked_add(match_rva as u64) else {
+        return PatternHit::fail(sig, "match address overflow");
+    };
 
     PatternHit {
-        name: display_name(sig.name()),
-        module: canonical_module_name(&mc.name),
+        name: sig.display_name_cow(),
+        module: intern_cached_module(&mc.name),
         resolve: kind_name(sig.resolve()),
-        pattern: sig.needle().to_string(),
+        pattern: sig.needle_cow(),
         prototype: opt_proto(sig.name(), sig.prototype()),
         bytes: capture_prologue(mc, res_rva),
         pattern_synth: synthesize_pattern(mc, res_rva),
@@ -928,19 +1087,18 @@ fn scan_string_ref<S: PatternLike>(mc: &ModuleCache, sig: &S) -> PatternHit {
     let mut string_rvas = Vec::new();
     for (region_rva, region) in [
         (mc.rdata_rva, mc.rdata().unwrap_or(&[])),
-        (0, mc.image.as_slice()),
+        (0, mc.image.as_ref()),
     ] {
-        if region.len() < needle.len() {
-            continue;
-        }
-        for offset in 0..=region.len() - needle.len() {
-            if &region[offset..offset + needle.len()] == needle {
-                let rva = region_rva.saturating_add(offset as u32);
-                if !string_rvas.contains(&rva) {
-                    string_rvas.push(rva);
-                }
+        visit_exact_matches(region, needle, |offset| {
+            if let Some(rva) = u32::try_from(offset)
+                .ok()
+                .and_then(|offset| region_rva.checked_add(offset))
+                && !string_rvas.contains(&rva)
+            {
+                string_rvas.push(rva);
             }
-        }
+            true
+        });
     }
     if string_rvas.is_empty() {
         return PatternHit::fail(sig, "string reference not found");
@@ -956,15 +1114,19 @@ fn scan_string_ref<S: PatternLike>(mc: &ModuleCache, sig: &S) -> PatternHit {
         return PatternHit::fail(sig, "string reference has no RIP-relative xref");
     }
     let match_rva = xrefs[0];
-    let match_va = mc.base + match_rva as u64;
+    let Some(match_va) = mc.base.checked_add(match_rva as u64) else {
+        return PatternHit::fail(sig, "match address overflow");
+    };
     let resolved_rva = find_function_start(mc, match_rva);
-    let resolved_va = mc.base + resolved_rva;
+    let Some(resolved_va) = mc.base.checked_add(resolved_rva) else {
+        return PatternHit::fail(sig, "resolved address overflow");
+    };
 
     PatternHit {
-        name: display_name(sig.name()),
-        module: canonical_module_name(&mc.name),
+        name: sig.display_name_cow(),
+        module: intern_cached_module(&mc.name),
         resolve: kind_name(sig.resolve()),
-        pattern: sig.needle().to_string(),
+        pattern: sig.needle_cow(),
         prototype: opt_proto(sig.name(), sig.prototype()),
         bytes: capture_prologue(mc, resolved_rva),
         pattern_synth: synthesize_pattern(mc, resolved_rva),
@@ -980,21 +1142,38 @@ fn scan_string_ref<S: PatternLike>(mc: &ModuleCache, sig: &S) -> PatternHit {
     }
 }
 
+fn is_rip_lead_byte(b: u8) -> bool {
+    matches!(b, 0x40..=0x4F | 0x8B | 0x8D | 0x89)
+}
+
 fn find_string_xrefs(mc: &ModuleCache, string_rva: u32) -> Vec<u32> {
     let text = mc.text();
     let text_base = mc.text_rva as usize;
-    let string_va = mc.base + string_rva as u64;
+    let Some(string_va) = mc.base.checked_add(string_rva as u64) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    for i in 0..text.len() {
-        let absolute = text_base + i;
+    let mut i = 0usize;
+    while i < text.len() {
+        match text[i..].iter().position(|&b| is_rip_lead_byte(b)) {
+            Some(delta) => i += delta,
+            None => break,
+        }
+        // REX is decoded at its own byte; the following opcode is not a
+        // separate RIP instruction.
         if i > 0 && (0x40..=0x4F).contains(&text[i - 1]) {
+            i += 1;
             continue;
         }
-        if let Some(target) = rip_target_at(mc, absolute) {
-            if target == string_va {
-                out.push(absolute as u32);
-            }
+        let Some(absolute) = text_base.checked_add(i) else {
+            break;
+        };
+        if rip_target_at(mc, absolute) == Some(string_va)
+            && let Ok(absolute) = u32::try_from(absolute)
+        {
+            out.push(absolute);
         }
+        i += 1;
     }
     out
 }
@@ -1018,15 +1197,15 @@ fn rip_target_at(mc: &ModuleCache, rva: usize) -> Option<u64> {
         let op = image[rva + 1];
         let modrm = image[rva + 2];
         if matches!(op, 0x8B | 0x8D | 0x89) && (modrm & 0xC7) == 0x05 {
-            let disp = i32::from_le_bytes(image[rva + 3..rva + 7].try_into().ok()?) as i64;
-            return Some((mc.base as i128 + rva as i128 + 7 + disp as i128) as u64);
+            let disp = i32_le_at(image, rva + 3)? as i64;
+            return relative_target(mc.base, rva, 7, disp);
         }
     }
     if matches!(b0, 0x8B | 0x8D | 0x89) && rva.checked_add(6)? <= image.len() {
         let modrm = image[rva + 1];
         if (modrm & 0xC7) == 0x05 {
-            let disp = i32::from_le_bytes(image[rva + 2..rva + 6].try_into().ok()?) as i64;
-            return Some((mc.base as i128 + rva as i128 + 6 + disp as i128) as u64);
+            let disp = i32_le_at(image, rva + 2)? as i64;
+            return relative_target(mc.base, rva, 6, disp);
         }
     }
     None
@@ -1038,7 +1217,7 @@ fn find_function_start(mc: &ModuleCache, xref_rva: u32) -> u64 {
     for rva in (start..=xref_rva as u64).rev() {
         let i = rva as usize;
         let image = &mc.image;
-        if i + 2 > image.len() {
+        if i.checked_add(2).is_none_or(|end| end > image.len()) {
             continue;
         }
         let prologue = (matches!(image[i], 0x40..=0x4F) && matches!(image[i + 1], 0x53..=0x57))
@@ -1111,7 +1290,7 @@ fn capture_prologue(mc: &ModuleCache, rva: u64) -> Option<String> {
     if lo < text_lo || lo >= text_hi {
         return None;
     }
-    let hi = (lo + 24).min(text_hi).min(mc.image.len());
+    let hi = lo.saturating_add(24).min(text_hi).min(mc.image.len());
     let slice = mc.image.get(lo..hi)?;
     if slice.is_empty() {
         return None;
@@ -1121,9 +1300,14 @@ fn capture_prologue(mc: &ModuleCache, rva: u64) -> Option<String> {
         if i > 0 {
             s.push(' ');
         }
-        s.push_str(&format!("{:02X}", b));
+        push_hex_byte(&mut s, *b);
     }
     Some(s)
+}
+
+fn relative_target(base: u64, rva: usize, instruction_len: u64, disp: i64) -> Option<u64> {
+    let target = base as i128 + rva as i128 + instruction_len as i128 + disp as i128;
+    (0..=u64::MAX as i128).contains(&target).then_some(target as u64)
 }
 
 fn resolve<S: PatternLike>(
@@ -1144,7 +1328,10 @@ fn resolve<S: PatternLike>(
             if end > mc.image.len() {
                 return (0, 0, Some("disp32 out of image".into()));
             }
-            let disp = i32::from_le_bytes(mc.image[idx..idx + 4].try_into().unwrap()) as i64;
+            let Some(disp) = crate::analysis::read::i32_le(&mc.image[idx..end]) else {
+                return (0, 0, Some("disp32 out of image".into()));
+            };
+            let disp = disp as i64;
             let target_va =
                 match_va as i128 + rel_off as i128 + 4 + disp as i128 + sig.extra_off() as i128;
             if target_va < mc.base as i128 || target_va > u64::MAX as i128 {
@@ -1155,7 +1342,7 @@ fn resolve<S: PatternLike>(
                 );
             }
             let target_va = target_va as u64;
-            (target_va - mc.base, target_va, None)
+            checked_module_target(mc, target_va, "resolved")
         }
         ResolveKind::StringRef => (match_rva as u64, match_va, None),
     }
@@ -1170,8 +1357,29 @@ fn adjusted_target(mc: &ModuleCache, match_va: u64, extra_off: i64) -> (u64, u64
             Some("adjusted target outside module address space".into()),
         );
     }
-    let target_va = target_va as u64;
-    (target_va - mc.base, target_va, None)
+    checked_module_target(mc, target_va as u64, "adjusted")
+}
+
+fn checked_module_target(
+    mc: &ModuleCache,
+    target_va: u64,
+    operation: &str,
+) -> (u64, u64, Option<String>) {
+    let Some(target_rva) = target_va.checked_sub(mc.base) else {
+        return (
+            0,
+            0,
+            Some(format!("{operation} target outside module address space")),
+        );
+    };
+    if target_rva >= mc.image.len() as u64 {
+        return (
+            0,
+            0,
+            Some(format!("{operation} target outside module image")),
+        );
+    }
+    (target_rva, target_va, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,10 +1398,10 @@ fn kind_name(k: ResolveKind) -> &'static str {
 impl PatternHit {
     fn fail<S: PatternLike>(sig: &S, err: &str) -> Self {
         Self {
-            name: display_name(sig.name()),
-            module: canonical_module_name(sig.module()),
+            name: sig.display_name_cow(),
+            module: intern_module_name(sig.module()),
             resolve: kind_name(sig.resolve()),
-            pattern: sig.needle().to_string(),
+            pattern: sig.needle_cow(),
             prototype: opt_proto(sig.name(), sig.prototype()),
             bytes: None,
             pattern_synth: None,
@@ -1210,12 +1418,12 @@ impl PatternHit {
     }
 }
 
-fn display_name(raw: &str) -> String {
+fn display_name(raw: &str) -> Cow<'_, str> {
     if raw.is_empty() {
-        return String::new();
+        return Cow::Borrowed("");
     }
     if let Some(idx) = raw.rfind("::") {
-        return raw[idx + 2..].to_string();
+        return Cow::Owned(raw[idx + 2..].to_string());
     }
     if raw.starts_with("m_")
         || raw.starts_with("dw")
@@ -1223,7 +1431,7 @@ fn display_name(raw: &str) -> String {
         || raw.starts_with("C_")
         || raw.ends_with("_t")
     {
-        return raw.to_string();
+        return Cow::Borrowed(raw);
     }
 
     let parts: Vec<&str> = raw.split('_').filter(|p| !p.is_empty()).collect();
@@ -1250,11 +1458,11 @@ fn display_name(raw: &str) -> String {
                 .map(|c| c.is_ascii_uppercase())
                 .unwrap_or(false)
             {
-                return rest;
+                return Cow::Owned(rest);
             }
         }
     }
-    raw.to_string()
+    Cow::Borrowed(raw)
 }
 
 fn opt_proto(sig_name: &str, p: &str) -> Option<String> {
@@ -1273,7 +1481,7 @@ fn opt_proto(sig_name: &str, p: &str) -> Option<String> {
         while end < out.len() && out.as_bytes()[end].is_ascii_hexdigit() {
             end += 1;
         }
-        out.replace_range(start..end, &display);
+        out.replace_range(start..end, display.as_ref());
     }
     Some(out)
 }
@@ -1281,6 +1489,31 @@ fn opt_proto(sig_name: &str, p: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Auto-tightened pattern synthesiser
 // ---------------------------------------------------------------------------
+
+const SYNTH_LENGTHS: [usize; 7] = [16, 20, 24, 28, 32, 40, 48];
+
+fn synth_window(mc: &ModuleCache, rva: u64, len: usize) -> Option<&[u8]> {
+    let lo = usize::try_from(rva).ok()?;
+    let text_lo = mc.text_rva as usize;
+    let text_hi = text_lo.saturating_add(mc.text_size as usize);
+    if lo < text_lo || lo >= text_hi {
+        return None;
+    }
+    let cap = text_hi.min(mc.image.len());
+    let hi = lo.saturating_add(len).min(cap);
+    if hi <= lo {
+        return None;
+    }
+    mc.image.get(lo..hi).filter(|bytes| !bytes.is_empty())
+}
+
+/// Cache-path synth: reloc wildcards from the bytes at `rva`. Does not count
+/// matches in `.text`, so a still-valid cached RVA is accepted even when the
+/// prologue is duplicated.
+fn synthesize_pattern_local(mc: &ModuleCache, rva: u64) -> Option<String> {
+    let bytes = synth_window(mc, rva, SYNTH_LENGTHS[0])?;
+    Some(format_ida(bytes, &relocatable_mask(bytes)))
+}
 
 /// Build the shortest unique-in-`.text` IDA pattern at `rva`, with `?`
 /// wildcards on bytes that look like rel32 displacements (CALL/JMP near,
@@ -1296,36 +1529,20 @@ fn opt_proto(sig_name: &str, p: &str) -> Option<String> {
 ///   5. if none unique, return the longest-attempted pattern as a
 ///      best-effort fallback (consumers can still tighten by hand)
 fn synthesize_pattern(mc: &ModuleCache, rva: u64) -> Option<String> {
-    let lo = rva as usize;
-    let text_lo = mc.text_rva as usize;
-    let text_hi = text_lo.saturating_add(mc.text_size as usize);
-    if lo < text_lo || lo >= text_hi {
-        return None;
-    }
-    let cap = text_hi.min(mc.image.len());
-
-    let try_lengths = [16usize, 20, 24, 28, 32, 40, 48];
-    let mut best: Option<(Vec<u8>, Vec<u8>)> = None;
-    for &len in &try_lengths {
-        let hi = (lo + len).min(cap);
-        if hi <= lo {
+    let mut best = None;
+    for &len in &SYNTH_LENGTHS {
+        let Some(bytes) = synth_window(mc, rva, len) else {
             break;
-        }
-        let bytes = mc.image[lo..hi].to_vec();
-        if bytes.is_empty() {
-            break;
-        }
-        let mask = relocatable_mask(&bytes);
-        let count = count_matches_capped(mc.text(), &bytes, &mask, 2);
+        };
+        let mask = relocatable_mask(bytes);
+        let count = count_matches_capped(mc.text(), bytes, &mask, 2);
         // We always match ourselves once; require uniqueness.
         if count == 1 {
-            return Some(format_ida(&bytes, &mask));
+            return Some(format_ida(bytes, &mask));
         }
-        best = Some((bytes, mask));
+        best = Some(format_ida(bytes, &mask));
     }
-    // Couldn't disambiguate within 48 bytes — return the longest attempt
-    // anyway; it's still useful in IDA.
-    best.map(|(b, m)| format_ida(&b, &m))
+    best
 }
 
 /// Mark bytes that are part of a rel32 displacement as wildcards.
@@ -1394,34 +1611,28 @@ fn relocatable_mask(bytes: &[u8]) -> Vec<u8> {
 /// Count matches of `(bytes, mask)` in `hay`, but stop early after
 /// `cap` matches — we only need to distinguish "1" from ">=2".
 fn count_matches_capped(hay: &[u8], bytes: &[u8], mask: &[u8], cap: usize) -> usize {
-    let need = bytes.len();
-    if hay.len() < need || need == 0 {
+    if cap == 0 {
         return 0;
     }
-    let first = bytes[0];
-    let first_wild = mask[0] == 0;
-    let end = hay.len() - need;
     let mut count = 0usize;
-    let mut i = 0usize;
-    while i <= end {
-        if first_wild || byte_matches(hay[i], first, mask[0]) {
-            let mut ok = true;
-            for j in 1..need {
-                if !byte_matches(hay[i + j], bytes[j], mask[j]) {
-                    ok = false;
-                    break;
-                }
-            }
-            if ok {
-                count += 1;
-                if count >= cap {
-                    return count;
-                }
-            }
-        }
-        i += 1;
-    }
+    visit_pattern_matches(hay, bytes, mask, |_| {
+        count += 1;
+        count < cap
+    });
     count
+}
+
+const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+#[inline]
+fn push_hex_nibble(s: &mut String, nibble: u8) {
+    s.push(HEX_UPPER[(nibble & 0x0F) as usize] as char);
+}
+
+#[inline]
+fn push_hex_byte(s: &mut String, b: u8) {
+    push_hex_nibble(s, b >> 4);
+    push_hex_nibble(s, b);
 }
 
 fn format_ida(bytes: &[u8], mask: &[u8]) -> String {
@@ -1432,14 +1643,16 @@ fn format_ida(bytes: &[u8], mask: &[u8]) -> String {
         }
         match mask[i] {
             0 => s.push('?'),
-            0xFF => s.push_str(&format!("{:02X}", b)),
+            0xFF => push_hex_byte(&mut s, *b),
             0xF0 => {
-                s.push_str(&format!("{:X}?", b >> 4));
+                push_hex_nibble(&mut s, b >> 4);
+                s.push('?');
             }
             0x0F => {
-                s.push_str(&format!("?{:X}", b & 0x0F));
+                s.push('?');
+                push_hex_nibble(&mut s, b & 0x0F);
             }
-            _ => s.push_str(&format!("{:02X}", b)),
+            _ => push_hex_byte(&mut s, *b),
         }
     }
     s
@@ -1448,6 +1661,7 @@ fn format_ida(bytes: &[u8], mask: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
 
     fn temp_pattern_file(body: &str) -> std::path::PathBuf {
         // The clock on Windows is coarser than the gap between two tests
@@ -1506,6 +1720,30 @@ mod tests {
     }
 
     #[test]
+    fn external_pattern_file_accepts_non_ida_string_references() {
+        let path = temp_pattern_file(
+            r#"[
+                {"name":"ByText","module":"client.dll","pattern":"not an IDA pattern","resolve":"string_ref"}
+            ]"#,
+        );
+        let patterns = load_pattern_file(&path).expect("string reference must load");
+        std::fs::remove_file(path).expect("remove pattern file");
+
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].needle, "not an IDA pattern");
+        assert_eq!(patterns[0].resolve, ResolveKind::StringRef);
+
+        let path = temp_pattern_file(
+            r#"[
+                {"name":"Empty","module":"client.dll","pattern":"","resolve":"string_ref"}
+            ]"#,
+        );
+        let error = load_pattern_file(&path).expect_err("empty string reference must fail");
+        std::fs::remove_file(path).expect("remove pattern file");
+        assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
     fn pattern_requires_a_concrete_byte() {
         let error = parse_ida("? ?? ?").expect_err("all-wildcard pattern must fail");
         assert!(error.to_string().contains("concrete byte"));
@@ -1521,6 +1759,15 @@ mod tests {
             vec![0, 3]
         );
         assert_eq!(format_ida(&bytes, &mask), "4? ?A ?");
+        let (lower, lower_mask) = parse_ida("ab CD").expect("mixed-case hex");
+        assert_eq!(lower, vec![0xAB, 0xCD]);
+        assert_eq!(lower_mask, vec![0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn exact_byte_search_counts_overlapping_matches() {
+        assert_eq!(find_all_exact(b"aaaa", b"aa"), vec![0, 1, 2]);
+        assert_eq!(find_all_exact(b"abc", b"z"), Vec::<usize>::new());
     }
 
     #[test]
@@ -1535,8 +1782,8 @@ mod tests {
         image[32..45].copy_from_slice(b"UniqueString\0");
         let module = ModuleCache {
             name: "client.dll".into(),
-            base: 0x1800_0000_0,
-            image,
+            base: 0x0001_8000_0000,
+            image: image.into(),
             text_rva: 0,
             text_size: 16,
             rdata_rva: 32,
@@ -1568,8 +1815,8 @@ mod tests {
         image[0x1100..0x1100 + func.len()].copy_from_slice(&func);
         let module = ModuleCache {
             name: "CLIENT.DLL".into(),
-            base: 0x1800_0000_0,
-            image,
+            base: 0x0001_8000_0000,
+            image: image.into(),
             text_rva: 0x1000,
             text_size: 0x1000,
             rdata_rva: 0,
@@ -1615,8 +1862,8 @@ mod tests {
         image[at + 9..at + 13].copy_from_slice(&disp.to_le_bytes());
         let module = ModuleCache {
             name: "client.dll".into(),
-            base: 0x1800_0000_0,
-            image,
+            base: 0x0001_8000_0000,
+            image: image.into(),
             text_rva: 0x1000,
             text_size: 0x1000,
             rdata_rva: 0,
@@ -1668,7 +1915,7 @@ mod tests {
             extra_off: -0x10,
             prototype: Some("void*".into()),
             candidate_rva: 0x1000,
-            candidate_va: 0x1800_0100_0,
+            candidate_va: 0x0001_8000_1000,
             constrained_bytes: 12,
             matched_bytes: 11,
             similarity: 0.9,
@@ -1713,6 +1960,207 @@ mod tests {
             find_all_pattern(&[0xAA, 0xAA, 0xAA], &bytes, &mask),
             vec![0, 1]
         );
+        assert_eq!(
+            find_ida(&[0xAA, 0xAA, 0xAA], "AA AA").expect("find_ida"),
+            vec![0, 1]
+        );
+    }
+
+    fn client_text_module(image: Vec<u8>) -> ModuleCache {
+        let text_size = u32::try_from(image.len()).expect("test image fits u32");
+        ModuleCache {
+            name: "client.dll".into(),
+            base: 0x0001_8000_0000,
+            image: image.into(),
+            text_rva: 0,
+            text_size,
+            rdata_rva: 0,
+            rdata_size: 0,
+        }
+    }
+
+    fn raw_client_pattern(name: &'static str, needle: &'static str) -> Pattern {
+        Pattern {
+            name,
+            module: "client.dll",
+            needle,
+            resolve: ResolveKind::None,
+            extra_off: 0,
+            prototype: "",
+        }
+    }
+
+    fn cached_hit(pattern: &Pattern, match_rva: u64, matches: u32) -> CachedPatternHit {
+        CachedPatternHit {
+            name: pattern.name.to_string(),
+            module: pattern.module.to_string(),
+            pattern: pattern.needle.to_string(),
+            found: true,
+            match_rva: Some(match_rva),
+            matches,
+        }
+    }
+
+    /// 16-byte prologue with a CALL rel32 so synth must wildcard the displacement.
+    const PLANTED_PREFIX16: [u8; 16] = [
+        0x48, 0x83, 0xEC, 0x28, 0xE8, 0x11, 0x22, 0x33, 0x44, 0x48, 0x89, 0x5C, 0x24, 0x08, 0x90,
+        0x90,
+    ];
+    const PLANTED_UNIQUE4: [u8; 4] = [0x4C, 0x8B, 0xDC, 0x90];
+    const PLANTED_SITE_A: usize = 32;
+    const PLANTED_SITE_B: usize = 80;
+    const PLANTED_NEEDLE: &str = "48 83 EC 28 E8";
+
+    fn planted_unique_prologue_image() -> Vec<u8> {
+        let mut image = vec![0xCCu8; 160];
+        image[PLANTED_SITE_A..PLANTED_SITE_A + 16].copy_from_slice(&PLANTED_PREFIX16);
+        image[PLANTED_SITE_A + 16..PLANTED_SITE_A + 20].copy_from_slice(&PLANTED_UNIQUE4);
+        image[PLANTED_SITE_B..PLANTED_SITE_B + 16].copy_from_slice(&PLANTED_PREFIX16);
+        image
+    }
+
+    #[test]
+    fn uncached_scan_emits_unique_reloc_wildcarded_synth() {
+        let module = client_text_module(planted_unique_prologue_image());
+        let pattern = raw_client_pattern("PlantedPrologue", PLANTED_NEEDLE);
+        let hit = scan_pattern(&module, &pattern);
+        assert!(hit.found);
+        assert_eq!(hit.match_rva, Some(PLANTED_SITE_A as u64));
+
+        let synth = hit
+            .pattern_synth
+            .as_deref()
+            .expect("cold-path hit emits synth");
+        assert!(
+            synth.split_ascii_whitespace().any(|tok| tok.contains('?')),
+            "rel32 displacement must be wildcarded: {synth}"
+        );
+        let tokens: Vec<&str> = synth.split_ascii_whitespace().collect();
+        assert!(
+            tokens.len() >= 20,
+            "16-byte prefix is planted twice, unique length must grow: {synth}"
+        );
+
+        let text = module.text();
+        assert_eq!(
+            find_ida(text, synth).expect("shipped finder parses synth"),
+            vec![PLANTED_SITE_A]
+        );
+        let short = tokens[..16].join(" ");
+        assert_eq!(
+            find_ida(text, &short).expect("shipped finder parses 16-byte prefix").len(),
+            2,
+            "the 16-byte prefix must stay ambiguous so uniqueness actually chose a longer synth"
+        );
+    }
+
+    #[test]
+    fn cached_rva_matches_uncached_scan_without_uniqueness() {
+        let module = client_text_module(planted_unique_prologue_image());
+        let pattern = raw_client_pattern("PlantedPrologue", PLANTED_NEEDLE);
+        let (uncached, used_cold) = scan_one_cached(&module, &pattern, None);
+        assert!(!used_cold);
+        assert!(uncached.found);
+        assert_eq!(uncached.match_rva, Some(PLANTED_SITE_A as u64));
+
+        let cached = cached_hit(
+            &pattern,
+            uncached.match_rva.expect("uncached match RVA"),
+            uncached.matches,
+        );
+        let (warm, used_cache) = scan_one_cached(&module, &pattern, Some(&cached));
+        assert!(used_cache);
+        assert!(warm.found);
+        assert_eq!(warm.match_rva, uncached.match_rva);
+        assert_eq!(warm.rva, uncached.rva);
+
+        let synth = warm
+            .pattern_synth
+            .as_deref()
+            .expect("cache-path hit emits local synth");
+        assert!(
+            synth.split_ascii_whitespace().any(|tok| tok.contains('?')),
+            "cache-path synth must wildcard the planted CALL rel32: {synth}"
+        );
+        let hits = find_ida(module.text(), synth).expect("shipped finder parses cache synth");
+        assert!(
+            hits.contains(&PLANTED_SITE_A),
+            "cache synth must match the cached RVA, got {hits:?}"
+        );
+    }
+
+    #[test]
+    fn cached_rva_is_accepted_when_prologue_is_not_unique_in_text() {
+        let mut image = vec![0xCCu8; 192];
+        let mut seq = [0x90u8; 48];
+        seq[0] = 0x48;
+        seq[1] = 0x83;
+        seq[2] = 0xEC;
+        seq[3] = 0x28;
+        seq[4] = 0xE8;
+        seq[5] = 0x11;
+        seq[6] = 0x22;
+        seq[7] = 0x33;
+        seq[8] = 0x44;
+        for (i, byte) in seq.iter_mut().enumerate().skip(9) {
+            *byte = 0xA0 + (i as u8 % 13);
+        }
+        image[16..64].copy_from_slice(&seq);
+        image[96..144].copy_from_slice(&seq);
+        let module = client_text_module(image);
+        let pattern = raw_client_pattern("DuplicatedPrologue", "48 83 EC 28");
+        let uncached = scan_pattern(&module, &pattern);
+        assert!(uncached.found);
+        assert_eq!(uncached.match_rva, Some(16));
+        assert!(uncached.matches >= 2);
+
+        let cached = cached_hit(&pattern, 16, uncached.matches);
+        let (warm, used_cache) = scan_one_cached(&module, &pattern, Some(&cached));
+        assert!(used_cache, "duplicate prologue must not reject a still-valid cached RVA");
+        assert_eq!(warm.match_rva, Some(16));
+        let synth = warm
+            .pattern_synth
+            .as_deref()
+            .expect("cache-path synth does not need a unique prologue");
+        assert!(
+            synth.split_ascii_whitespace().any(|tok| tok.contains('?')),
+            "duplicated prologue still wildcards the planted CALL: {synth}"
+        );
+        let hits = find_ida(module.text(), synth).expect("shipped finder parses cache synth");
+        assert!(hits.contains(&16), "cache synth must still match site A: {hits:?}");
+        assert!(
+            hits.len() >= 2,
+            "local cache synth must not uniqueness-walk; duplicated prologue should match twice: {hits:?}"
+        );
+        let cache_tokens = synth.split_ascii_whitespace().count();
+        assert_eq!(
+            cache_tokens, 16,
+            "cache synth is the local 16-byte window, not a uniqueness fallback: {synth}"
+        );
+    }
+
+    #[test]
+    fn drifted_cached_needle_misses_and_rescans() {
+        let pattern = raw_client_pattern("PlantedPrologue", PLANTED_NEEDLE);
+        let previous = PatternCache {
+            hits: vec![cached_hit(&pattern, PLANTED_SITE_A as u64, 2)],
+        };
+        let index = PatternCacheIndex::from_cache(Some(&previous));
+        assert!(
+            index
+                .get(pattern.module, pattern.name, "48 83 EC 28 E9")
+                .is_none(),
+            "a drifted needle string must not reuse the previous-run RVA"
+        );
+
+        let mut drifted = planted_unique_prologue_image();
+        drifted[PLANTED_SITE_A] = 0x00;
+        let module = client_text_module(drifted);
+        let stale = cached_hit(&pattern, PLANTED_SITE_A as u64, 1);
+        let (hit, used_cache) = scan_one_cached(&module, &pattern, Some(&stale));
+        assert!(!used_cache);
+        assert!(hit.found);
+        assert_eq!(hit.match_rva, Some(PLANTED_SITE_B as u64));
     }
 
     #[test]
@@ -1722,8 +2170,8 @@ mod tests {
         image[12..15].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
         let module = ModuleCache {
             name: "client.dll".into(),
-            base: 0x1800_0000_0,
-            image,
+            base: 0x0001_8000_0000,
+            image: image.into(),
             text_rva: 0,
             text_size: 32,
             rdata_rva: 0,
@@ -1752,8 +2200,8 @@ mod tests {
         image[12..17].copy_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]);
         let module = ModuleCache {
             name: "client.dll".into(),
-            base: 0x1800_0000_0,
-            image,
+            base: 0x0001_8000_0000,
+            image: image.into(),
             text_rva: 0,
             text_size: 32,
             rdata_rva: 0,
@@ -1783,8 +2231,8 @@ mod tests {
         image[34..39].copy_from_slice(&[0xE8, 0x00, 0x00, 0x00, 0x00]);
         let module = ModuleCache {
             name: "client.dll".into(),
-            base: 0x1800_0000_0,
-            image,
+            base: 0x0001_8000_0000,
+            image: image.into(),
             text_rva: 0,
             text_size: 16,
             rdata_rva: 32,
@@ -1810,8 +2258,8 @@ mod tests {
         image[10..13].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
         let module = ModuleCache {
             name: "client.dll".into(),
-            base: 0x1800_0000_0,
-            image,
+            base: 0x0001_8000_0000,
+            image: image.into(),
             text_rva: 0,
             text_size: 32,
             rdata_rva: 0,
@@ -1838,8 +2286,8 @@ mod tests {
         image[2..5].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
         let module = ModuleCache {
             name: "client.dll".into(),
-            base: 0x1800_0000_0,
-            image,
+            base: 0x0001_8000_0000,
+            image: image.into(),
             text_rva: 0,
             text_size: 8,
             rdata_rva: 0,
@@ -1859,11 +2307,47 @@ mod tests {
     }
 
     #[test]
+    fn raw_patterns_and_cached_hits_reject_targets_past_image_end() {
+        let mut image = vec![0u8; 8];
+        image[2..5].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let module = ModuleCache {
+            name: "client.dll".into(),
+            base: 0x0001_8000_0000,
+            image: image.into(),
+            text_rva: 0,
+            text_size: 8,
+            rdata_rva: 0,
+            rdata_size: 0,
+        };
+        let pattern = Pattern {
+            name: "PastImageEnd",
+            module: "client.dll",
+            needle: "AA BB CC",
+            resolve: ResolveKind::None,
+            extra_off: 8,
+            prototype: "",
+        };
+        let cached = CachedPatternHit {
+            name: pattern.name.to_string(),
+            module: pattern.module.to_string(),
+            pattern: pattern.needle.to_string(),
+            found: true,
+            match_rva: Some(2),
+            matches: 1,
+        };
+
+        let hit = scan_pattern(&module, &pattern);
+        assert!(!hit.found);
+        assert!(hit.error.as_deref().unwrap_or_default().contains("outside"));
+        assert!(validate_cached_hit(&module, &pattern, &cached).is_none());
+    }
+
+    #[test]
     fn pattern_results_normalize_external_module_case() {
         let module = ModuleCache {
             name: "CLIENT.DLL".into(),
-            base: 0x1800_0000_0,
-            image: vec![0xAA, 0xBB, 0xCC],
+            base: 0x0001_8000_0000,
+            image: vec![0xAA, 0xBB, 0xCC].into(),
             text_rva: 0,
             text_size: 3,
             rdata_rva: 0,
@@ -1879,15 +2363,15 @@ mod tests {
         };
         let hit = scan_pattern(&module, &pattern);
         assert!(hit.found);
-        assert_eq!(hit.module, "client.dll");
+        assert_eq!(hit.module.as_ref(), "client.dll");
     }
 
     #[test]
     fn malformed_section_bounds_do_not_panic() {
         let module = ModuleCache {
             name: "client.dll".into(),
-            base: 0x1800_0000_0,
-            image: vec![0u8; 8],
+            base: 0x0001_8000_0000,
+            image: vec![0u8; 8].into(),
             text_rva: 0x1000,
             text_size: u32::MAX,
             rdata_rva: 0x2000,
@@ -1895,5 +2379,82 @@ mod tests {
         };
         assert!(module.text().is_empty());
         assert!(module.rdata().is_none());
+    }
+
+    #[test]
+    fn display_name_borrows_offset_and_netvar_symbols() {
+        let dw = "dwEntityList";
+        let out = display_name(dw);
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(out.as_ref().as_ptr(), dw.as_ptr()));
+        assert_eq!(display_name("CCSPlayer_RunCommand_Context").as_ref(), "RunCommand_Context");
+        assert_eq!(display_name("client.dll::CreateMove").as_ref(), "CreateMove");
+    }
+
+    #[test]
+    fn builtin_pattern_interns_static_needle() {
+        let pattern = Pattern {
+            name: "dwEntityList",
+            module: "client.dll",
+            needle: "48 8B 0D ? ? ? ? 48 85 C9 74 04 8B 01",
+            resolve: ResolveKind::RipRel { rel_off: 3 },
+            extra_off: 0,
+            prototype: "",
+        };
+        let needle = pattern.needle_cow();
+        assert!(matches!(needle, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(needle.as_ref().as_ptr(), pattern.needle.as_ptr()));
+        let name = pattern.display_name_cow();
+        assert!(matches!(name, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(name.as_ref().as_ptr(), pattern.name.as_ptr()));
+    }
+
+    #[test]
+    fn canonical_module_name_borrows_lowercase() {
+        let module = "client.dll";
+        let out = canonical_module_name(module);
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(out.as_ref().as_ptr(), module.as_ptr()));
+        assert_eq!(canonical_module_name("CLIENT.DLL").as_ref(), "client.dll");
+        assert_eq!(canonical_module_name("  engine2.dll").as_ref(), "engine2.dll");
+    }
+
+    #[test]
+    fn intern_cached_module_shares_canonical_arc() {
+        let name: Arc<str> = Arc::from("client.dll");
+        let interned = intern_cached_module(&name);
+        assert!(Arc::ptr_eq(&name, &interned));
+        let upper: Arc<str> = Arc::from("CLIENT.DLL");
+        let lowered = intern_cached_module(&upper);
+        assert_eq!(lowered.as_ref(), "client.dll");
+        assert!(!Arc::ptr_eq(&upper, &lowered));
+    }
+
+    #[test]
+    fn cache_index_matches_case_insensitive_name_and_exact_pattern() {
+        let cache = PatternCache {
+            hits: vec![CachedPatternHit {
+                name: "dwEntityList".into(),
+                module: "CLIENT.DLL".into(),
+                pattern: "48 8B 0D".into(),
+                found: true,
+                match_rva: Some(0x10),
+                matches: 1,
+            }],
+        };
+        assert_eq!(
+            cache_lookup_key("CLIENT.DLL", "DwEntityList"),
+            "client.dll\0dwentitylist"
+        );
+        let index = PatternCacheIndex::from_cache(Some(&cache));
+        assert!(index.get("client.dll", "DWENTITYLIST", "48 8B 0D").is_some());
+        assert!(
+            index.get("client.dll", "dwEntityList", "DE AD").is_none(),
+            "a drifted needle must miss the cache and rescan"
+        );
+        assert!(index.get("engine2.dll", "dwEntityList", "48 8B 0D").is_none());
+        assert!(PatternCacheIndex::from_cache(None)
+            .get("client.dll", "dwEntityList", "48 8B 0D")
+            .is_none());
     }
 }

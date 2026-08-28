@@ -1,90 +1,13 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
-use phf::phf_map;
+use rayon::prelude::*;
 
-use crate::analysis::{Class, Enum, SchemaMap};
-
-static PRIM_MAP: phf::Map<&'static str, &'static str> = phf_map! {
-    "bool" => "bool",
-    "float32" => "float",
-    "float64" => "double",
-    "int8" => "int8_t",
-    "int16" => "int16_t",
-    "int32" => "int32_t",
-    "int64" => "int64_t",
-    "uint8" => "uint8_t",
-    "uint16" => "uint16_t",
-    "uint32" => "uint32_t",
-    "uint64" => "uint64_t",
-    "int" => "int32_t",
-    "unsignedint" => "uint32_t",
-    "long" => "long",
-    "unsignedlong" => "unsigned long",
-    "char" => "char",
-    "void" => "void",
-    "Color" => "uint32_t",
-    "GameTime_t" => "float",
-    "GameTick_t" => "int32_t",
-    "float" => "float",
-    "CUtlStringToken" => "uint32_t",
-    "CGlobalSymbol" => "uint64_t",
-    "PulseSymbol_t" => "uint64_t",
-    "CEntityIndex" => "uint32_t",
-    "CEntityHandle" => "uint32_t",
-    "ItemId_t" => "uint64_t",
-    "ItemIdLow_t" => "uint32_t",
-    "AttachmentHandle_t" => "uint8_t",
-    "AmmoIndex_t" => "uint8_t",
-    "SceneHandle_t" => "uint32_t",
-    "HSequence" => "int32_t",
-    "attributeprovidertypes_t" => "uint32_t",
-    "EntityPlatformTypes_t" => "uint8_t",
-    "TakeDamageFlags_t" => "uint32_t",
-    "SplitScreenSlot_t" => "uint32_t",
-    "CSPlayerState" => "uint32_t",
-    "CSPlayerBullets_t" => "int32_t",
-    "WorldGroupId_t" => "int32_t",
-    "CNetworkedQuantizedFloat" => "float",
-    "CFiringModeFloat" => "float",
-    "CFiringModeInt" => "int32_t",
-    "HSCRIPT" => "uint64_t",
-    "ScriptOrdinal_t" => "uint32_t",
-    "SubclassMdlData_t" => "uint32_t",
-    "RenderMode_t" => "uint8_t",
-    "RenderGroup_t" => "uint32_t",
-    "SolidType_t" => "uint8_t",
-    "SurroundingBoundsType_t" => "uint8_t",
-    "DamageMode_t" => "uint8_t",
-    "DoorState_t" => "uint8_t",
-    "ShatterPanelMode" => "uint8_t",
-    "ShatterDamageCause" => "uint8_t",
-    "ShatterGlassEdge_t" => "uint8_t",
-    "ShatterGlassTint_t" => "uint8_t",
-    "ShadowType_t" => "uint8_t",
-    "Touch_t" => "uint8_t",
-    "WaterWakeMode_t" => "uint8_t",
-    "CounterType_t" => "uint8_t",
-    "FontLerpMode_t" => "uint8_t",
-    "FadeBlendMode_t" => "uint8_t",
-    "ExplosionType_t" => "uint8_t",
-    "ClaimResult_t" => "uint32_t",
-    "ChickenActivity_t" => "uint32_t",
-    "ChickenToCrowActivity_t" => "uint32_t",
-    "ItemFlagTypes_t" => "uint8_t",
-    "MoneyShellPage_t" => "uint8_t",
-    "eSpectatorTeamContentChannel" => "uint32_t",
-    "BoneDomain_t" => "uint32_t",
-    "VPhysExpiry_t" => "uint32_t",
-    "ShootMode_t" => "uint32_t",
-    "PlayerConnectedState" => "uint32_t",
-    "DisplacementLookups_t" => "uint32_t",
-    "CStrongHandle" => "uint64_t",
-    "CWeakHandle" => "uint64_t",
-    "SkeletonBoneBits_t" => "uint32_t",
-    "fixtures1_t" => "uint32_t",
-    "AEarRspBox_t" => "uint32_t",
-};
+use super::cpp_types;
+use super::comment_text;
+use super::ident::IdentifierAllocator;
+use crate::analysis::{Class, ClassField, Enum, SchemaMap};
 
 const SDK_TYPES_BODY: &str = r#"// Type-safe field accessor.
 // Usage:  entity->m_iHealth().value()   // read
@@ -142,13 +65,35 @@ inline const T& field_ref(const void* base, std::ptrdiff_t offset) noexcept {
 
 #define SCHEMA_PAD(NAME, SIZE) std::byte NAME[(SIZE)]
 
+template <typename T>
+struct CUtlVector {
+    T* m_pElements;
+    int m_Size;
+    int m_Capacity;
+};
+template <typename T>
+using C_UtlVectorEmbeddedNetworkVar = CUtlVector<T>;
+template <typename T>
+using CUtlVectorEmbeddedNetworkVar = CUtlVector<T>;
+template <typename T>
+struct CNetworkUtlVectorBase {
+    T* m_pElements;
+    int m_Size;
+};
+template <typename T>
+using C_NetworkUtlVectorBase = CNetworkUtlVectorBase<T>;
+
 // Basic structs
 struct Vector { float x, y, z; };
 struct Vector2D { float x, y; };
 struct Vector4D { float x, y, z, w; };
 struct QAngle { float x, y, z; };
-struct CTransform { Vector pos; QAngle rot; };
-struct CNetworkOriginCellCoordQuantizedVector { float x, y, z; };
+struct Quaternion { float x, y, z, w; };
+struct CTransform { Vector m_vPosition; Quaternion m_orientation; };
+struct CNetworkOriginCellCoordQuantizedVector {
+    uint16_t m_cellX, m_cellY, m_cellZ, m_nOutsideWorld;
+    Vector m_vecX, m_vecY, m_vecZ;
+};
 struct CNetworkVelocityVector { float x, y, z; };
 struct CNetworkViewOffsetVector { float x, y, z; };
 
@@ -186,145 +131,84 @@ struct CEntityIdentity {
 };
 "#;
 
-struct ResolvedType {
-    cpp_type: String,
+struct ResolvedType<'a> {
+    cpp_type: Cow<'a, str>,
     is_arr: bool,
-    arr_size: usize,
 }
 
-fn sanitize_cpp_ident(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut previous_separator = false;
-    for c in raw.chars() {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            out.push(c);
-            previous_separator = false;
-        } else if !previous_separator {
-            out.push('_');
-            previous_separator = true;
-        }
+fn resolved_static<'a>(cpp_type: &'static str) -> ResolvedType<'a> {
+    ResolvedType {
+        cpp_type: Cow::Borrowed(cpp_type),
+        is_arr: false,
     }
-    if out.is_empty() {
-        return "Anonymous".to_string();
-    }
-    if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        out.insert(0, '_');
-    }
-    if is_cpp_keyword(&out) {
-        out.insert(0, '_');
-    }
-    out
+}
+
+fn sanitize_cpp_ident(raw: &str) -> Cow<'_, str> {
+    super::ident::cpp_type_ident(raw)
 }
 
 fn is_cpp_keyword(name: &str) -> bool {
+    super::ident::is_cpp_keyword(name)
+}
+
+fn is_engine_vector_name(name: &str) -> bool {
     matches!(
         name,
-        "alignas"
-            | "alignof"
-            | "asm"
-            | "auto"
-            | "bool"
-            | "break"
-            | "case"
-            | "catch"
-            | "char"
-            | "class"
-            | "const"
-            | "constexpr"
-            | "continue"
-            | "default"
-            | "delete"
-            | "do"
-            | "double"
-            | "else"
-            | "enum"
-            | "explicit"
-            | "export"
-            | "extern"
-            | "false"
-            | "float"
-            | "for"
-            | "friend"
-            | "goto"
-            | "if"
-            | "inline"
-            | "int"
-            | "long"
-            | "mutable"
-            | "namespace"
-            | "new"
-            | "noexcept"
-            | "nullptr"
-            | "operator"
-            | "private"
-            | "protected"
-            | "public"
-            | "register"
-            | "reinterpret_cast"
-            | "return"
-            | "short"
-            | "signed"
-            | "sizeof"
-            | "static"
-            | "struct"
-            | "switch"
-            | "template"
-            | "this"
-            | "throw"
-            | "true"
-            | "try"
-            | "typedef"
-            | "typename"
-            | "union"
-            | "unsigned"
-            | "using"
-            | "virtual"
-            | "void"
-            | "volatile"
-            | "while"
+        "Vector"
+            | "Vector2D"
+            | "Vector4D"
+            | "QAngle"
+            | "Quaternion"
+            | "CTransform"
+            | "CNetworkOriginCellCoordQuantizedVector"
+            | "CNetworkVelocityVector"
+            | "CNetworkViewOffsetVector"
     )
 }
 
-fn resolve_type(raw: &str, known_types: &HashSet<&str>) -> ResolvedType {
+/// Types defined as POD / templates in [`SDK_TYPES_BODY`]. Schema classes with
+/// the same identifier must not be forwarded or re-emitted, or `sdk_classes.hpp`
+/// redefines them after `sdk_types.hpp`.
+fn is_baked_sdk_type(name: &str) -> bool {
+    is_engine_vector_name(name)
+        || matches!(
+            name,
+            "CEntityIdentity" | "ChangeAccessorFieldPathIndex_t" | "CHandle" | "FieldRef"
+        )
+}
+
+fn resolve_type<'a>(raw: &'a str, known_types: &HashSet<&str>) -> ResolvedType<'a> {
     let ts = raw.trim();
 
     if ts.ends_with('*') {
         let pointee = ts.trim_end_matches('*').trim();
         if known_types.contains(pointee) {
             return ResolvedType {
-                cpp_type: format!("{}*", sanitize_cpp_ident(pointee)),
+                cpp_type: Cow::Owned(format!("{}*", sanitize_cpp_ident(pointee))),
                 is_arr: false,
-                arr_size: 0,
             };
         }
-        return ResolvedType {
-            cpp_type: "uintptr_t".to_string(),
-            is_arr: false,
-            arr_size: 0,
-        };
+        return resolved_static("uintptr_t");
     }
 
-    if let Some((inner, size)) = parse_fixed_array(ts) {
-        let mut resolved = resolve_type(&inner, known_types);
-        resolved.is_arr = true;
-        resolved.arr_size = size;
-        return resolved;
+    if let Some((inner, dims)) = cpp_types::split_fixed_array(ts) {
+        let resolved = resolve_type(inner, known_types);
+        return ResolvedType {
+            cpp_type: Cow::Owned(format!("{}{}", resolved.cpp_type, dims)),
+            is_arr: true,
+        };
     }
 
     if is_handle_like(ts) {
-        return ResolvedType {
-            cpp_type: "uint32_t".to_string(),
-            is_arr: false,
-            arr_size: 0,
-        };
+        return resolved_static("uint32_t");
     }
 
-    if is_vector_like(ts) {
-        return ResolvedType {
-            cpp_type: "uintptr_t".to_string(),
-            is_arr: false,
-            arr_size: 0,
-        };
+    if is_resource_handle_like(ts) {
+        return resolved_static("uint64_t");
+    }
+
+    if let Some(resolved) = wrap_vector_like(ts, known_types) {
+        return resolved;
     }
 
     if let Some(bits) = parse_bitfield(ts) {
@@ -334,100 +218,98 @@ fn resolve_type(raw: &str, known_types: &HashSet<&str>) -> ResolvedType {
             17..=32 => "uint32_t",
             _ => "uint64_t",
         };
+        return resolved_static(cpp_type);
+    }
 
+    if let Some(mapped) = cpp_types::map_storage(ts) {
+        return resolved_static(mapped);
+    }
+
+    if is_engine_vector_name(ts) {
         return ResolvedType {
-            cpp_type: cpp_type.to_string(),
+            cpp_type: Cow::Borrowed(ts),
             is_arr: false,
-            arr_size: 0,
         };
     }
 
-    let stripped = ts.replace(' ', "");
-    if let Some(mapped) = PRIM_MAP.get(stripped.as_str()) {
-        return ResolvedType {
-            cpp_type: (*mapped).to_string(),
-            is_arr: false,
-            arr_size: 0,
-        };
-    }
-
-    if matches!(
-        stripped.as_str(),
-        "Vector"
-            | "Vector2D"
-            | "Vector4D"
-            | "QAngle"
-            | "CTransform"
-            | "CNetworkOriginCellCoordQuantizedVector"
-            | "CNetworkVelocityVector"
-            | "CNetworkViewOffsetVector"
-    ) {
-        return ResolvedType {
-            cpp_type: stripped,
-            is_arr: false,
-            arr_size: 0,
-        };
+    if ts.contains(' ') {
+        let stripped = ts.replace(' ', "");
+        if let Some(mapped) = cpp_types::map_storage(&stripped) {
+            return resolved_static(mapped);
+        }
+        if is_engine_vector_name(&stripped) {
+            return ResolvedType {
+                cpp_type: Cow::Owned(stripped),
+                is_arr: false,
+            };
+        }
     }
 
     if known_types.contains(ts) {
         return ResolvedType {
             cpp_type: sanitize_cpp_ident(ts),
             is_arr: false,
-            arr_size: 0,
         };
     }
 
     if let Some(pos) = ts.rfind("::") {
         let last = &ts[pos + 2..];
 
-        return ResolvedType {
-            cpp_type: if known_types.contains(ts) || known_types.contains(last) {
-                sanitize_cpp_ident(ts)
-            } else {
-                "uint32_t".to_string()
-            },
-            is_arr: false,
-            arr_size: 0,
+        return if known_types.contains(ts) || known_types.contains(last) {
+            ResolvedType {
+                cpp_type: sanitize_cpp_ident(ts),
+                is_arr: false,
+            }
+        } else {
+            resolved_static("uint32_t")
         };
     }
 
-    ResolvedType {
-        cpp_type: "uintptr_t".to_string(),
-        is_arr: false,
-        arr_size: 0,
-    }
-}
-
-fn parse_fixed_array(raw: &str) -> Option<(String, usize)> {
-    if !raw.ends_with(']') {
-        return None;
-    }
-
-    let pos = raw.rfind('[')?;
-    let size = raw[pos + 1..raw.len() - 1].trim().parse::<usize>().ok()?;
-    let inner = raw[..pos].trim().to_string();
-
-    Some((inner, size))
+    resolved_static("uintptr_t")
 }
 
 fn is_handle_like(raw: &str) -> bool {
     raw.starts_with("CHandle<")
-        || raw.starts_with("CStrongHandle<")
-        || raw.starts_with("CWeakHandle<")
 }
 
-fn is_vector_like(raw: &str) -> bool {
-    raw.starts_with("CUtlVector<")
-        || raw.starts_with("C_NetworkUtlVectorBase<")
-        || raw.starts_with("C_UtlVectorEmbeddedNetworkVar<")
+fn is_resource_handle_like(raw: &str) -> bool {
+    raw.starts_with("CStrongHandle<")
+        || raw.starts_with("CWeakHandle<")
+        || raw.starts_with("CStrongHandleCopyable<")
+}
+
+fn template_arg<'a>(raw: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = raw.strip_prefix(prefix)?.trim_start();
+    rest.strip_suffix('>').map(str::trim)
+}
+
+fn wrap_vector_like<'a>(raw: &'a str, known_types: &HashSet<&str>) -> Option<ResolvedType<'a>> {
+    const PREFIXES: &[(&str, &str)] = &[
+        ("CUtlVector<", "CUtlVector"),
+        ("C_UtlVectorEmbeddedNetworkVar<", "C_UtlVectorEmbeddedNetworkVar"),
+        ("CUtlVectorEmbeddedNetworkVar<", "CUtlVectorEmbeddedNetworkVar"),
+        ("C_NetworkUtlVectorBase<", "C_NetworkUtlVectorBase"),
+        ("CNetworkUtlVectorBase<", "CNetworkUtlVectorBase"),
+    ];
+    for (prefix, name) in PREFIXES {
+        if let Some(inner) = template_arg(raw, prefix) {
+            let inner_ty = resolve_type(inner, known_types);
+            return Some(ResolvedType {
+                cpp_type: Cow::Owned(format!("{name}<{}>", inner_ty.cpp_type)),
+                is_arr: false,
+            });
+        }
+    }
+    None
 }
 
 fn parse_bitfield(raw: &str) -> Option<u32> {
     raw.strip_prefix("bitfield:")?.parse::<u32>().ok()
 }
 
-pub fn write_sdk_types(classes: &[(&String, &Class)], build_number: Option<u32>) -> String {
-    let mut out = String::new();
+pub fn write_sdk_types(classes: &[(&str, &Class)], build_number: Option<u32>) -> String {
+    let mut out =
+        String::with_capacity(classes.len().saturating_mul(32) + SDK_TYPES_BODY.len() + 512);
     let _ = writeln!(out, "#pragma once");
     let _ = writeln!(out);
     let _ = writeln!(out, "// Auto-generated by cs2-dumper (SDK mode).");
@@ -445,6 +327,9 @@ pub fn write_sdk_types(classes: &[(&String, &Class)], build_number: Option<u32>)
     let _ = writeln!(out, "// Forward declarations");
 
     for (_, class) in classes {
+        if is_baked_sdk_type(&class.name) {
+            continue;
+        }
         let _ = writeln!(out, "class {};", sanitize_cpp_ident(&class.name));
     }
 
@@ -458,44 +343,41 @@ pub fn write_sdk_types(classes: &[(&String, &Class)], build_number: Option<u32>)
     out
 }
 
-fn enum_underlying(alignment: u8) -> &'static str {
-    match alignment {
-        1 => "uint8_t",
-        2 => "uint16_t",
-        4 => "uint32_t",
-        8 => "uint64_t",
-        _ => "uint32_t",
-    }
-}
-
-fn enum_max_value(type_name: &str) -> u64 {
-    match type_name {
-        "uint8_t" => u8::MAX as u64,
-        "uint16_t" => u16::MAX as u64,
-        "uint32_t" => u32::MAX as u64,
-        "uint64_t" => u64::MAX,
-        _ => 0,
-    }
+fn enum_value_masked(value: i64, type_name: &str) -> u64 {
+    cpp_types::enum_value_masked(value, type_name)
 }
 
 fn enum_value_literal(value: i64, type_name: &str) -> String {
-    let bits = match type_name {
-        "uint8_t" => 8,
-        "uint16_t" => 16,
-        "uint32_t" => 32,
-        "uint64_t" => 64,
-        _ => 32,
-    };
-    let masked = if bits == 64 {
-        value as u64
-    } else {
-        (value as u64) & ((1u64 << bits) - 1)
-    };
-    format!("{:#X}", masked)
+    format!("{:#X}", enum_value_masked(value, type_name))
 }
 
-pub fn write_sdk_enums(enums: &[(&String, &Enum)]) -> String {
-    let mut out = String::new();
+fn render_sdk_enum(module_name: &str, enum_: &Enum, enum_ident: &str) -> String {
+    let mut out = String::with_capacity(96 + enum_.members.len() * 40);
+    let type_name = cpp_types::enum_underlying(enum_.storage_bytes());
+    let _ = writeln!(out, "// Module: {}", comment_text(module_name));
+    let _ = writeln!(
+        out,
+        "enum class {} : {} {{",
+        enum_ident, type_name
+    );
+
+    let mut names = IdentifierAllocator::default();
+    for member in &enum_.members {
+        let _ = writeln!(
+            out,
+            "    {} = {},",
+            names.allocate(sanitize_cpp_ident(&member.name).into_owned()),
+            enum_value_literal(member.value, type_name)
+        );
+    }
+
+    let _ = writeln!(out, "}};");
+    let _ = writeln!(out);
+    out
+}
+
+pub fn write_sdk_enums(enums: &[(&str, &Enum)]) -> String {
+    let mut out = String::with_capacity(enums.len().saturating_mul(128) + 256);
     let _ = writeln!(out, "#pragma once");
     let _ = writeln!(out);
     let _ = writeln!(out, "// Auto-generated by cs2-dumper (SDK mode).");
@@ -504,36 +386,35 @@ pub fn write_sdk_enums(enums: &[(&String, &Enum)]) -> String {
     let _ = writeln!(out, "#include <cstdint>");
     let _ = writeln!(out);
 
-    for (module_name, enum_) in enums.iter().copied() {
-        let type_name = enum_underlying(enum_.storage_bytes());
-        let _ = writeln!(out, "// Module: {}", module_name);
-        let _ = writeln!(
-            out,
-            "enum class {} : {} {{",
-            sanitize_cpp_ident(&enum_.name),
-            type_name
-        );
-
-        for member in &enum_.members {
-            let formatted_value = enum_value_literal(member.value, type_name);
-
-            let _ = writeln!(
-                out,
-                "    {} = {},",
-                sanitize_cpp_ident(&member.name),
-                formatted_value
-            );
-        }
-
-        let _ = writeln!(out, "}};");
-        let _ = writeln!(out);
-    }
-
+    let mut enum_alloc = IdentifierAllocator::default();
+    let named: Vec<(&str, &Enum, String)> = enums
+        .iter()
+        .map(|(module_name, enum_)| {
+            (
+                *module_name,
+                *enum_,
+                enum_alloc.allocate(sanitize_cpp_ident(&enum_.name).into_owned()),
+            )
+        })
+        .collect();
+    let bodies: Vec<String> = named
+        .par_iter()
+        .map(|(module_name, enum_, ident)| render_sdk_enum(module_name, enum_, ident))
+        .collect();
+    append_chunks(&mut out, bodies);
     out
 }
 
-pub fn write_sdk_classes(classes: &[(&String, &Class)], enums: &[(&String, &Enum)]) -> String {
-    let mut out = String::new();
+fn append_chunks(out: &mut String, chunks: Vec<String>) {
+    let extra: usize = chunks.iter().map(String::len).sum();
+    out.reserve(extra);
+    for chunk in chunks {
+        out.push_str(&chunk);
+    }
+}
+
+pub fn write_sdk_classes(classes: &[(&str, &Class)], enums: &[(&str, &Enum)]) -> String {
+    let mut out = String::with_capacity(classes.len().saturating_mul(256) + 512);
     let _ = writeln!(out, "#pragma once");
     let _ = writeln!(out);
     let _ = writeln!(out, "// Auto-generated by cs2-dumper (SDK mode).");
@@ -543,11 +424,26 @@ pub fn write_sdk_classes(classes: &[(&String, &Class)], enums: &[(&String, &Enum
     let _ = writeln!(out, "#include \"sdk_enums.hpp\"");
     let _ = writeln!(out);
 
-    let known_types: HashSet<&str> = classes
+    let mut known_types: HashSet<&str> = classes
         .iter()
         .map(|(_, class)| class.name.as_str())
         .chain(enums.iter().map(|(_, enum_)| enum_.name.as_str()))
         .collect();
+    known_types.extend([
+        "Vector",
+        "Vector2D",
+        "Vector4D",
+        "QAngle",
+        "Quaternion",
+        "CTransform",
+        "CNetworkOriginCellCoordQuantizedVector",
+        "CNetworkVelocityVector",
+        "CNetworkViewOffsetVector",
+        "CEntityIdentity",
+        "ChangeAccessorFieldPathIndex_t",
+        "CHandle",
+        "FieldRef",
+    ]);
 
     let class_map: BTreeMap<&str, &Class> = classes
         .iter()
@@ -563,20 +459,19 @@ pub fn write_sdk_classes(classes: &[(&String, &Class)], enums: &[(&String, &Enum
         state: &mut HashMap<&'a str, u8>,
         ordered: &mut Vec<&'a str>,
     ) {
-        if let Some(status) = state.get(name).copied() {
-            if status == 1 || status == 2 {
-                return;
-            }
+        if let Some(status) = state.get(name).copied()
+            && (status == 1 || status == 2)
+        {
+            return;
         }
 
         state.insert(name, 1);
 
-        if let Some(class) = class_map.get(name) {
-            if let Some(parent) = class.parent_name.as_deref() {
-                if class_map.contains_key(parent) {
-                    visit(parent, class_map, state, ordered);
-                }
-            }
+        if let Some(class) = class_map.get(name)
+            && let Some(parent) = class.parent_name.as_deref()
+            && class_map.contains_key(parent)
+        {
+            visit(parent, class_map, state, ordered);
         }
 
         state.insert(name, 2);
@@ -587,58 +482,127 @@ pub fn write_sdk_classes(classes: &[(&String, &Class)], enums: &[(&String, &Enum
         visit(class.name.as_str(), &class_map, &mut state, &mut ordered);
     }
 
+    let mut missing_parents = BTreeSet::new();
+    for (_, class) in classes {
+        if is_baked_sdk_type(&class.name) {
+            continue;
+        }
+        let Some(parent) = class.parent_name.as_deref() else {
+            continue;
+        };
+        if known_types.contains(parent) || is_baked_sdk_type(parent) {
+            continue;
+        }
+        let ident = sanitize_cpp_ident(parent);
+        if known_types.contains(ident.as_ref()) || is_baked_sdk_type(ident.as_ref()) {
+            continue;
+        }
+        missing_parents.insert(ident.into_owned());
+    }
+
+    let mut class_idents: HashMap<&str, String> = HashMap::new();
+    let mut class_alloc = IdentifierAllocator::default();
     for name in &ordered {
-        let class = class_map[*name];
-        let class_name = sanitize_cpp_ident(name);
-        let parent = class.parent_name.as_deref();
-
-        if let Some(parent) = parent {
-            let _ = writeln!(
-                out,
-                "class {} : public {} {{",
-                class_name,
-                sanitize_cpp_ident(parent)
-            );
-        } else {
-            let _ = writeln!(out, "class {} {{", class_name);
+        if is_baked_sdk_type(name) {
+            continue;
         }
-        let _ = writeln!(out, "public:");
+        class_idents.insert(
+            *name,
+            class_alloc.allocate(sanitize_cpp_ident(&class_map[name].name).into_owned()),
+        );
+    }
 
-        let mut fields = class.fields.iter().collect::<Vec<_>>();
-        fields.sort_by_key(|field| field.offset);
-
-        let mut seen = HashSet::new();
-        for field in fields {
-            if !seen.insert(field.name.as_str()) {
-                continue;
-            }
-
-            let resolved = resolve_type(&field.type_name, &known_types);
-            let field_name = sanitize_cpp_ident(&field.name);
-            let field_type = if resolved.is_arr {
-                format!("{}[{}]", resolved.cpp_type, resolved.arr_size)
-            } else {
-                resolved.cpp_type
-            };
-
-            if resolved.is_arr {
-                let _ = writeln!(
-                    out,
-                    "    FieldRef<{}> {}() {{ return {{this, {:#X}}}; }}",
-                    field_type, field_name, field.offset
-                );
-            } else {
-                let _ = writeln!(
-                    out,
-                    "    SCHEMA_FIELD({}, {}, {:#X})",
-                    field_type, field_name, field.offset
-                );
-            }
+    if !missing_parents.is_empty() {
+        let _ = writeln!(
+            out,
+            "// missing schema bindings — empty stubs so inheritance compiles"
+        );
+        for parent in &missing_parents {
+            let _ = writeln!(out, "class {parent} {{}};");
         }
-        let _ = writeln!(out, "}};");
         let _ = writeln!(out);
     }
 
+    let bodies: Vec<String> = ordered
+        .par_iter()
+        .filter(|name| !is_baked_sdk_type(name))
+        .map(|name| render_sdk_class(class_map[name], &known_types, &class_idents))
+        .collect();
+    append_chunks(&mut out, bodies);
+    out
+}
+
+fn fields_sorted_by_offset(fields: &[ClassField]) -> bool {
+    fields
+        .windows(2)
+        .all(|pair| pair[0].offset <= pair[1].offset)
+}
+
+fn emit_sdk_fields<'a>(
+    out: &mut String,
+    fields: impl IntoIterator<Item = &'a ClassField>,
+    known_types: &HashSet<&str>,
+) {
+    let mut seen = HashSet::new();
+    let mut names = IdentifierAllocator::default();
+    for field in fields {
+        if !seen.insert(field.name.as_str()) {
+            continue;
+        }
+        let resolved = resolve_type(&field.type_name, known_types);
+        let field_name = names.allocate(sanitize_cpp_ident(&field.name).into_owned());
+        if resolved.is_arr {
+            let _ = writeln!(
+                out,
+                "    FieldRef<{}> {}() {{ return {{this, {:#X}}}; }}",
+                resolved.cpp_type, field_name, field.offset
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "    SCHEMA_FIELD({}, {}, {:#X})",
+                resolved.cpp_type, field_name, field.offset
+            );
+        }
+    }
+}
+
+fn render_sdk_class(
+    class: &Class,
+    known_types: &HashSet<&str>,
+    class_idents: &HashMap<&str, String>,
+) -> String {
+    let mut out = String::with_capacity(96 + class.fields.len() * 80);
+    let class_name = class_idents
+        .get(class.name.as_str())
+        .cloned()
+        .unwrap_or_else(|| sanitize_cpp_ident(&class.name).into_owned());
+    let parent = class.parent_name.as_deref();
+
+    if let Some(parent) = parent {
+        let parent_ident = class_idents
+            .get(parent)
+            .cloned()
+            .unwrap_or_else(|| sanitize_cpp_ident(parent).into_owned());
+        let _ = writeln!(
+            out,
+            "class {} : public {} {{",
+            class_name, parent_ident
+        );
+    } else {
+        let _ = writeln!(out, "class {} {{", class_name);
+    }
+    let _ = writeln!(out, "public:");
+
+    if fields_sorted_by_offset(&class.fields) {
+        emit_sdk_fields(&mut out, class.fields.iter(), known_types);
+    } else {
+        let mut fields = class.fields.iter().collect::<Vec<_>>();
+        fields.sort_by_key(|field| field.offset);
+        emit_sdk_fields(&mut out, fields, known_types);
+    }
+    let _ = writeln!(out, "}};");
+    let _ = writeln!(out);
     out
 }
 
@@ -665,14 +629,31 @@ pub fn write_sdk_umbrella() -> String {
     out
 }
 
-pub fn collect_sdk_data(schemas: &SchemaMap) -> (Vec<(String, Enum)>, Vec<(String, Class)>) {
-    let mut enums: BTreeMap<String, (String, Enum)> = BTreeMap::new();
-    let mut classes: BTreeMap<String, (String, Class)> = BTreeMap::new();
+pub type SdkEnums<'a> = Vec<(&'a str, &'a Enum)>;
+pub type SdkClasses<'a> = Vec<(&'a str, &'a Class)>;
+
+pub fn collect_sdk_data(schemas: &SchemaMap) -> (SdkEnums<'_>, SdkClasses<'_>) {
+    let mut enums: BTreeMap<&str, (&str, &Enum)> = BTreeMap::new();
+    let mut classes: BTreeMap<&str, (&str, &Class)> = BTreeMap::new();
 
     let mut module_names: Vec<&str> = schemas.keys().map(String::as_str).collect();
     module_names.sort_by(|a, b| {
-        let a_key = (if *a == "client.dll" { 0 } else { 1 }, *a);
-        let b_key = (if *b == "client.dll" { 0 } else { 1 }, *b);
+        let a_key = (
+            if a.eq_ignore_ascii_case("client.dll") {
+                0
+            } else {
+                1
+            },
+            *a,
+        );
+        let b_key = (
+            if b.eq_ignore_ascii_case("client.dll") {
+                0
+            } else {
+                1
+            },
+            *b,
+        );
         a_key.cmp(&b_key)
     });
 
@@ -683,14 +664,14 @@ pub fn collect_sdk_data(schemas: &SchemaMap) -> (Vec<(String, Enum)>, Vec<(Strin
 
         for enum_ in module_enums {
             enums
-                .entry(enum_.name.clone())
-                .or_insert_with(|| (module_name.to_string(), enum_.clone()));
+                .entry(enum_.name.as_str())
+                .or_insert((module_name, enum_));
         }
 
         for class in module_classes {
             classes
-                .entry(class.name.clone())
-                .or_insert_with(|| (module_name.to_string(), class.clone()));
+                .entry(class.name.as_str())
+                .or_insert((module_name, class));
         }
     }
 
@@ -700,7 +681,21 @@ pub fn collect_sdk_data(schemas: &SchemaMap) -> (Vec<(String, Enum)>, Vec<(Strin
     )
 }
 
-fn module_slug(input: &str) -> String {
+fn module_slug(input: &str) -> Cow<'_, str> {
+    if let Some(stem) = input.strip_suffix(".dll")
+        && super::ident::already_ascii_ident(stem)
+        && !stem.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
+        && !is_cpp_keyword(stem)
+    {
+        return Cow::Borrowed(stem);
+    }
+    if super::ident::already_ascii_ident(input)
+        && !input.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
+        && !input.ends_with("_dll")
+        && !is_cpp_keyword(input)
+    {
+        return Cow::Borrowed(input);
+    }
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
         if c.is_ascii_alphanumeric() || c == '_' {
@@ -713,14 +708,24 @@ fn module_slug(input: &str) -> String {
         out.truncate(out.len() - 4);
     }
     if out.is_empty() {
-        "module".to_string()
+        Cow::Borrowed("module")
     } else {
-        out
+        if out.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) || is_cpp_keyword(&out) {
+            out.insert(0, '_');
+        }
+        Cow::Owned(out)
     }
 }
 
-fn write_module_header(module: &str, classes: &[Class], enums: &[Enum]) -> String {
-    let mut out = String::new();
+fn write_module_header(
+    module: &str,
+    module_ident: &str,
+    classes: &[Class],
+    enums: &[Enum],
+) -> String {
+    let field_count: usize = classes.iter().map(|class| class.fields.len()).sum();
+    let mut out =
+        String::with_capacity(256 + classes.len() * 96 + enums.len() * 128 + field_count * 64);
     let _ = writeln!(
         out,
         "#pragma once\n#include <cstddef>\n#include <cstdint>\n"
@@ -728,39 +733,37 @@ fn write_module_header(module: &str, classes: &[Class], enums: &[Enum]) -> Strin
     let _ = writeln!(
         out,
         "// Auto-generated per-schema-scope offsets for {}.",
-        module
+        comment_text(module)
     );
     let _ = writeln!(
         out,
         "namespace offsets {{ namespace {} {{",
-        module_slug(module)
+        module_ident
     );
+    let mut declarations = IdentifierAllocator::default();
     for enum_ in enums {
-        let underlying = enum_underlying(enum_.storage_bytes());
+        let underlying = cpp_types::enum_underlying(enum_.storage_bytes());
+        let enum_name = declarations.allocate(sanitize_cpp_ident(&enum_.name).into_owned());
         let _ = writeln!(
             out,
             "enum class {} : {} {{",
-            sanitize_cpp_ident(&enum_.name),
+            enum_name,
             underlying
         );
+        let mut names = IdentifierAllocator::default();
         for member in &enum_.members {
             let _ = writeln!(
                 out,
                 "    {} = 0x{:X},",
-                sanitize_cpp_ident(&member.name),
-                u64::from_str_radix(
-                    enum_value_literal(member.value, underlying)
-                        .trim_start_matches("0x")
-                        .trim_start_matches("0X"),
-                    16,
-                )
-                .unwrap_or_else(|_| enum_max_value(underlying))
+                names.allocate(sanitize_cpp_ident(&member.name).into_owned()),
+                enum_value_masked(member.value, underlying)
             );
         }
         let _ = writeln!(out, "}};\n");
     }
     for class in classes {
-        let _ = writeln!(out, "namespace {} {{", sanitize_cpp_ident(&class.name));
+        let class_name = declarations.allocate(sanitize_cpp_ident(&class.name).into_owned());
+        let _ = writeln!(out, "namespace {class_name} {{");
         let _ = writeln!(
             out,
             "inline constexpr std::size_t kSize = 0x{:X};",
@@ -771,13 +774,14 @@ fn write_module_header(module: &str, classes: &[Class], enums: &[Enum]) -> Strin
             "inline constexpr std::size_t kAlignment = {};",
             class.alignment
         );
+        let mut names = IdentifierAllocator::default();
         for field in &class.fields {
             let _ = writeln!(
                 out,
                 "inline constexpr std::ptrdiff_t {} = 0x{:X}; // {}",
-                sanitize_cpp_ident(&field.name),
+                names.allocate(sanitize_cpp_ident(&field.name).into_owned()),
                 field.offset,
-                field.type_name
+                comment_text(&field.type_name)
             );
         }
         let _ = writeln!(out, "}}\n");
@@ -786,19 +790,22 @@ fn write_module_header(module: &str, classes: &[Class], enums: &[Enum]) -> Strin
     out
 }
 
-fn write_class_header(module: &str, class: &Class) -> String {
-    let mut out = String::new();
-    let module = module_slug(module);
+fn write_class_header(module_ident: &str, class_ident: &str, class: &Class) -> String {
+    let mut out = String::with_capacity(160 + class.fields.len() * 64 + class.flags.len() * 32);
     let _ = writeln!(out, "#pragma once\n#include <cstddef>\n");
-    let _ = writeln!(out, "// Auto-generated schema offsets for {}.", class.name);
+    let _ = writeln!(
+        out,
+        "// Auto-generated schema offsets for {}.",
+        comment_text(&class.name)
+    );
     for flag in &class.flags {
-        let _ = writeln!(out, "// {}", flag);
+        let _ = writeln!(out, "// {}", comment_text(flag));
     }
     let _ = writeln!(
         out,
         "namespace offsets {{ namespace {} {{ namespace {} {{",
-        module,
-        sanitize_cpp_ident(&class.name)
+        module_ident,
+        class_ident
     );
     let _ = writeln!(
         out,
@@ -810,13 +817,14 @@ fn write_class_header(module: &str, class: &Class) -> String {
         "inline constexpr std::size_t kAlignment = {};",
         class.alignment
     );
+    let mut names = IdentifierAllocator::default();
     for field in &class.fields {
         let _ = writeln!(
             out,
             "inline constexpr std::ptrdiff_t {} = 0x{:X}; // {}",
-            sanitize_cpp_ident(&field.name),
+            names.allocate(sanitize_cpp_ident(&field.name).into_owned()),
             field.offset,
-            field.type_name
+            comment_text(&field.type_name)
         );
     }
     let _ = writeln!(out, "}} }} }}");
@@ -829,22 +837,47 @@ pub fn dump_module_headers(out_dir: &std::path::Path, schemas: &SchemaMap) -> st
     let classes_dir = out_dir.join("sdk").join("classes");
     std::fs::create_dir_all(&classes_dir)?;
     let mut umbrella = String::from("#pragma once\n\n");
+    let mut module_jobs = Vec::with_capacity(schemas.len());
+    let mut class_files = Vec::new();
+    let mut module_names = IdentifierAllocator::default();
     for (module, (classes, enums)) in schemas {
-        let slug = module_slug(module);
-        std::fs::write(
-            modules_dir.join(format!("{}.hpp", slug)),
-            write_module_header(module, classes, enums),
-        )?;
+        let slug = module_names.allocate(module_slug(module).into_owned());
         let module_classes_dir = classes_dir.join(&slug);
         std::fs::create_dir_all(&module_classes_dir)?;
-        for class in classes {
-            std::fs::write(
-                module_classes_dir.join(format!("{}.hpp", sanitize_cpp_ident(&class.name))),
-                write_class_header(module, class),
-            )?;
+        let mut declarations = IdentifierAllocator::default();
+        for enum_ in enums {
+            declarations.allocate(sanitize_cpp_ident(&enum_.name).into_owned());
         }
+        class_files.extend(classes.iter().map(|class| {
+            let class_ident =
+                declarations.allocate(sanitize_cpp_ident(&class.name).into_owned());
+            let mut path = module_classes_dir.join(&class_ident);
+            path.set_extension("hpp");
+            (path, slug.clone(), class_ident, class)
+        }));
         let _ = writeln!(umbrella, "#include \"modules/{}.hpp\"", slug);
+        module_jobs.push((module.as_str(), classes.as_slice(), enums.as_slice(), slug));
     }
+    let (module_res, class_res) = rayon::join(
+        || {
+            module_jobs
+                .par_iter()
+                .try_for_each(|(module, classes, enums, slug)| {
+                    let mut path = modules_dir.join(slug);
+                    path.set_extension("hpp");
+                    std::fs::write(path, write_module_header(module, slug, classes, enums))
+                })
+        },
+        || {
+            class_files
+                .par_iter()
+                .try_for_each(|(path, module_ident, class_ident, class)| {
+                    std::fs::write(path, write_class_header(module_ident, class_ident, class))
+                })
+        },
+    );
+    module_res?;
+    class_res?;
     std::fs::write(out_dir.join("sdk").join("modules.hpp"), umbrella)?;
     Ok(())
 }
@@ -858,32 +891,39 @@ pub fn dump_sdk(
 
     let (enums, classes) = collect_sdk_data(schemas);
 
-    let enum_refs: Vec<(&String, &Enum)> = enums
-        .iter()
-        .map(|(module, enum_)| (module, enum_))
-        .collect();
-    let class_refs: Vec<(&String, &Class)> = classes
-        .iter()
-        .map(|(module, class)| (module, class))
-        .collect();
+    let ((((types_body, enums_body), classes_body), umbrella), headers_res) = rayon::join(
+        || {
+            let bodies = rayon::join(
+                || {
+                    rayon::join(
+                        || write_sdk_types(&classes, build_number),
+                        || write_sdk_enums(&enums),
+                    )
+                },
+                || write_sdk_classes(&classes, &enums),
+            );
+            (bodies, write_sdk_umbrella())
+        },
+        || dump_module_headers(out_dir, schemas),
+    );
 
-    std::fs::write(
-        sdk_dir.join("sdk_types.hpp"),
-        write_sdk_types(&class_refs, build_number),
-    )?;
+    [
+        (sdk_dir.join("sdk_types.hpp"), types_body),
+        (sdk_dir.join("sdk_enums.hpp"), enums_body),
+        (sdk_dir.join("sdk_classes.hpp"), classes_body),
+        (sdk_dir.join("sdk.hpp"), umbrella),
+    ]
+    .into_par_iter()
+    .try_for_each(|(path, body)| std::fs::write(path, body))?;
+
+    let emitted_classes = classes
+        .iter()
+        .filter(|(_, class)| !is_baked_sdk_type(&class.name))
+        .count();
     println!("  sdk/sdk_types.hpp");
-
-    std::fs::write(sdk_dir.join("sdk_enums.hpp"), write_sdk_enums(&enum_refs))?;
     println!("  sdk/sdk_enums.hpp     {} enums", enums.len());
-
-    std::fs::write(
-        sdk_dir.join("sdk_classes.hpp"),
-        write_sdk_classes(&class_refs, &enum_refs),
-    )?;
-    println!("  sdk/sdk_classes.hpp   {} classes", classes.len());
-
-    std::fs::write(sdk_dir.join("sdk.hpp"), write_sdk_umbrella())?;
-    dump_module_headers(out_dir, schemas)?;
+    println!("  sdk/sdk_classes.hpp   {} classes", emitted_classes);
+    headers_res?;
     println!("  sdk/modules.hpp       per-scope class/enum offsets");
     println!("  sdk/sdk.hpp           umbrella header");
 
@@ -894,17 +934,480 @@ pub fn dump_sdk(
 mod tests {
     use super::*;
     use crate::analysis::{ClassField, EnumMember};
+    use std::borrow::Cow;
     use std::process::Command;
 
     #[test]
     fn sanitizes_nested_cpp_names_without_changing_normal_names() {
-        assert_eq!(sanitize_cpp_ident("CCSPlayerPawn"), "CCSPlayerPawn");
         assert_eq!(
-            sanitize_cpp_ident("CPulseCell::TimelineEvent_t"),
+            sanitize_cpp_ident("CCSPlayerPawn").as_ref(),
+            "CCSPlayerPawn"
+        );
+        assert_eq!(
+            sanitize_cpp_ident("CPulseCell::TimelineEvent_t").as_ref(),
             "CPulseCell_TimelineEvent_t"
         );
-        assert_eq!(sanitize_cpp_ident("3d_type"), "_3d_type");
-        assert_eq!(sanitize_cpp_ident("operator"), "_operator");
+        assert_eq!(sanitize_cpp_ident("3d_type").as_ref(), "_3d_type");
+        assert_eq!(sanitize_cpp_ident("operator").as_ref(), "_operator");
+    }
+
+    #[test]
+    fn sanitize_cpp_ident_borrows_clean_names() {
+        let name = "CCSPlayerPawn";
+        let out = sanitize_cpp_ident(name);
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(out.as_ref().as_ptr(), name.as_ptr()));
+    }
+
+    #[test]
+    fn module_slug_borrows_dll_stem() {
+        let module = "client.dll";
+        let slug = module_slug(module);
+        assert_eq!(slug.as_ref(), "client");
+        assert!(matches!(slug, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(slug.as_ref().as_ptr(), module.as_ptr()));
+        assert_eq!(module_slug("engine2.dll").as_ref(), "engine2");
+        assert_eq!(module_slug("client_dll").as_ref(), "client");
+        assert_eq!(module_slug("namespace.dll").as_ref(), "_namespace");
+        assert_eq!(module_slug("3d.dll").as_ref(), "_3d");
+        assert_eq!(module_slug(".dll").as_ref(), "module");
+    }
+
+    #[test]
+    fn module_headers_keep_schema_comments_on_one_line() {
+        let class = Class {
+            name: "C_Test\n#define CLASS_INJECTED 1".to_string(),
+            module_name: "namespace.dll\n#define MODULE_INJECTED 1".into(),
+            parent_name: None,
+            size: 0x20,
+            alignment: 8,
+            metadata: Vec::new(),
+            fields: vec![ClassField {
+                name: "m_value".to_string(),
+                type_name: "int32\n#define TYPE_INJECTED 1".to_string(),
+                offset: 0x10,
+                metadata: Vec::new(),
+            }],
+            static_fields: Vec::new(),
+            flags: vec!["MNetworkVarNames\n#define FLAG_INJECTED 1".to_string()],
+        };
+
+        let module_body = write_module_header(
+            &class.module_name,
+            "_namespace",
+            std::slice::from_ref(&class),
+            &[],
+        );
+        let class_body = write_class_header("_namespace", "C_Test", &class);
+        for body in [&module_body, &class_body] {
+            assert!(!body.contains("\n#define"), "schema text escaped a comment: {body}");
+        }
+    }
+
+    #[test]
+    fn dump_module_headers_writes_every_class_file() {
+        fn dummy(name: &str, module: &str) -> Class {
+            Class {
+                name: name.to_string(),
+                module_name: module.into(),
+                parent_name: None,
+                size: 0x20,
+                alignment: 8,
+                metadata: Vec::new(),
+                fields: Vec::new(),
+                static_fields: Vec::new(),
+                flags: Vec::new(),
+            }
+        }
+
+        let client: Vec<Class> = (0..16)
+            .map(|i| dummy(&format!("C_Client{i}"), "client.dll"))
+            .collect();
+        let server: Vec<Class> = (0..8)
+            .map(|i| dummy(&format!("C_Server{i}"), "server.dll"))
+            .collect();
+        let schemas = SchemaMap::from([
+            ("client.dll".to_string(), (client, Vec::new())),
+            ("server.dll".to_string(), (server, Vec::new())),
+        ]);
+        let root =
+            std::env::temp_dir().join(format!("cs2-dumper-sdk-classes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        dump_sdk(&root, &schemas, Some(1)).expect("write sdk");
+        for i in 0..16 {
+            assert!(
+                root.join("sdk/classes/client")
+                    .join(format!("C_Client{i}.hpp"))
+                    .is_file(),
+                "missing client class {i}"
+            );
+        }
+        for i in 0..8 {
+            assert!(
+                root.join("sdk/classes/server")
+                    .join(format!("C_Server{i}.hpp"))
+                    .is_file(),
+                "missing server class {i}"
+            );
+        }
+        assert!(root.join("sdk/modules.hpp").is_file());
+        assert!(root.join("sdk/modules/client.hpp").is_file());
+        assert!(root.join("sdk/modules/server.hpp").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dump_module_headers_disambiguates_module_and_class_paths() {
+        let class = |name: &str, module: &str| Class {
+            name: name.to_string(),
+            module_name: module.into(),
+            parent_name: None,
+            size: 0x10,
+            alignment: 4,
+            metadata: Vec::new(),
+            fields: Vec::new(),
+            static_fields: Vec::new(),
+            flags: Vec::new(),
+        };
+        let enum_ = Enum {
+            name: "same-name".into(),
+            alignment: 4,
+            size: 4,
+            members: Vec::new(),
+            flags: Vec::new(),
+        };
+        let schemas = SchemaMap::from([
+            (
+                "foo-bar.dll".to_string(),
+                (
+                    vec![
+                        class("same_name", "foo-bar.dll"),
+                        class("C-Test", "foo-bar.dll"),
+                        class("C_Test", "foo-bar.dll"),
+                    ],
+                    vec![enum_],
+                ),
+            ),
+            ("foo_bar.dll".to_string(), (Vec::new(), Vec::new())),
+        ]);
+        let root = std::env::temp_dir().join(format!(
+            "cs2-dumper-sdk-path-collisions-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        dump_module_headers(&root, &schemas).expect("write module headers");
+
+        let classes = root.join("sdk/classes/foo_bar");
+        assert!(classes.join("same_name_2.hpp").is_file());
+        assert!(classes.join("C_Test.hpp").is_file());
+        assert!(classes.join("C_Test_2.hpp").is_file());
+        assert!(root.join("sdk/modules/foo_bar.hpp").is_file());
+        assert!(root.join("sdk/modules/foo_bar_2.hpp").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn collect_sdk_data_prefers_client_and_borrows_schema_entries() {
+        fn dummy(name: &str, module: &str, size: i32) -> Class {
+            Class {
+                name: name.to_string(),
+                module_name: module.into(),
+                parent_name: None,
+                size,
+                alignment: 8,
+                metadata: Vec::new(),
+                fields: Vec::new(),
+                static_fields: Vec::new(),
+                flags: Vec::new(),
+            }
+        }
+
+        let schemas = SchemaMap::from([
+            (
+                "server.dll".to_string(),
+                (vec![dummy("C_Shared", "server.dll", 0x99)], Vec::new()),
+            ),
+            (
+                "client.dll".to_string(),
+                (vec![dummy("C_Shared", "client.dll", 0x10)], Vec::new()),
+            ),
+        ]);
+        let client = &schemas["client.dll"].0[0];
+        let (enums, classes) = collect_sdk_data(&schemas);
+        assert!(enums.is_empty());
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].0, "client.dll");
+        assert_eq!(classes[0].1.size, 0x10);
+        assert!(
+            std::ptr::eq(classes[0].1, client),
+            "collect_sdk_data must borrow the schema class, not clone it"
+        );
+    }
+
+    #[test]
+    fn collect_sdk_data_prefers_client_when_module_case_differs() {
+        fn dummy(name: &str, module: &str, size: i32) -> Class {
+            Class {
+                name: name.to_string(),
+                module_name: module.into(),
+                parent_name: None,
+                size,
+                alignment: 8,
+                metadata: Vec::new(),
+                fields: Vec::new(),
+                static_fields: Vec::new(),
+                flags: Vec::new(),
+            }
+        }
+
+        let schemas = SchemaMap::from([
+            (
+                "server.dll".to_string(),
+                (vec![dummy("C_Shared", "server.dll", 0x99)], Vec::new()),
+            ),
+            (
+                "CLIENT.DLL".to_string(),
+                (vec![dummy("C_Shared", "CLIENT.DLL", 0x10)], Vec::new()),
+            ),
+        ]);
+        let (enums, classes) = collect_sdk_data(&schemas);
+        assert!(enums.is_empty());
+        assert_eq!(classes.len(), 1);
+        assert_eq!(classes[0].0, "CLIENT.DLL");
+        assert_eq!(classes[0].1.size, 0x10);
+    }
+
+    #[test]
+    fn baked_engine_types_are_not_redefined_as_schema_classes() {
+        fn dummy(name: &str, fields: Vec<ClassField>) -> Class {
+            Class {
+                name: name.to_string(),
+                module_name: "client.dll".into(),
+                parent_name: None,
+                size: 0x28,
+                alignment: 8,
+                metadata: Vec::new(),
+                fields,
+                static_fields: Vec::new(),
+                flags: Vec::new(),
+            }
+        }
+        let field = |name: &str, ty: &str, offset: i32| ClassField {
+            name: name.to_string(),
+            type_name: ty.to_string(),
+            offset,
+            metadata: Vec::new(),
+        };
+        let schemas = SchemaMap::from([(
+            "client.dll".to_string(),
+            (
+                vec![
+                    dummy(
+                        "Vector",
+                        vec![field("x", "float32", 0), field("y", "float32", 4)],
+                    ),
+                    dummy(
+                        "CEntityIdentity",
+                        vec![field("m_designerName", "CUtlSymbolLarge", 0x20)],
+                    ),
+                    dummy(
+                        "C_CSPlayerPawn",
+                        vec![field("m_vecOrigin", "Vector", 0x10)],
+                    ),
+                ],
+                Vec::new(),
+            ),
+        )]);
+        let root = std::env::temp_dir().join(format!(
+            "cs2-dumper-sdk-baked-types-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        dump_sdk(&root, &schemas, Some(1)).expect("write sdk");
+        let types = std::fs::read_to_string(root.join("sdk/sdk_types.hpp")).unwrap();
+        let classes = std::fs::read_to_string(root.join("sdk/sdk_classes.hpp")).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(types.contains("struct Vector"));
+        assert!(types.contains("struct CEntityIdentity"));
+        assert!(
+            !types.lines().any(|line| line.trim() == "class Vector;"),
+            "baked Vector must not be forwarded as a class: {types}"
+        );
+        assert!(
+            !types
+                .lines()
+                .any(|line| line.trim() == "class CEntityIdentity;"),
+            "baked CEntityIdentity must not be forwarded as a class: {types}"
+        );
+        assert!(
+            !classes.contains("class Vector"),
+            "schema Vector must not redefine the baked POD: {classes}"
+        );
+        assert!(
+            !classes.contains("class CEntityIdentity"),
+            "schema CEntityIdentity must not redefine the baked POD: {classes}"
+        );
+        assert!(classes.contains("class C_CSPlayerPawn"));
+        assert!(
+            classes.contains("SCHEMA_FIELD(Vector, m_vecOrigin, 0x10)"),
+            "pawn origin must keep the baked Vector type: {classes}"
+        );
+    }
+
+    #[test]
+    fn sdk_class_emits_fieldref_for_fixed_arrays() {
+        let class = Class {
+            name: "C_WithArray".to_string(),
+            module_name: "client.dll".into(),
+            parent_name: None,
+            size: 0xA0,
+            alignment: 8,
+            metadata: Vec::new(),
+            fields: vec![
+                ClassField {
+                    name: "m_name".to_string(),
+                    type_name: "char[128]".to_string(),
+                    offset: 0,
+                    metadata: Vec::new(),
+                },
+                ClassField {
+                    name: "m_cells".to_string(),
+                    type_name: "int32[2][3]".to_string(),
+                    offset: 0x80,
+                    metadata: Vec::new(),
+                },
+            ],
+            static_fields: Vec::new(),
+            flags: Vec::new(),
+        };
+        let body = render_sdk_class(&class, &HashSet::new(), &HashMap::new());
+        assert!(
+            body.contains("FieldRef<char[128]> m_name()"),
+            "char[128] must stay a FieldRef array: {body}"
+        );
+        assert!(
+            body.contains("FieldRef<int32_t[2][3]> m_cells()"),
+            "int32[2][3] must keep both ranks: {body}"
+        );
+        assert!(
+            !body.contains("FieldRef<char[128][128]>"),
+            "must not double-wrap the array rank: {body}"
+        );
+    }
+
+    #[test]
+    fn sdk_classes_stub_missing_parent_types() {
+        let derived = Class {
+            name: "C_Derived".to_string(),
+            module_name: "client.dll".into(),
+            parent_name: Some("CMissingBase".to_string()),
+            size: 8,
+            alignment: 8,
+            metadata: Vec::new(),
+            fields: Vec::new(),
+            static_fields: Vec::new(),
+            flags: Vec::new(),
+        };
+        let schemas =
+            SchemaMap::from([("client.dll".to_string(), (vec![derived], Vec::new()))]);
+        let (enums, classes) = collect_sdk_data(&schemas);
+        let body = write_sdk_classes(&classes, &enums);
+        assert!(
+            body.contains("class CMissingBase {};"),
+            "missing parent must be stubbed: {body}"
+        );
+        assert!(
+            body.contains("class C_Derived : public CMissingBase"),
+            "derived must inherit the stub: {body}"
+        );
+    }
+
+    #[test]
+    fn sdk_classes_disambiguate_sanitized_type_names() {
+        fn dummy(name: &str) -> Class {
+            Class {
+                name: name.to_string(),
+                module_name: "client.dll".into(),
+                parent_name: None,
+                size: 4,
+                alignment: 4,
+                metadata: Vec::new(),
+                fields: Vec::new(),
+                static_fields: Vec::new(),
+                flags: Vec::new(),
+            }
+        }
+        let schemas = SchemaMap::from([(
+            "client.dll".to_string(),
+            (vec![dummy("C-Test"), dummy("C_Test")], Vec::new()),
+        )]);
+        let (enums, classes) = collect_sdk_data(&schemas);
+        let body = write_sdk_classes(&classes, &enums);
+        assert!(body.contains("class C_Test {"), "first ident: {body}");
+        assert!(
+            body.contains("class C_Test_2 {"),
+            "colliding ident must be allocated: {body}"
+        );
+    }
+
+    #[test]
+    fn baked_transform_matches_include_tree_layout() {
+        let types = write_sdk_types(&[], None);
+        assert!(types.contains("struct Quaternion { float x, y, z, w; }"));
+        assert!(types.contains("Vector m_vPosition"));
+        assert!(types.contains("Quaternion m_orientation"));
+        assert!(types.contains("uint16_t m_cellX"));
+        assert!(!types.contains("Vector pos; QAngle rot"));
+    }
+
+    #[test]
+    fn sdk_class_emits_fields_lowest_offset_first() {
+        let class = Class {
+            name: "C_OutOfOrder".to_string(),
+            module_name: "client.dll".into(),
+            parent_name: None,
+            size: 0x28,
+            alignment: 8,
+            metadata: Vec::new(),
+            fields: vec![
+                ClassField {
+                    name: "late".to_string(),
+                    type_name: "int32".to_string(),
+                    offset: 0x20,
+                    metadata: Vec::new(),
+                },
+                ClassField {
+                    name: "early".to_string(),
+                    type_name: "int32".to_string(),
+                    offset: 0x8,
+                    metadata: Vec::new(),
+                },
+            ],
+            static_fields: Vec::new(),
+            flags: Vec::new(),
+        };
+        let body = render_sdk_class(&class, &HashSet::new(), &HashMap::new());
+        let early = body.find("early").expect("early field");
+        let late = body.find("late").expect("late field");
+        assert!(
+            early < late,
+            "fields must be emitted in offset order: {body}"
+        );
+        assert!(fields_sorted_by_offset(&[
+            ClassField {
+                name: "a".into(),
+                type_name: "int32".into(),
+                offset: 0,
+                metadata: Vec::new(),
+            },
+            ClassField {
+                name: "b".into(),
+                type_name: "int32".into(),
+                offset: 4,
+                metadata: Vec::new(),
+            },
+        ]));
+        assert!(!fields_sorted_by_offset(&class.fields));
     }
 
     #[test]
@@ -913,10 +1416,49 @@ mod tests {
         let resolved = resolve_type("C_BaseEntity*", &known);
         assert_eq!(resolved.cpp_type, "C_BaseEntity*");
         let nested = resolve_type("C_BaseEntity[2]", &known);
-        assert_eq!(nested.cpp_type, "C_BaseEntity");
+        assert_eq!(nested.cpp_type, "C_BaseEntity[2]");
         assert!(nested.is_arr);
-        assert_eq!(nested.arr_size, 2);
+        assert_eq!(
+            resolve_type("int32[2][3]", &known).cpp_type,
+            "int32_t[2][3]"
+        );
         assert_eq!(resolve_type("Vector", &known).cpp_type, "Vector");
+    }
+
+    #[test]
+    fn resource_handles_are_eight_bytes_entity_handles_are_four() {
+        let known = HashSet::new();
+        assert_eq!(resolve_type("CHandle< C_BaseEntity >", &known).cpp_type, "uint32_t");
+        assert_eq!(
+            resolve_type("CStrongHandle< InfoForResourceTypeCModel >", &known).cpp_type,
+            "uint64_t"
+        );
+        assert_eq!(
+            resolve_type("CWeakHandle< InfoForResourceTypeCTextureBase >", &known).cpp_type,
+            "uint64_t"
+        );
+        assert_eq!(resolve_type("CStrongHandle", &known).cpp_type, "uint64_t");
+    }
+
+    #[test]
+    fn utl_vectors_keep_container_layout_not_a_single_pointer() {
+        let known = HashSet::from(["C_BaseEntity"]);
+        assert_eq!(
+            resolve_type("CUtlVector< Vector >", &known).cpp_type,
+            "CUtlVector<Vector>"
+        );
+        assert_eq!(
+            resolve_type("CUtlVector< C_BaseEntity >", &known).cpp_type,
+            "CUtlVector<C_BaseEntity>"
+        );
+        assert_eq!(
+            resolve_type("C_NetworkUtlVectorBase< int32 >", &known).cpp_type,
+            "C_NetworkUtlVectorBase<int32_t>"
+        );
+        assert_ne!(
+            resolve_type("CUtlVector< Vector >", &known).cpp_type,
+            "uintptr_t"
+        );
     }
 
     #[test]
@@ -940,9 +1482,41 @@ mod tests {
             std::env::temp_dir().join(format!("cs2-dumper-sdk-smoke-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
 
+        let identity = Class {
+            name: "CEntityIdentity".to_string(),
+            module_name: "client.dll".into(),
+            parent_name: None,
+            size: 0x70,
+            alignment: 8,
+            metadata: Vec::new(),
+            fields: vec![ClassField {
+                name: "m_designerName".to_string(),
+                type_name: "CUtlSymbolLarge".to_string(),
+                offset: 0x20,
+                metadata: Vec::new(),
+            }],
+            static_fields: Vec::new(),
+            flags: Vec::new(),
+        };
+        let vector = Class {
+            name: "Vector".to_string(),
+            module_name: "client.dll".into(),
+            parent_name: None,
+            size: 0xC,
+            alignment: 4,
+            metadata: Vec::new(),
+            fields: vec![ClassField {
+                name: "x".to_string(),
+                type_name: "float32".to_string(),
+                offset: 0,
+                metadata: Vec::new(),
+            }],
+            static_fields: Vec::new(),
+            flags: Vec::new(),
+        };
         let base = Class {
             name: "C_BaseEntity".to_string(),
-            module_name: "client.dll".to_string(),
+            module_name: "client.dll".into(),
             parent_name: None,
             size: 0x20,
             alignment: 8,
@@ -958,17 +1532,49 @@ mod tests {
         };
         let derived = Class {
             name: "C_TestEntity".to_string(),
-            module_name: "client.dll".to_string(),
+            module_name: "client.dll".into(),
             parent_name: Some("C_BaseEntity".to_string()),
             size: 0x28,
             alignment: 8,
             metadata: Vec::new(),
-            fields: vec![ClassField {
-                name: "m_hOwner".to_string(),
-                type_name: "C_BaseEntity*".to_string(),
-                offset: 0x20,
-                metadata: Vec::new(),
-            }],
+            fields: vec![
+                ClassField {
+                    name: "m_hOwner".to_string(),
+                    type_name: "C_BaseEntity*".to_string(),
+                    offset: 0x20,
+                    metadata: Vec::new(),
+                },
+                ClassField {
+                    name: "m_vecWeapons".to_string(),
+                    type_name: "CUtlVector< C_BaseEntity >".to_string(),
+                    offset: 0x28,
+                    metadata: Vec::new(),
+                },
+            ],
+            static_fields: Vec::new(),
+            flags: Vec::new(),
+        };
+        let orphan = Class {
+            name: "C_Orphan".to_string(),
+            module_name: "client.dll".into(),
+            parent_name: Some("CMissingBase".to_string()),
+            size: 0x18,
+            alignment: 8,
+            metadata: Vec::new(),
+            fields: vec![
+                ClassField {
+                    name: "m_name".to_string(),
+                    type_name: "char[8]".to_string(),
+                    offset: 0,
+                    metadata: Vec::new(),
+                },
+                ClassField {
+                    name: "m_cells".to_string(),
+                    type_name: "int32[2][2]".to_string(),
+                    offset: 8,
+                    metadata: Vec::new(),
+                },
+            ],
             static_fields: Vec::new(),
             flags: Vec::new(),
         };
@@ -982,8 +1588,13 @@ mod tests {
             }],
             flags: Vec::new(),
         };
-        let schemas =
-            SchemaMap::from([("client.dll".to_string(), (vec![base, derived], vec![enum_]))]);
+        let schemas = SchemaMap::from([(
+            "client.dll".to_string(),
+            (
+                vec![identity, vector, base, derived, orphan],
+                vec![enum_],
+            ),
+        )]);
 
         dump_sdk(&root, &schemas, Some(12345)).expect("write synthetic SDK");
         let sdk_types = std::fs::read_to_string(root.join("sdk/sdk_types.hpp")).unwrap();
@@ -998,7 +1609,7 @@ mod tests {
         let status = Command::new("g++")
             .args(["-std=c++20", "-fsyntax-only"])
             .arg("-I")
-            .arg(&root.join("sdk"))
+            .arg(root.join("sdk"))
             .arg(&source)
             .status()
             .expect("run g++");

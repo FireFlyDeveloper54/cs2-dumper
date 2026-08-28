@@ -9,6 +9,7 @@ pub enum SchemaAtomicCategory {
     CollectionOfT,
     TF,
     TT,
+    #[allow(clippy::upper_case_acronyms)]
     TTF,
     I,
     None,

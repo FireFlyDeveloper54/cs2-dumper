@@ -421,20 +421,24 @@ fn field_key(field: &str) -> &str {
 
 fn live_field_offset(schemas: &SchemaMap, class: &str, field: &str) -> Option<i32> {
     let key = field_key(field);
-    for (_, (classes, _)) in schemas {
-        if let Some(found) = classes.iter().find(|c| {
-            c.name == class || c.name.rsplit("::").next() == Some(class)
-        }) {
-            if let Some(member) = found.fields.iter().find(|f| f.name == key) {
-                return Some(member.offset);
-            }
+    for (classes, _) in schemas.values() {
+        if let Some(found) = classes
+            .iter()
+            .find(|c| c.name == class || c.name.rsplit("::").next() == Some(class))
+            && let Some(member) = found.fields.iter().find(|f| f.name == key)
+        {
+            return Some(member.offset);
         }
     }
     None
 }
 
-pub fn render_json(build_number: Option<u32>, schemas: Option<&SchemaMap>) -> String {
-    let working: Vec<&VerifiedFeature> = FEATURES.iter().filter(|f| f.status == "working").collect();
+pub fn render_json(
+    build_number: Option<u32>,
+    schemas: Option<&SchemaMap>,
+) -> Result<String, serde_json::Error> {
+    let working: Vec<&VerifiedFeature> =
+        FEATURES.iter().filter(|f| f.status == "working").collect();
     let features: Vec<_> = working
         .iter()
         .map(|f| {
@@ -474,7 +478,7 @@ pub fn render_json(build_number: Option<u32>, schemas: Option<&SchemaMap>) -> St
         "features":       features,
     });
 
-    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| String::from("{}"))
+    serde_json::to_string_pretty(&doc)
 }
 
 #[cfg(test)]
@@ -515,10 +519,8 @@ mod tests {
             live_field_offset(&schemas, "C_BaseEntity", "m_iHealth"),
             Some(0x999)
         );
-        let json = render_json(Some(1), Some(&schemas));
+        let json = render_json(Some(1), Some(&schemas)).expect("serialize");
         assert!(json.contains("0x999"));
         assert!(json.contains("\"source\": \"schema\""));
     }
 }
-
-

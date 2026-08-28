@@ -8,7 +8,7 @@ Counter-Strike 2 外部 offset / schema / SDK dumper。单 exe、默认全量输
 
 ## Build
 
-需要 Rust 1.85+（edition 2024）。仓库根目录：
+需要 Rust 1.88+（edition 2024；`slice::as_chunks` 等 API 从 1.88 稳定）。仓库根目录：
 
 ```text
 cargo build --release
@@ -16,16 +16,26 @@ cargo build --release
 
 产物只有一个 `target/release/cs2-dumper.exe`。`-c shade` 用的 payload 在编译时嵌进这个 exe，不需要再带 DLL。
 
+## Benches
+
+微基准打的是 dump 真正会走的公开函数（小端整数加载、模块名 intern、上一轮 `patterns.json` 缓存查找、IDA matcher、标识符 slugify），不是另写一套。不 attach `cs2.exe`。
+
+```text
+cargo bench --features bench --bench hot_paths
+```
+
+`FakeMemory` 只在 `cfg(test)` 和 `--features bench` 下编译，默认 exe 不含它。`--features bench` 是必须的：`[[bench]]` 标了 `required-features`，不加这个 feature 时 cargo 会跳过该 bench。
+
 ## Usage
 
 ```text
 cs2-dumper.exe
 ```
 
-不传参数就会跑完全部阶段，写出 `cs` / `hpp` / `json` / `rs` / `zig` 以及 C++ include-tree。
+不传参数就会跑完全部阶段，写出扁平多语言文件、C++ include-tree，以及全局命名空间 `sdk/`。
 
 1. 本机有 `cs2.exe`：attach 后 dump 活进程。
-2. 没有游戏进程：从注册表 / `libraryfolders.vdf` / 本地盘自动找 `steamapps/common/Counter-Strike*`，把 schema DLL `LoadLibrary` 进 **dumper 自己的进程** 再 dump（不是注入 `cs2.exe`）。
+2. 没有游戏进程、且未指定 memflow 插件（`-c pcileech` / `kvm` / `winio`）：从注册表 / `libraryfolders.vdf` / 本地盘自动找 `steamapps/common/Counter-Strike*`，把 schema DLL `LoadLibrary` 进 **dumper 自己的进程** 再 dump（不是注入 `cs2.exe`）。插件连接器上找不到 `cs2.exe` 会直接失败，不会误 dump 本机 LoadLibrary 镜像。
 
 可选参数：
 
@@ -35,7 +45,10 @@ cs2-dumper.exe
 | `-v` / `-vv` | 更详细的日志 |
 | `-c, --connector <name>` | 内存后端，见下表 |
 | `--guess-structs` | 额外写出 `structs.hpp`：按字段间距猜测未知类型大小。偏移会显式 pad；`sizeof` 仍可能错。默认关闭 |
+| `--no-sound` | 关闭 Windows `Beep()` 进度提示音 |
 | `-h` / `-V` | 帮助 / 版本 |
+
+日志默认写到 `<output>/cs2-dumper.log`。终端默认 Warn（sanitize 丢弃、写失败等会显示）；`-v` 提到 Info，`-vv` Debug。文件始终记 Info 及以上。输出目录一开始就会创建；日志文件写失败不会中断 dump。
 
 ### Backends (`-c`)
 
@@ -46,23 +59,27 @@ cs2-dumper.exe
 | `shade` | 把内嵌 payload 注入活 `cs2.exe`，对已加载模块调用 `InstallSchemaBindings`，再 dump（Windows） |
 | `pcileech` / `kvm` / `winio` | memflow 插件。例如 `cs2-dumper.exe -c pcileech -a :device=FPGA` |
 
-`syscall` 和 `shade` 都要求游戏正在跑。DMA 连接器通常需要管理员 / root。
+`syscall`、`shade` 和 memflow 插件都要求目标上有活的 `cs2.exe`。DMA 连接器通常需要管理员 / root。
 
-`manifest.json` 的 `backend` 字段会记下这次跑的是 `native` / `syscall` / `shade` / `loadlib`。
+`manifest.json` 的 `backend` 字段会记下这次跑的是 `native` / `syscall` / `shade` / `loadlib`。LoadLibrary dump 不会把未初始化的 `dwBuildNumber`（常见 `0` / `0xFFFFFFFF`）写成引擎版本；`game/csgo/steam.inf` 的 `PatchVersion` / `ClientVersion` 写进 `steam_inf`。
 
 ## Output
 
-每次运行同时写两套东西：
+每次运行默认全量写出三套消费端产物，互不替代：
 
 - **扁平多语言文件**（和 [a2x/cs2-dumper](https://github.com/a2x/cs2-dumper) 兼容）：`offsets.*`、`buttons.*`、`interfaces.*`、各 `<module>_dll.*`
 - **C++ include-tree**（[scros22/cs2-universal-offsets](https://github.com/scros22/cs2-universal-offsets) 那一套）：`cs2.hpp` 单头 amalgamation + `macros.hpp` + `schemas/` + `impl/entity_system.hpp`
+- **全局命名空间 SDK**：`sdk/sdk.hpp` + `sdk/sdk_types.hpp` + `sdk/modules/` + `sdk/classes/`
+
+写出 `sdk/` 时控制台会打印生成的头文件名。根目录还会再写一份 `entity_system.hpp`（和 `impl/entity_system.hpp` 并存）。
 
 ```text
 <output>/
 ├── manifest.json
 ├── info.json
-├── cs2.hpp                          # C++ 单头
+├── cs2.hpp                          # C++ 单头 amalgamation
 ├── macros.hpp                       # SCHEMA_FIELD + engine types + auto forwards
+├── entity_system.hpp                # 根目录 entity helper（消费 offsets_merged.hpp）
 ├── offsets.{cs,hpp,json,rs,zig}     # canonical dwXxx
 ├── offsets_merged.{hpp,json}        # canonical + pattern + interface RVA
 ├── buttons.*  interfaces.*
@@ -72,7 +89,7 @@ cs2-dumper.exe
 ├── schema_index.json
 ├── schema_index.diff.json
 ├── sdk/
-│   ├── sdk.hpp
+│   ├── sdk.hpp                      # 全局命名空间 umbrella
 │   ├── sdk_types.hpp
 │   ├── sdk_enums.hpp
 │   ├── sdk_classes.hpp
@@ -108,8 +125,9 @@ cs2-dumper.exe
 | 你要干什么 | 用哪个文件 |
 | --- | --- |
 | C++ 一个 include 全要 | `cs2.hpp` |
+| C++ 全局命名空间 SDK | `sdk/sdk.hpp` |
 | C++ typed schema class | `macros.hpp` + `schemas/client_dll.hpp` |
-| C++ 走 entity list | `impl/entity_system.hpp` |
+| C++ 走 entity list | `impl/entity_system.hpp` 或根目录 `entity_system.hpp` |
 | 任意语言只要常量 | `offsets.hpp` / `<module>_dll.json` |
 | 更新后对 diff | `manifest.json` + `*.diff.json` + `patterns.repair.patch.json` |
 | 按 vtable index hook | `vtables.hpp` / `vtables.json` |
@@ -126,10 +144,13 @@ my-project/
 └── vendor/cs2-dumper/          # 拷一份 <output>/
     ├── cs2.hpp
     ├── macros.hpp
+    ├── sdk/
     ├── schemas/
     ├── impl/
     └── ...
 ```
+
+include-tree（推荐单头）：
 
 ```cpp
 #include <cs2.hpp>
@@ -142,9 +163,15 @@ int health(void* pawn_ptr) {
 }
 ```
 
-`cs2.hpp` 会拉上 `macros.hpp`、各模块 schema（编辑器模块会跳过）、merged offsets、typed interfaces、buttons、protobufs、patterns、entity helper、engine 结构。缺的可选报告用 `__has_include` 挡住，照样能编。扁平的 `sdk/sdk.hpp` 还在，给要全局命名空间那套的人用。
+全局命名空间 SDK：
 
-Entity helper 在 `impl/entity_system.hpp`，走 `offsets::` 常量，不写死数字：
+```cpp
+#include <sdk/sdk.hpp>
+```
+
+`cs2.hpp` 会拉上 `macros.hpp`、各模块 schema（编辑器模块会跳过）、merged offsets、typed interfaces、buttons、protobufs、patterns、entity helper、engine 结构。缺的可选报告用 `__has_include` 挡住，照样能编。`sdk/sdk.hpp` 是另一套独立头，给要 `sdk::` 全局命名空间的人用，默认每次 dump 都会写出。
+
+Entity helper 在 `impl/entity_system.hpp`（根目录 `entity_system.hpp` 也有一份），走 `offsets::` 常量，不写死数字：
 
 ```cpp
 auto* local = CGameEntitySystem::GetLocalPlayer();
@@ -159,7 +186,7 @@ input->SetRelativeMouseMode(false);
 void* slot = ifc::detail::vtable_slot(input, 76);
 ```
 
-C# / Rust / Zig / JSON 用扁平多语言文件（`offsets.json`、`client_dll.cs`、`patterns.rs` …）。include-tree 只给 C++。
+C# / Rust / Zig / JSON 用扁平多语言文件（`offsets.json`、`client_dll.cs`、`patterns.rs` …）。include-tree 和 `sdk/` 只给 C++。
 
 游戏更新后：对着新 build 再跑一遍 dumper，看 `manifest.json`（`build_number`、`pattern_summary`），再看 `patterns.diff.json` / `schema_index.diff.json` / `interfaces.diff.json`。特征漂了会写出 `patterns.repair.json` 和可直接喂回去的 `patterns.repair.patch.json`。然后用新的 `cs2.hpp` 重编消费端。
 
@@ -177,7 +204,7 @@ Walker 在 `src/source2/`：
 2. memflow 顺着 `CUtlTSHash` 枚举每个 scope 的 class / enum。
 3. `src/analysis/schemas.rs` 拍扁成 emitter 用的 `Class` / `Enum`。
 
-两套写出：
+三套写出：
 
 ```cpp
 // 扁平常量（任意语言）
@@ -185,22 +212,25 @@ namespace cs2_dumper::schemas::client_dll::C_CSPlayerPawn {
     constexpr std::ptrdiff_t m_iHealth = 0x344;
 }
 
-// include-tree typed class
+// include-tree typed class（cs2.hpp / schemas/）
 namespace cs2::sdk::client_dll {
     class C_CSPlayerPawn : public C_BasePlayerPawn {
     public:
         SCHEMA_FIELD(std::int32_t, m_iHealth, 0x344)
     };
 }
+
+// 全局命名空间 SDK（sdk/sdk.hpp）
+#include <sdk/sdk.hpp>
 ```
 
 `SCHEMA_FIELD` 在 `macros.hpp`，展开成 `this + offset` 的 typed 访问器。带 `MNetworkVarNames` 的字段还会单独写到 `netvars/`。
 
-相关代码：`src/source2/`、`src/analysis/schemas.rs`、`src/output/schemas.rs`、`src/output/sdk_classes.rs`、`src/output/netvars.rs`。
+相关代码：`src/source2/`、`src/analysis/schemas.rs`、`src/output/schemas.rs`、`src/output/sdk.rs`、`src/output/sdk_classes.rs`、`src/output/netvars.rs`。
 
 ## Patterns
 
-特征是 IDA 风格字节串，空格分隔，`?` / `??` 是通配，也支持半字节通配（`4?`、`?A`）。扫描器基于 [pelite](https://github.com/CasualX/pelite)，只扫指定模块的指定 PE 节（代码走 `.text`，字符串走 `.rdata`）。
+特征是 IDA 风格字节串，空格分隔，`?` / `??` 是通配，也支持半字节通配（`4?`、`?A`）。扫描器基于 [pelite](https://github.com/CasualX/pelite)，只扫指定模块的指定 PE 节（代码走 `.text`，字符串走 `.rdata`）。活进程读失败时会回退到磁盘 PE，先按 `SizeOfImage` 映射成 RVA 布局再扫，不会把 `PointerToRawData` 当成 `VirtualAddress`。
 
 匹配地址是 pattern **第一个字节** 的 RVA。真正要的值往往在后面的 `lea` / `call` / `mov` 里，所以每条特征带一个 resolver：
 
@@ -264,6 +294,22 @@ void hook_create_move(void* iface) {
 ```
 
 `vtables.json` 的 `vtable_module` 是 vftable 字节所在的 DLL（实现有时在兄弟模块里）。Walker 在 `src/analysis/vtables.rs`，写出在 `src/output/vtables.rs`。
+
+## Layout
+
+| 路径 | 做什么 |
+| --- | --- |
+| `src/main.rs` | CLI、日志、选后端、attach |
+| `src/dump.rs` | 分析 → 特征 → 对象级恢复 → 写出全部产物 |
+| `src/analysis/` | schema / offset / interface / button / vtable / entity / convar |
+| `src/analysis/module_data.rs` | 模块镜像读取；一次 dump 内缓存，避免反复读 `client.dll` |
+| `src/analysis/read.rs` | 远程 C 字符串读取，walker 共用 |
+| `src/patterns/` | 内置特征库、扫描、repair |
+| `src/output/` | 扁平文件、include-tree、`sdk/`、manifest |
+| `src/output/cpp_types.rs` | schema → C++ 原语 / 存储宽度，两套 SDK 共用 |
+| `src/memory/` | native / syscall / shade / LoadLibrary 自附加 |
+| `src/loadlib.rs` | 游戏没开时对本进程 `LoadLibrary` |
+| `shade-payload/` | `-c shade` 注入 DLL，编译期嵌进主 exe |
 
 ## Tests
 

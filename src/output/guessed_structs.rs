@@ -9,7 +9,8 @@ use std::fmt::Write;
 
 use crate::analysis::{Class, ClassField, SchemaMap};
 
-use super::ident::{sanitize_ident, slugify};
+use super::ident::{cpp_identifier, IdentifierAllocator};
+use super::comment_text;
 
 pub fn render_hpp(schemas: &SchemaMap, build_number: Option<u32>) -> String {
     let votes = vote_unknown_sizes(schemas);
@@ -36,10 +37,11 @@ pub fn render_hpp(schemas: &SchemaMap, build_number: Option<u32>) -> String {
     let mut modules: Vec<_> = schemas.iter().collect();
     modules.sort_by(|a, b| a.0.cmp(b.0));
     for (module, (classes, _)) in modules {
-        let ns = slugify(module.trim_end_matches(".dll"));
+        let ns = cpp_identifier(module.trim_end_matches(".dll"));
         writeln!(s, "namespace {ns} {{\n").ok();
+        let mut class_names = IdentifierAllocator::default();
         for class in classes {
-            write_class(&mut s, class, &votes);
+            write_class(&mut s, class, &votes, &mut class_names);
         }
         writeln!(s, "}} // namespace {ns}\n").ok();
     }
@@ -49,17 +51,24 @@ pub fn render_hpp(schemas: &SchemaMap, build_number: Option<u32>) -> String {
     s
 }
 
-fn write_class(out: &mut String, class: &Class, votes: &BTreeMap<String, i32>) {
+fn write_class(
+    out: &mut String,
+    class: &Class,
+    votes: &BTreeMap<String, i32>,
+    class_names: &mut IdentifierAllocator,
+) {
     let mut fields: Vec<&ClassField> = class.fields.iter().collect();
     if fields.is_empty() {
         return;
     }
     fields.sort_by_key(|f| f.offset);
-    let name = sanitize_ident(&class.name.replace("::", "_"));
+    let ident_src = class.name.replace("::", "_");
+    let name = class_names.allocate(cpp_identifier(&ident_src));
     writeln!(out, "struct {name} {{").ok();
 
     let mut cursor = 0i32;
     let mut pad_i = 0usize;
+    let mut field_names = IdentifierAllocator::default();
     let class_end = class.size.max(0);
     for field in &fields {
         if field.offset < 0 {
@@ -77,7 +86,8 @@ fn write_class(out: &mut String, class: &Class, votes: &BTreeMap<String, i32>) {
             writeln!(
                 out,
                 "    // overlap skipped: {} at 0x{:X} (cursor 0x{cursor:X})",
-                field.name, field.offset
+                comment_text(&field.name),
+                field.offset
             )
             .ok();
             continue;
@@ -85,12 +95,13 @@ fn write_class(out: &mut String, class: &Class, votes: &BTreeMap<String, i32>) {
 
         let gap = next_gap(&fields, field.offset, class_end);
         let (cpp, size, how) = field_layout(&field.type_name, gap, votes);
-        let field_name = sanitize_ident(&field.name);
+        let field_name = field_names.allocate(cpp_identifier(&field.name));
         let decl = cpp_decl(&cpp, &field_name);
         writeln!(
             out,
             "    {decl}; // +0x{:X} {how} ({})",
-            field.offset, field.type_name
+            field.offset,
+            comment_text(&field.type_name)
         )
         .ok();
         cursor = field.offset + size.max(0);
@@ -124,14 +135,22 @@ fn next_gap(fields: &[&ClassField], offset: i32, class_end: i32) -> i32 {
         .saturating_sub(offset)
 }
 
-fn field_layout(type_name: &str, gap: i32, votes: &BTreeMap<String, i32>) -> (String, i32, &'static str) {
+fn field_layout(
+    type_name: &str,
+    gap: i32,
+    votes: &BTreeMap<String, i32>,
+) -> (String, i32, &'static str) {
     let key = normalize(type_name);
-    if let Some(size) = known_size(&key) {
+    if let Some(size) = known_size(key.as_ref()) {
         let size = if gap > 0 { size.min(gap) } else { size };
-        return (cpp_type(&key, size), size, "known");
+        return (cpp_type(key.as_ref(), size), size, "known");
     }
-    if let Some(&vote) = votes.get(&key) {
-        let size = if gap > 0 { vote.min(gap).max(1) } else { vote.max(1) };
+    if let Some(&vote) = votes.get(key.as_ref()) {
+        let size = if gap > 0 {
+            vote.min(gap).max(1)
+        } else {
+            vote.max(1)
+        };
         return (array_or_byte(size), size, "guessed");
     }
     let size = if gap > 0 { gap } else { 1 };
@@ -184,8 +203,8 @@ fn known_size(key: &str) -> Option<i32> {
     if key.ends_with('*') {
         return Some(8);
     }
-    if key.starts_with("bitfield:") {
-        let bits: i32 = key[9..].parse().unwrap_or(8);
+    if let Some(bits) = key.strip_prefix("bitfield:") {
+        let bits: i32 = bits.parse().unwrap_or(8);
         return Some(((bits + 7) / 8).max(1));
     }
     if key.starts_with("CHandle") || key == "CEntityHandle" {
@@ -204,27 +223,36 @@ fn known_size(key: &str) -> Option<i32> {
     })
 }
 
-fn normalize(raw: &str) -> String {
-    raw.split_whitespace().collect::<String>()
+fn normalize(raw: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = raw.trim();
+    if trimmed.bytes().any(|b| b.is_ascii_whitespace()) {
+        std::borrow::Cow::Owned(trimmed.split_whitespace().collect())
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    }
 }
 
 fn vote_unknown_sizes(schemas: &SchemaMap) -> BTreeMap<String, i32> {
     let mut samples: BTreeMap<String, BTreeMap<i32, usize>> = BTreeMap::new();
-    for (_, (classes, _)) in schemas {
+    for (classes, _) in schemas.values() {
         for class in classes {
             let mut fields: Vec<&ClassField> = class.fields.iter().collect();
             fields.sort_by_key(|f| f.offset);
             let end = class.size.max(0);
             for field in &fields {
                 let key = normalize(&field.type_name);
-                if known_size(&key).is_some() {
+                if known_size(key.as_ref()).is_some() {
                     continue;
                 }
                 let gap = next_gap(&fields, field.offset, end);
                 if gap <= 0 || gap >= 4096 {
                     continue;
                 }
-                *samples.entry(key).or_default().entry(gap).or_default() += 1;
+                *samples
+                    .entry(key.into_owned())
+                    .or_default()
+                    .entry(gap)
+                    .or_default() += 1;
             }
         }
     }
@@ -286,10 +314,7 @@ mod tests {
                 vec![class(
                     "C_Test",
                     0x18,
-                    vec![
-                        field("a", "Mystery_t", 0x0),
-                        field("b", "int32", 0x10),
-                    ],
+                    vec![field("a", "Mystery_t", 0x0), field("b", "int32", 0x10)],
                 )],
                 Vec::new(),
             ),
@@ -301,5 +326,31 @@ mod tests {
         assert!(hpp.contains("guessed"));
         assert!(hpp.contains("static_assert(sizeof(C_Test) == 0x18"));
         assert!(hpp.contains("_pad_"));
+    }
+
+    #[test]
+    fn guessed_structs_disambiguate_sanitized_class_and_field_names() {
+        let schemas = SchemaMap::from([(
+            "client.dll".into(),
+            (
+                vec![
+                    class(
+                        "C-Test",
+                        8,
+                        vec![field("", "int32", 0), field("int", "int32", 4)],
+                    ),
+                    class("C_Test", 4, vec![field("x", "int32", 0)]),
+                ],
+                Vec::new(),
+            ),
+        )]);
+        let hpp = render_hpp(&schemas, None);
+        assert!(hpp.contains("struct C_Test {"), "first sanitized name: {hpp}");
+        assert!(
+            hpp.contains("struct C_Test_2 {"),
+            "colliding class name must be allocated: {hpp}"
+        );
+        assert!(hpp.contains("anonymous"), "empty field name: {hpp}");
+        assert!(hpp.contains("_int"), "keyword field name: {hpp}");
     }
 }

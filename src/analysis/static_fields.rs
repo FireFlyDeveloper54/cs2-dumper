@@ -145,7 +145,10 @@ fn score_binding<P: MemoryView>(mem: &mut P, binding_va: u64, layout: StaticFiel
     let Some(count) = plausible_count(mem, binding_va, layout) else {
         return 0;
     };
-    let array = rd_u64(mem, binding_va + layout.array);
+    let Some(array_addr) = binding_va.checked_add(layout.array) else {
+        return 0;
+    };
+    let array = rd_u64(mem, array_addr);
     if array < 0x10000 {
         return 0;
     }
@@ -159,7 +162,8 @@ fn plausible_count<P: MemoryView>(
     binding_va: u64,
     layout: StaticFieldLayout,
 ) -> Option<i16> {
-    let count = rd_i16(mem, binding_va + layout.count);
+    let count_addr = binding_va.checked_add(layout.count)?;
+    let count = rd_i16(mem, count_addr);
     (1..=MAX_STATIC_FIELDS).contains(&count).then_some(count)
 }
 
@@ -170,21 +174,28 @@ fn read_entry<P: MemoryView>(
     index: u16,
     layout: StaticFieldLayout,
 ) -> Option<StaticField> {
-    let entry = array + layout.stride * index as u64;
+    let entry = layout
+        .stride
+        .checked_mul(index as u64)
+        .and_then(|delta| array.checked_add(delta))?;
     // A static field always has storage; a null instance means this is not one.
-    if rd_u64(mem, entry + layout.entry_instance) < 0x10000 {
+    let instance_addr = entry.checked_add(layout.entry_instance)?;
+    if rd_u64(mem, instance_addr) < 0x10000 {
         return None;
     }
-    let name_ptr = rd_u64(mem, entry + layout.entry_name);
+    let name_addr = entry.checked_add(layout.entry_name)?;
+    let name_ptr = rd_u64(mem, name_addr);
     let name = rd_cstr(mem, name_ptr);
     if !plausible_ident(&name) {
         return None;
     }
-    let type_ptr = rd_u64(mem, entry + layout.entry_type);
+    let type_addr = entry.checked_add(layout.entry_type)?;
+    let type_ptr = rd_u64(mem, type_addr);
     if type_ptr < 0x10000 {
         return None;
     }
-    let type_name_ptr = rd_u64(mem, type_ptr + TYPE_NAME);
+    let type_name_addr = type_ptr.checked_add(TYPE_NAME)?;
+    let type_name_ptr = rd_u64(mem, type_name_addr);
     let type_name = rd_cstr(mem, type_name_ptr);
     if !plausible_type_name(&type_name) {
         return None;
@@ -207,7 +218,10 @@ pub fn read_static_fields<P: MemoryView>(
     let Some(count) = plausible_count(mem, binding_va, layout) else {
         return Vec::new();
     };
-    let array = rd_u64(mem, binding_va + layout.array);
+    let Some(array_addr) = binding_va.checked_add(layout.array) else {
+        return Vec::new();
+    };
+    let array = rd_u64(mem, array_addr);
     if array < 0x10000 {
         return Vec::new();
     }
@@ -237,20 +251,15 @@ fn plausible_type_name(name: &str) -> bool {
 }
 
 fn rd_u64<P: MemoryView>(mem: &mut P, va: u64) -> u64 {
-    mem.read::<u64>(Address::from(va)).data_part().unwrap_or(0)
+    crate::analysis::read::u64_va(mem, va)
 }
 
 fn rd_i16<P: MemoryView>(mem: &mut P, va: u64) -> i16 {
-    mem.read::<i16>(Address::from(va)).data_part().unwrap_or(0)
+    crate::analysis::read::i16_va(mem, va)
 }
 
 fn rd_cstr<P: MemoryView>(mem: &mut P, ptr: u64) -> String {
-    if ptr == 0 {
-        return String::new();
-    }
-    mem.read_utf8_lossy(Address::from(ptr), 256)
-        .data_part()
-        .unwrap_or_default()
+    crate::analysis::read::cstr(mem, ptr)
 }
 
 #[cfg(test)]

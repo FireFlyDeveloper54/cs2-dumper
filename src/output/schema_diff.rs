@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Compare two schema_index.json documents and report class, field, enum, and member changes.
 pub fn render_json(previous: &str, current: &str) -> Result<String> {
@@ -91,13 +91,12 @@ fn compare_enums<'a>(
 fn changed_scalar_fields(before: &Value, after: &Value, fields: &[&str]) -> Vec<Value> {
     fields
         .iter()
-        .filter_map(|field| {
-            (before.get(*field) != after.get(*field)).then(|| {
-                json!({
-                    "field": field,
-                    "before": before.get(*field),
-                    "after": after.get(*field),
-                })
+        .filter(|field| before.get(**field) != after.get(**field))
+        .map(|field| {
+            json!({
+                "field": field,
+                "before": before.get(*field),
+                "after": after.get(*field),
             })
         })
         .collect()

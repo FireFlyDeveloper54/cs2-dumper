@@ -5,7 +5,7 @@ use serde_json::json;
 use crate::analysis::{ClassMetadata, SchemaMap};
 
 // Stable, language-neutral layout report intended for comparing CS2 updates.
-pub fn render_json(schemas: &SchemaMap) -> String {
+pub fn render_json(schemas: &SchemaMap) -> Result<String, serde_json::Error> {
     let modules: BTreeMap<_, _> = schemas
         .iter()
         .map(|(module, (classes, enums))| {
@@ -64,7 +64,6 @@ pub fn render_json(schemas: &SchemaMap) -> String {
         .collect();
 
     serde_json::to_string_pretty(&json!({ "modules": modules }))
-        .expect("schema index serialization")
 }
 
 fn metadata_json(metadata: &ClassMetadata) -> serde_json::Value {
@@ -76,5 +75,43 @@ fn metadata_json(metadata: &ClassMetadata) -> serde_json::Value {
             json!({ "type": "NetworkVarNames", "name": name, "type_name": type_name })
         }
         ClassMetadata::Unknown { name } => json!({ "type": "Unknown", "name": name }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::{Class, ClassField, SchemaMap};
+
+    #[test]
+    fn render_json_emits_class_field_offset_without_panicking() {
+        let schemas = SchemaMap::from([(
+            "client.dll".to_string(),
+            (
+                vec![Class {
+                    name: "C_TestPawn".into(),
+                    module_name: "client.dll".into(),
+                    parent_name: None,
+                    size: 0x500,
+                    alignment: 8,
+                    metadata: Vec::new(),
+                    fields: vec![ClassField {
+                        name: "m_iHealth".into(),
+                        type_name: "int32".into(),
+                        offset: 0x4A8,
+                        metadata: Vec::new(),
+                    }],
+                    static_fields: Vec::new(),
+                    flags: Vec::new(),
+                }],
+                Vec::new(),
+            ),
+        )]);
+        let raw = render_json(&schemas).expect("serialize");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(
+            json["modules"]["client.dll"]["classes"]["C_TestPawn"]["fields"]["m_iHealth"]["offset"],
+            0x4A8
+        );
     }
 }

@@ -9,111 +9,19 @@ use anyhow::Result;
 
 #[cfg(windows)]
 mod win {
-    use anyhow::{Result, bail};
+    use anyhow::Result;
     use memflow::cglue::{CTup2, CTup3};
-    use memflow::mem::mem_data::{MemOps, ReadRawMemOps, WriteRawMemOps, opt_call};
+    use memflow::mem::mem_data::{opt_call, MemOps, ReadRawMemOps, WriteRawMemOps};
     use memflow::prelude::v1::*;
 
-    const TH32CS_SNAPMODULE: u32 = 0x0000_0008;
-    const TH32CS_SNAPMODULE32: u32 = 0x0000_0010;
-    const MAX_PATH: usize = 260;
-    const MAX_MODULE_NAME32: usize = 255;
-    const PAGE: usize = 0x1000;
-
-    #[repr(C)]
-    struct ModuleEntry32W {
-        dw_size: u32,
-        th32_module_id: u32,
-        th32_process_id: u32,
-        glbl_cnt_usage: u32,
-        proc_cnt_usage: u32,
-        mod_base_addr: *mut u8,
-        mod_base_size: u32,
-        h_module: *mut core::ffi::c_void,
-        sz_module: [u16; MAX_MODULE_NAME32 + 1],
-        sz_exe_path: [u16; MAX_PATH],
-    }
-
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> *mut core::ffi::c_void;
-        fn GetCurrentProcessId() -> u32;
-        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut core::ffi::c_void;
-        #[link_name = "Module32FirstW"]
-        fn module32_first_w(snapshot: *mut core::ffi::c_void, entry: *mut ModuleEntry32W) -> i32;
-        #[link_name = "Module32NextW"]
-        fn module32_next_w(snapshot: *mut core::ffi::c_void, entry: *mut ModuleEntry32W) -> i32;
-        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
-        fn ReadProcessMemory(
-            process: *mut core::ffi::c_void,
-            base: *const core::ffi::c_void,
-            buffer: *mut core::ffi::c_void,
-            size: usize,
-            read: *mut usize,
-        ) -> i32;
-        fn GetLastError() -> u32;
-    }
-
-    fn wchar_to_string(buf: &[u16]) -> String {
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        String::from_utf16_lossy(&buf[..len])
-    }
-
-    fn invalid_handle(handle: *mut core::ffi::c_void) -> bool {
-        handle.is_null() || handle == (-1isize as *mut core::ffi::c_void)
-    }
-
-    fn enumerate_modules(pid: u32, parent: Address, arch: ArchitectureIdent) -> Result<Vec<ModuleInfo>> {
-        unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-            if invalid_handle(snap) {
-                bail!(
-                    "CreateToolhelp32Snapshot(self modules) failed ({})",
-                    GetLastError()
-                );
-            }
-            struct Close(*mut core::ffi::c_void);
-            impl Drop for Close {
-                fn drop(&mut self) {
-                    unsafe {
-                        CloseHandle(self.0);
-                    }
-                }
-            }
-            let _guard = Close(snap);
-            let mut entry = std::mem::zeroed::<ModuleEntry32W>();
-            entry.dw_size = std::mem::size_of::<ModuleEntry32W>() as u32;
-            if module32_first_w(snap, &mut entry) == 0 {
-                bail!("Module32FirstW(self) failed ({})", GetLastError());
-            }
-            let mut modules = Vec::new();
-            loop {
-                let name = wchar_to_string(&entry.sz_module);
-                let path = wchar_to_string(&entry.sz_exe_path);
-                let base = entry.mod_base_addr as umem;
-                modules.push(ModuleInfo {
-                    address: Address::from(base),
-                    parent_process: parent,
-                    base: Address::from(base),
-                    size: entry.mod_base_size as umem,
-                    name: name.into(),
-                    path: path.into(),
-                    arch,
-                });
-                if module32_next_w(snap, &mut entry) == 0 {
-                    break;
-                }
-            }
-            if modules.is_empty() {
-                bail!("no modules enumerated for self pid {pid}");
-            }
-            Ok(modules)
-        }
-    }
+    use crate::memory::snapshot::{self, ProcessSnapshot};
+    use crate::memory::win::{
+        enumerate_modules, GetCurrentProcess, GetCurrentProcessId, ReadProcessMemory, PAGE,
+    };
 
     pub struct LocalProcess {
         handle: isize,
-        info: ProcessInfo,
-        modules: Vec<ModuleInfo>,
+        snapshot: ProcessSnapshot,
     }
 
     impl LocalProcess {
@@ -122,29 +30,43 @@ mod win {
                 return true;
             }
             let mut off = 0usize;
-            let mut any = false;
+            let mut complete = true;
             while off < buf.len() {
-                let next_page = PAGE - ((addr as usize + off) % PAGE);
+                let current = match (addr as usize).checked_add(off) {
+                    Some(value) => value,
+                    None => {
+                        complete = false;
+                        buf[off..].fill(0);
+                        break;
+                    }
+                };
+                let next_page = PAGE - (current % PAGE);
                 let chunk = next_page.min(buf.len() - off);
                 let mut n = 0usize;
                 let ok = unsafe {
                     ReadProcessMemory(
                         self.handle as *mut core::ffi::c_void,
-                        (addr as usize + off) as *const core::ffi::c_void,
+                        current as *const core::ffi::c_void,
                         buf[off..off + chunk].as_mut_ptr() as *mut core::ffi::c_void,
                         chunk,
                         &mut n,
                     )
                 };
-                if ok != 0 && n > 0 {
+                let n = n.min(chunk);
+                if ok != 0 && n == chunk {
                     off += n;
-                    any = true;
                     continue;
                 }
-                buf[off..off + chunk].fill(0);
-                off += chunk;
+                complete = false;
+                let old_off = off;
+                let fill_start = (old_off + n).min(buf.len());
+                let fill_end = (old_off + chunk).min(buf.len());
+                if fill_start < fill_end {
+                    buf[fill_start..fill_end].fill(0);
+                }
+                off = old_off + chunk;
             }
-            any
+            complete
         }
     }
 
@@ -167,28 +89,12 @@ mod win {
             Ok(())
         }
 
-        fn write_raw_iter(
-            &mut self,
-            MemOps {
-                inp,
-                out: _out,
-                mut out_fail,
-            }: WriteRawMemOps,
-        ) -> memflow::error::Result<()> {
-            for CTup3(_addr, meta, data) in inp {
-                opt_call(out_fail.as_deref_mut(), CTup2(meta, data));
-            }
-            Ok(())
+        fn write_raw_iter(&mut self, ops: WriteRawMemOps) -> memflow::error::Result<()> {
+            snapshot::reject_writes(ops)
         }
 
         fn metadata(&self) -> MemoryViewMetadata {
-            MemoryViewMetadata {
-                max_address: Address::from(u64::MAX),
-                real_size: 0,
-                readonly: true,
-                little_endian: true,
-                arch_bits: 64,
-            }
+            snapshot::readonly_metadata()
         }
     }
 
@@ -206,15 +112,8 @@ mod win {
             target_arch: Option<&ArchitectureIdent>,
             callback: ModuleAddressCallback,
         ) -> memflow::error::Result<()> {
-            self.modules
-                .iter()
-                .filter(|m| target_arch.is_none() || Some(&m.arch) == target_arch)
-                .map(|m| ModuleAddressInfo {
-                    address: m.address,
-                    arch: m.arch,
-                })
-                .feed_into(callback);
-            Ok(())
+            self.snapshot
+                .module_address_list_callback(target_arch, callback)
         }
 
         fn module_by_address(
@@ -222,28 +121,15 @@ mod win {
             address: Address,
             architecture: ArchitectureIdent,
         ) -> memflow::error::Result<ModuleInfo> {
-            self.modules
-                .iter()
-                .find(|m| m.address == address && m.arch == architecture)
-                .cloned()
-                .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::ModuleNotFound))
+            self.snapshot.module_by_address(address, architecture)
         }
 
         fn module_by_name(&mut self, name: &str) -> memflow::error::Result<ModuleInfo> {
-            self.modules
-                .iter()
-                .find(|m| m.name.as_ref().eq_ignore_ascii_case(name))
-                .cloned()
-                .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::ModuleNotFound))
+            self.snapshot.module_by_name(name)
         }
 
         fn primary_module_address(&mut self) -> memflow::error::Result<Address> {
-            self.modules
-                .iter()
-                .find(|m| m.name.as_ref().eq_ignore_ascii_case(&self.info.name))
-                .or_else(|| self.modules.first())
-                .map(|m| m.address)
-                .ok_or(Error(ErrorOrigin::OsLayer, ErrorKind::ModuleNotFound))
+            self.snapshot.primary_module_address()
         }
 
         fn module_import_list_callback(
@@ -271,7 +157,7 @@ mod win {
         }
 
         fn info(&self) -> &ProcessInfo {
-            &self.info
+            self.snapshot.info()
         }
 
         fn mapped_mem_range(
@@ -281,13 +167,7 @@ mod win {
             end: Address,
             out: MemoryRangeCallback,
         ) {
-            self.modules
-                .iter()
-                .filter(|m| {
-                    m.base >= start && (end.is_null() || end == Address::INVALID || m.base < end)
-                })
-                .map(|m| CTup3(m.base, m.size, PageType::UNKNOWN))
-                .feed_into(out);
+            self.snapshot.mapped_mem_range(start, end, out);
         }
     }
 
@@ -312,19 +192,21 @@ mod win {
         );
         Ok(LocalProcess {
             handle: handle as isize,
-            info: ProcessInfo {
-                address: parent,
-                pid,
-                state: ProcessState::Alive,
-                name: exe_name.into(),
-                path: exe_path.into(),
-                command_line: "".into(),
-                sys_arch: arch,
-                proc_arch: arch,
-                dtb1: Address::INVALID,
-                dtb2: Address::INVALID,
-            },
-            modules,
+            snapshot: ProcessSnapshot::new(
+                ProcessInfo {
+                    address: parent,
+                    pid,
+                    state: ProcessState::Alive,
+                    name: exe_name.into(),
+                    path: exe_path.into(),
+                    command_line: "".into(),
+                    sys_arch: arch,
+                    proc_arch: arch,
+                    dtb1: Address::INVALID,
+                    dtb2: Address::INVALID,
+                },
+                modules,
+            ),
         })
     }
 }

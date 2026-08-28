@@ -20,10 +20,7 @@ const MAX_BUTTONS: usize = 256;
 
 pub fn buttons<P: Process + MemoryView>(process: &mut P) -> Result<ButtonMap> {
     let module = process.module_by_name("client.dll")?;
-
-    let buf = process
-        .read_raw(module.base, module.size as _)
-        .data_part()?;
+    let (_, buf) = module_data::read_image(process, "client.dll")?;
 
     let view = PeView::from_bytes(&buf)?;
 
@@ -36,7 +33,12 @@ pub fn buttons<P: Process + MemoryView>(process: &mut P) -> Result<ButtonMap> {
         bail!("outdated button list pattern");
     }
 
-    let list_head = process.read_addr64(module.base + save[1]).data_part()?;
+    let global_va = module
+        .base
+        .to_umem()
+        .checked_add(save[1] as umem)
+        .ok_or_else(|| anyhow::anyhow!("button global address overflow"))?;
+    let list_head = process.read_addr64(Address::from(global_va)).data_part()?;
 
     read_buttons(process, &module, list_head)
 }
@@ -61,7 +63,9 @@ fn read_buttons(
     let mut result = ButtonMap::new();
     let mut seen = HashSet::new();
     let module_base = module.base.to_umem();
-    let module_end = module_base.saturating_add(module.size as umem);
+    let module_end = module_base
+        .checked_add(module.size as umem)
+        .ok_or_else(|| anyhow::anyhow!("button module range overflow"))?;
     let mut button_ptr = Pointer64::<KeyButton>::from(list_head);
 
     while !button_ptr.is_null() {
@@ -75,8 +79,12 @@ fn read_buttons(
 
         let button = mem.read_ptr(button_ptr).data_part()?;
         let name = mem.read_utf8_lossy(button.name.address(), 32).data_part()?;
-        let state_addr = button_ptr.address() + offset_of!(KeyButton.state);
-        let state_va = state_addr.to_umem();
+        let state_addr = button_ptr
+            .address()
+            .to_umem()
+            .checked_add(offset_of!(KeyButton.state) as umem)
+            .ok_or_else(|| anyhow::anyhow!("button state address overflow"))?;
+        let state_va = state_addr;
 
         if is_button_name(&name) && (module_base..module_end).contains(&state_va) {
             let state_rva = state_va - module_base;
@@ -146,13 +154,22 @@ fn find_button_list_in(image: &[u8], base: u64, ranges: &[(u64, u64)]) -> Option
     let mut heads: HashSet<u64> = HashSet::new();
 
     for &(rva, size) in ranges {
-        let start = rva as usize;
+        let start = (rva as usize).min(image.len());
         let end = start.saturating_add(size as usize).min(image.len());
         let mut offset = start.next_multiple_of(8);
 
-        while offset + 8 <= end {
-            let slot = base + offset as u64;
-            let target = u64::from_le_bytes(image[offset..offset + 8].try_into().unwrap());
+        while offset
+            .checked_add(8)
+            .is_some_and(|candidate_end| candidate_end <= end)
+        {
+            let Some(slot) = base.checked_add(offset as u64) else {
+                // All later offsets are larger, so they cannot resolve once
+                // the module base itself has reached the address-space end.
+                break;
+            };
+            let Some(target) = crate::analysis::read::u64_le_at(image, offset) else {
+                break;
+            };
             offset += 8;
 
             // The nodes are statically allocated, so a head pointer lands in
@@ -199,7 +216,10 @@ fn chain_len(image: &[u8], base: u64, head: u64) -> usize {
         let Some(at) = image_offset(image, base, node) else {
             break;
         };
-        let Some(name_ptr) = image_u64(image, at + KB_NAME as usize) else {
+        let Some(name_field) = at.checked_add(KB_NAME as usize) else {
+            break;
+        };
+        let Some(name_ptr) = image_u64(image, name_field) else {
             break;
         };
         let name = image_offset(image, base, name_ptr)
@@ -209,7 +229,10 @@ fn chain_len(image: &[u8], base: u64, head: u64) -> usize {
             break;
         }
         len += 1;
-        node = image_u64(image, at + KB_NEXT as usize).unwrap_or(0);
+        let Some(next_field) = at.checked_add(KB_NEXT as usize) else {
+            break;
+        };
+        node = image_u64(image, next_field).unwrap_or(0);
     }
     len
 }
@@ -222,16 +245,14 @@ fn image_offset(image: &[u8], base: u64, va: u64) -> Option<usize> {
 }
 
 fn image_u64(image: &[u8], at: usize) -> Option<u64> {
-    image
-        .get(at..at + 8)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u64::from_le_bytes)
+    crate::analysis::read::u64_le_at(image, at)
 }
 
 /// The NUL-terminated name at `at`, or `None` when it is unterminated within a
 /// button name's length or not text.
 fn image_cstr(image: &[u8], at: usize) -> Option<&str> {
-    let window = image.get(at..(at + 32).min(image.len()))?;
+    let end = at.saturating_add(32).min(image.len());
+    let window = image.get(at..end)?;
     let end = window.iter().position(|byte| *byte == 0)?;
     std::str::from_utf8(&window[..end]).ok()
 }
@@ -431,6 +452,15 @@ mod tests {
     #[test]
     fn a_module_without_a_button_list_yields_nothing() {
         assert_eq!(FakeImage::new().find(), None);
+    }
+
+    #[test]
+    fn an_overflowing_module_base_stops_the_image_scan() {
+        let image = vec![0u8; 16];
+        assert_eq!(
+            find_button_list_in(&image, u64::MAX, &[(0, image.len() as u64)]),
+            None
+        );
     }
 
     /// A lone plausible node is what a stray pointer into `.data` looks like,

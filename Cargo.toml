@@ -1,11 +1,12 @@
 [package]
 name = "cs2-dumper"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["a2x"]
 edition = "2024"
+rust-version = "1.88"
 description = "CS2 external dumper — offsets, patterns, schemas, and a namespaced C++ include-tree SDK."
 readme = "README.md"
-repository = "https://github.com/a2x/cs2-dumper"
+repository = "https://github.com/FireFlyDeveloper54/cs2-dumper"
 license = "MIT"
 
 [workspace]
@@ -22,6 +23,7 @@ log = "0.4"
 memflow = "0.2"
 pelite = "0.10"
 phf = { version = "0.13", features = ["macros"] }
+rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 simplelog = "0.12"
@@ -35,6 +37,23 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+[features]
+default = []
+bench = []
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "hot_paths"
+harness = false
+required-features = ["bench"]
+
 [profile.release]
 lto = true
 strip = true
+
+[profile.bench]
+inherits = "release"
+lto = false
+strip = false

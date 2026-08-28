@@ -4,7 +4,7 @@ use serde_json::json;
 
 use crate::analysis::gameevents::GameEvent;
 
-pub fn render_json(events: &[GameEvent], build: Option<u32>) -> String {
+pub fn render_json(events: &[GameEvent], build: Option<u32>) -> Result<String, serde_json::Error> {
     let rows: Vec<_> = events
         .iter()
         .map(|e| {
@@ -26,5 +26,4 @@ pub fn render_json(events: &[GameEvent], build: Option<u32>) -> String {
         "event_count": events.len(),
         "events": rows,
     }))
-    .unwrap_or_else(|_| "{}".into())
 }

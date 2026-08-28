@@ -12,105 +12,59 @@
 //! `pb::RepeatedField<T>` / `pb::RepeatedPtrField<T>` — while the explicit
 //! padding + `static_assert`s keep every offset byte-exact.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::{self, Write};
+use std::sync::Arc;
 
 use crate::analysis::{ProtoField, ProtoMessage, ProtobufMap};
 
-fn module_ns(module: &str) -> String {
+use super::comment_text;
+use super::ident::{already_ascii_ident, is_cpp_keyword, IdentifierAllocator};
+
+fn module_ns(module: &str) -> Cow<'_, str> {
     sanitize(module.trim_end_matches(".dll"))
 }
 
-const CPP_KEYWORDS: &[&str] = &[
-    "alignas",
-    "alignof",
-    "and",
-    "and_eq",
-    "asm",
-    "auto",
-    "bitand",
-    "bitor",
-    "bool",
-    "break",
-    "case",
-    "catch",
-    "char",
-    "char16_t",
-    "char32_t",
-    "class",
-    "compl",
-    "const",
-    "constexpr",
-    "const_cast",
-    "continue",
-    "decltype",
-    "default",
-    "delete",
-    "do",
-    "double",
-    "dynamic_cast",
-    "else",
-    "enum",
-    "explicit",
-    "export",
-    "extern",
-    "false",
-    "float",
-    "for",
-    "friend",
-    "goto",
-    "if",
-    "inline",
-    "int",
-    "long",
-    "mutable",
-    "namespace",
-    "new",
-    "noexcept",
-    "not",
-    "not_eq",
-    "nullptr",
-    "operator",
-    "or",
-    "or_eq",
-    "private",
-    "protected",
-    "public",
-    "register",
-    "reinterpret_cast",
-    "requires",
-    "return",
-    "short",
-    "signed",
-    "sizeof",
-    "static",
-    "static_assert",
-    "static_cast",
-    "struct",
-    "switch",
-    "template",
-    "this",
-    "thread_local",
-    "throw",
-    "true",
-    "try",
-    "typedef",
-    "typeid",
-    "typename",
-    "union",
-    "unsigned",
-    "using",
-    "virtual",
-    "void",
-    "volatile",
-    "wchar_t",
-    "while",
-    "xor",
-    "xor_eq",
-];
+fn intern_ns(cache: &mut HashMap<String, Arc<str>>, module: &str) -> Arc<str> {
+    let ns = module_ns(module);
+    if let Some(existing) = cache.get(ns.as_ref()) {
+        return Arc::clone(existing);
+    }
+    let interned = Arc::from(ns.as_ref());
+    cache.insert(ns.into_owned(), Arc::clone(&interned));
+    interned
+}
 
-fn sanitize(raw: &str) -> String {
-    let mut s = String::with_capacity(raw.len());
+fn flatten_proto_name(raw: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = raw.trim_start_matches('.');
+    if trimmed.bytes().any(|b| b == b'.') {
+        std::borrow::Cow::Owned(trimmed.replace('.', "_"))
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    }
+}
+
+fn sanitize(raw: &str) -> Cow<'_, str> {
+    if already_ascii_ident(raw) {
+        if raw.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
+            let mut s = String::with_capacity(raw.len() + 1);
+            s.push('_');
+            s.push_str(raw);
+            if is_cpp_keyword(&s) {
+                s.push('_');
+            }
+            return Cow::Owned(s);
+        }
+        if is_cpp_keyword(raw) {
+            let mut s = String::with_capacity(raw.len() + 1);
+            s.push_str(raw);
+            s.push('_');
+            return Cow::Owned(s);
+        }
+        return Cow::Borrowed(raw);
+    }
+    let mut s = String::with_capacity(raw.len() + 1);
     for c in raw.chars() {
         if c.is_ascii_alphanumeric() || c == '_' {
             s.push(c);
@@ -121,45 +75,59 @@ fn sanitize(raw: &str) -> String {
     if s.is_empty() {
         s.push('_');
     }
-    if s.chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false)
-    {
+    if s.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
         s.insert(0, '_');
     }
-    if CPP_KEYWORDS.contains(&s.as_str()) {
+    if is_cpp_keyword(&s) {
         s.push('_');
     }
-    s
+    Cow::Owned(s)
 }
 
-/// `flattened message name -> module namespace`, so a field's proto type_name
-/// can be resolved to the emitted `pb::<module>::<Name>` struct.
+/// `flattened message name -> interned `pb::<module>::<Name>`` path, so a
+/// field's proto type_name is a lookup instead of a `format!` per field.
 struct Registry {
-    by_mod: BTreeMap<String, BTreeSet<String>>,
-    global: BTreeMap<String, String>,
-    maps: BTreeMap<(String, String), (String, String)>,
+    by_mod: BTreeMap<Arc<str>, BTreeMap<String, Arc<str>>>,
+    paths: BTreeMap<String, Arc<str>>,
+    maps: BTreeMap<Arc<str>, BTreeMap<String, (String, String)>>,
+    emitted_names: BTreeMap<Arc<str>, BTreeMap<String, String>>,
 }
 
 impl Registry {
     fn build(map: &ProtobufMap) -> Self {
-        let mut by_mod: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut global: BTreeMap<String, String> = BTreeMap::new();
-        let mut maps = BTreeMap::new();
+        let mut ns_cache = HashMap::new();
+        let mut by_mod: BTreeMap<Arc<str>, BTreeMap<String, Arc<str>>> = BTreeMap::new();
+        let mut paths: BTreeMap<String, Arc<str>> = BTreeMap::new();
+        let mut maps: BTreeMap<Arc<str>, BTreeMap<String, (String, String)>> = BTreeMap::new();
+        let mut emitted_names: BTreeMap<Arc<str>, BTreeMap<String, String>> = BTreeMap::new();
+        let mut allocators: HashMap<Arc<str>, IdentifierAllocator> = HashMap::new();
         for (module, msgs) in map {
-            let ns = module_ns(module);
+            let ns = intern_ns(&mut ns_cache, module);
             for m in msgs {
                 if m.size == 0 {
                     continue; // not emitted → don't resolve pointers to it
                 }
-                let flat = sanitize(&m.name);
-                by_mod.entry(ns.clone()).or_default().insert(flat.clone());
-                global.entry(flat).or_insert_with(|| ns.clone());
+                let names = emitted_names.entry(Arc::clone(&ns)).or_default();
+                if names.contains_key(&m.name) {
+                    continue;
+                }
+                let emitted = allocators
+                    .entry(Arc::clone(&ns))
+                    .or_default()
+                    .allocate(sanitize(&m.name).into_owned());
+                names.insert(m.name.clone(), emitted.clone());
+                let key = sanitize(flatten_proto_name(&m.name).as_ref()).into_owned();
+                let path = Arc::<str>::from(format!("pb::{ns}::{emitted}"));
+                by_mod
+                    .entry(Arc::clone(&ns))
+                    .or_default()
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::clone(&path));
+                paths.entry(key).or_insert(path);
             }
         }
         for (module, msgs) in map {
-            let ns = module_ns(module);
+            let ns = intern_ns(&mut ns_cache, module);
             for m in msgs {
                 if m.size == 0 {
                     continue;
@@ -168,11 +136,11 @@ impl Registry {
                     let key = m.fields.iter().find(|f| f.number == 1);
                     let value = m.fields.iter().find(|f| f.number == 2);
                     if let (Some(key), Some(value)) = (key, value) {
-                        maps.insert(
-                            (ns.clone(), sanitize(&m.name)),
+                        maps.entry(Arc::clone(&ns)).or_default().insert(
+                            sanitize(flatten_proto_name(&m.name).as_ref()).into_owned(),
                             (
-                                proto_value_type(key, &global, &ns),
-                                proto_value_type(value, &global, &ns),
+                                proto_value_type(key, &paths, ns.as_ref()),
+                                proto_value_type(value, &paths, ns.as_ref()),
                             ),
                         );
                     }
@@ -181,46 +149,57 @@ impl Registry {
         }
         Registry {
             by_mod,
-            global,
+            paths,
             maps,
+            emitted_names,
         }
     }
 
-    /// Resolve a proto type_name (`.pkg.Outer.Inner`) to `pb::<mod>::<Name>`,
-    /// preferring the referencing message's own module. `None` if unknown.
-    fn resolve(&self, type_name: &str, cur_ns: &str) -> Option<String> {
-        let flat = sanitize(&type_name.trim_start_matches('.').replace('.', "_"));
-        if self.by_mod.get(cur_ns).is_some_and(|s| s.contains(&flat)) {
-            return Some(format!("pb::{cur_ns}::{flat}"));
-        }
-        self.global.get(&flat).map(|m| format!("pb::{m}::{flat}"))
+    fn emitted_name(&self, cur_ns: &str, raw: &str) -> Option<&str> {
+        self.emitted_names
+            .get(cur_ns)
+            .and_then(|names| names.get(raw))
+            .map(String::as_str)
     }
 
-    fn map_types(&self, type_name: &str, cur_ns: &str) -> Option<(String, String)> {
-        let flat = sanitize(&type_name.trim_start_matches('.').replace('.', "_"));
+    /// Resolve a proto type_name (`.pkg.Outer.Inner`) to interned
+    /// `pb::<mod>::<Name>`, preferring the referencing message's own module.
+    fn resolve(&self, type_name: &str, cur_ns: &str) -> Option<&str> {
+        let flattened = flatten_proto_name(type_name);
+        let flat = sanitize(flattened.as_ref());
+        if let Some(path) = self.by_mod.get(cur_ns).and_then(|s| s.get(flat.as_ref())) {
+            return Some(path.as_ref());
+        }
+        self.paths.get(flat.as_ref()).map(|path| path.as_ref())
+    }
+
+    fn map_types(&self, type_name: &str, cur_ns: &str) -> Option<(&str, &str)> {
+        let flattened = flatten_proto_name(type_name);
+        let flat = sanitize(flattened.as_ref());
         self.maps
-            .get(&(cur_ns.to_string(), flat.clone()))
-            .cloned()
+            .get(cur_ns)
+            .and_then(|by_name| by_name.get(flat.as_ref()))
             .or_else(|| {
                 self.maps
-                    .iter()
-                    .find(|((_, name), _)| name == &flat)
-                    .map(|(_, types)| types.clone())
+                    .values()
+                    .find_map(|by_name| by_name.get(flat.as_ref()))
             })
+            .map(|(key, value)| (key.as_str(), value.as_str()))
     }
 }
 
-fn proto_value_type(f: &ProtoField, global: &BTreeMap<String, String>, cur_ns: &str) -> String {
+fn proto_value_type(f: &ProtoField, paths: &BTreeMap<String, Arc<str>>, cur_ns: &str) -> String {
     if let Some((ty, _)) = scalar(f) {
         return ty.to_string();
     }
     match f.ty {
         9 | 12 => "pb::string_t".to_string(),
         10 | 11 => {
-            let flat = sanitize(&f.type_name.trim_start_matches('.').replace('.', "_"));
-            global
-                .get(&flat)
-                .map(|ns| format!("pb::{ns}::{flat}*"))
+            let flattened = flatten_proto_name(&f.type_name);
+            let flat = sanitize(flattened.as_ref());
+            paths
+                .get(flat.as_ref())
+                .map(|path| format!("{path}*"))
                 .unwrap_or_else(|| format!("void* /* {cur_ns} */"))
         }
         _ => "uint8_t".to_string(),
@@ -247,116 +226,174 @@ fn scalar(f: &ProtoField) -> Option<(&'static str, u32)> {
 
 /// Element C++ type for a repeated field's `RepeatedField`/`RepeatedPtrField`.
 /// Returns (type, uses_ptr_field) — message/string use RepeatedPtrField.
-fn repeated_elem(f: &ProtoField, reg: &Registry, cur_ns: &str) -> (String, bool) {
+fn repeated_elem<'a>(f: &ProtoField, reg: &'a Registry, cur_ns: &'a str) -> (Cow<'a, str>, bool) {
     match f.ty {
-        1 => ("double".into(), false),
-        2 => ("float".into(), false),
-        3 | 16 | 18 => ("int64_t".into(), false),
-        4 | 6 => ("uint64_t".into(), false),
-        5 | 15 | 17 => ("int32_t".into(), false),
-        7 | 13 => ("uint32_t".into(), false),
-        8 => ("bool".into(), false),
-        14 => ("int32_t".into(), false),         // enum
-        9 | 12 => ("pb::string_t".into(), true), // string/bytes
+        1 => (Cow::Borrowed("double"), false),
+        2 => (Cow::Borrowed("float"), false),
+        3 | 16 | 18 => (Cow::Borrowed("int64_t"), false),
+        4 | 6 => (Cow::Borrowed("uint64_t"), false),
+        5 | 15 | 17 => (Cow::Borrowed("int32_t"), false),
+        7 | 13 => (Cow::Borrowed("uint32_t"), false),
+        8 => (Cow::Borrowed("bool"), false),
+        14 => (Cow::Borrowed("int32_t"), false),
+        9 | 12 => (Cow::Borrowed("pb::string_t"), true),
         10 | 11 => (
-            reg.resolve(&f.type_name, cur_ns)
-                .unwrap_or_else(|| "void".into()),
+            Cow::Borrowed(reg.resolve(&f.type_name, cur_ns).unwrap_or("void")),
             true,
         ),
-        _ => ("void".into(), true),
+        _ => (Cow::Borrowed("void"), true),
+    }
+}
+
+enum MemberTy<'a> {
+    Scalar(&'static str),
+    PathPtr(&'a str),
+    Repeated { ptr: bool, elem: Cow<'a, str> },
+    Map { key: &'a str, value: &'a str },
+}
+
+impl fmt::Display for MemberTy<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scalar(ty) => f.write_str(ty),
+            Self::PathPtr(path) => {
+                f.write_str(path)?;
+                f.write_str("*")
+            }
+            Self::Repeated { ptr, elem } => {
+                f.write_str(if *ptr {
+                    "pb::RepeatedPtrField<"
+                } else {
+                    "pb::RepeatedField<"
+                })?;
+                f.write_str(elem)?;
+                f.write_str(">")
+            }
+            Self::Map { key, value } => {
+                f.write_str("pb::MapField<")?;
+                f.write_str(key)?;
+                f.write_str(", ")?;
+                f.write_str(value)?;
+                f.write_str(">")
+            }
+        }
+    }
+}
+
+struct ProtoTy<'a> {
+    repeated: bool,
+    base: &'static str,
+    type_name: &'a str,
+}
+
+impl std::fmt::Display for ProtoTy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.repeated {
+            f.write_str("repeated ")?;
+        }
+        f.write_str(self.base)?;
+        if !self.type_name.is_empty() {
+            write!(
+                f,
+                " {}",
+                comment_text(self.type_name.trim_start_matches('.'))
+            )?;
+        }
+        Ok(())
     }
 }
 
 /// Human-readable proto type for the trailing comment.
-fn proto_ty(f: &ProtoField) -> String {
-    let base = match f.ty {
-        1 => "double",
-        2 => "float",
-        3 => "int64",
-        4 => "uint64",
-        5 => "int32",
-        6 => "fixed64",
-        7 => "fixed32",
-        8 => "bool",
-        9 => "string",
-        10 => "group",
-        11 => "message",
-        12 => "bytes",
-        13 => "uint32",
-        14 => "enum",
-        15 => "sfixed32",
-        16 => "sfixed64",
-        17 => "sint32",
-        18 => "sint64",
-        _ => "?",
-    };
-    let rep = if f.label == 3 { "repeated " } else { "" };
-    let tn = if f.type_name.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", f.type_name.trim_start_matches('.'))
-    };
-    format!("{rep}{base}{tn}")
+fn proto_ty(f: &ProtoField) -> ProtoTy<'_> {
+    ProtoTy {
+        repeated: f.label == 3,
+        base: match f.ty {
+            1 => "double",
+            2 => "float",
+            3 => "int64",
+            4 => "uint64",
+            5 => "int32",
+            6 => "fixed64",
+            7 => "fixed32",
+            8 => "bool",
+            9 => "string",
+            10 => "group",
+            11 => "message",
+            12 => "bytes",
+            13 => "uint32",
+            14 => "enum",
+            15 => "sfixed32",
+            16 => "sfixed64",
+            17 => "sint32",
+            18 => "sint64",
+            _ => "?",
+        },
+        type_name: f.type_name.as_str(),
+    }
 }
 
 /// The C++ member declaration (type only, no name) and its byte size for a
 /// field, given the slot available before the next field. `None` → emit a raw
 /// byte slot (slot too small for the natural type).
-fn member_type(f: &ProtoField, reg: &Registry, cur_ns: &str, slot: u32) -> Option<(String, u32)> {
+fn member_type<'a>(
+    f: &ProtoField,
+    reg: &'a Registry,
+    cur_ns: &'a str,
+    slot: u32,
+) -> Option<(MemberTy<'a>, u32)> {
     if f.label == 3 {
         // repeated: RepeatedField<T> (scalar) / RepeatedPtrField<T> (msg/string), 0x18.
         if slot >= 0x18 {
             if f.is_map {
                 let (key, value) = reg
                     .map_types(&f.type_name, cur_ns)
-                    .unwrap_or_else(|| ("void".into(), "void".into()));
-                return Some((format!("pb::MapField<{key}, {value}>"), 0x18));
+                    .unwrap_or(("void", "void"));
+                return Some((MemberTy::Map { key, value }, 0x18));
             }
             let (elem, ptr) = repeated_elem(f, reg, cur_ns);
-            let cont = if ptr {
-                "RepeatedPtrField"
-            } else {
-                "RepeatedField"
-            };
-            return Some((format!("pb::{cont}<{elem}>"), 0x18));
+            return Some((MemberTy::Repeated { ptr, elem }, 0x18));
         }
         return None;
     }
     if let Some((ty, sz)) = scalar(f) {
-        return (sz <= slot).then(|| (ty.to_string(), sz));
+        return (sz <= slot).then_some((MemberTy::Scalar(ty), sz));
     }
     match f.ty {
-        9 | 12 => (slot >= 8).then(|| ("pb::string_t*".to_string(), 8)), // string/bytes
-        10 | 11 => (slot >= 8).then(|| {
-            let t = reg
-                .resolve(&f.type_name, cur_ns)
-                .unwrap_or_else(|| "void".into());
-            (format!("{t}*"), 8)
+        9 | 12 => (slot >= 8).then_some((MemberTy::Scalar("pb::string_t*"), 8)),
+        10 | 11 => (slot >= 8).then(|| match reg.resolve(&f.type_name, cur_ns) {
+            Some(path) => (MemberTy::PathPtr(path), 8),
+            None => (MemberTy::Scalar("void*"), 8),
         }),
         _ => None,
     }
 }
 
-fn struct_block(m: &ProtoMessage, cur_ns: &str, reg: &Registry) -> String {
-    let name = sanitize(&m.name);
+fn struct_block(m: &ProtoMessage, name: &str, cur_ns: &str, reg: &Registry) -> String {
     let size = m.size;
     let mut s = String::new();
-
-    let hb = m
-        .has_bits_offset
-        .map(|o| format!("_has_bits_ @ {o:#x}"))
-        .unwrap_or_else(|| "no _has_bits_".to_string());
 
     // Fields in memory order; drop ones at/after object end. Oneof members
     // intentionally remain grouped so the generated C++ preserves the union
     // semantics instead of silently keeping only the first field.
     let mut fields: Vec<&ProtoField> = m.fields.iter().filter(|f| f.offset < size).collect();
-    fields.sort_by_key(|f| f.offset);
+    if !fields
+        .windows(2)
+        .all(|pair| pair[0].offset <= pair[1].offset)
+    {
+        fields.sort_by_key(|f| f.offset);
+    }
 
     writeln!(s, "#pragma pack(push, 1)").ok();
-    writeln!(s, "struct {name} {{ // sizeof {size:#x}, {hb}").ok();
+    match m.has_bits_offset {
+        Some(o) => writeln!(
+            s,
+            "struct {name} {{ // sizeof {size:#x}, _has_bits_ @ {o:#x}"
+        )
+        .ok(),
+        None => writeln!(s, "struct {name} {{ // sizeof {size:#x}, no _has_bits_").ok(),
+    };
 
-    let mut asserts: Vec<String> = Vec::new();
+    let mut asserts = String::new();
 
     if fields.is_empty() {
         if size > 0 {
@@ -364,6 +401,7 @@ fn struct_block(m: &ProtoMessage, cur_ns: &str, reg: &Registry) -> String {
         }
     } else {
         let mut cursor: u32 = 0;
+        let mut field_names = IdentifierAllocator::default();
         for (i, f) in fields.iter().enumerate() {
             let off = f.offset;
             if off < cursor {
@@ -399,7 +437,7 @@ fn struct_block(m: &ProtoMessage, cur_ns: &str, reg: &Registry) -> String {
             if group_end > i + 1 {
                 writeln!(s, "    union {{").ok();
                 for member in &fields[i..group_end] {
-                    let fname = sanitize(&member.name);
+                    let fname = field_names.allocate(sanitize(&member.name).into_owned());
                     if let Some((ty, _)) = member_type(member, reg, cur_ns, slot) {
                         writeln!(s, "        {ty} {fname}; // #{}", member.number).ok();
                     } else {
@@ -416,39 +454,52 @@ fn struct_block(m: &ProtoMessage, cur_ns: &str, reg: &Registry) -> String {
                 continue;
             }
 
-            let fname = sanitize(&f.name);
-            let hbit = f
-                .has_bit
-                .map(|b| format!("has-bit {b}"))
-                .unwrap_or_else(|| "no has-bit".to_string());
+            let fname = field_names.allocate(sanitize(&f.name).into_owned());
             match member_type(f, reg, cur_ns, slot) {
                 Some((ty, sz)) => {
-                    writeln!(
-                        s,
-                        "    {ty} {fname}; // #{} {}, {}",
-                        f.number,
-                        proto_ty(f),
-                        hbit
-                    )
-                    .ok();
+                    match f.has_bit {
+                        Some(b) => writeln!(
+                            s,
+                            "    {ty} {fname}; // #{} {}, has-bit {b}",
+                            f.number,
+                            proto_ty(f),
+                        )
+                        .ok(),
+                        None => writeln!(
+                            s,
+                            "    {ty} {fname}; // #{} {}, no has-bit",
+                            f.number,
+                            proto_ty(f),
+                        )
+                        .ok(),
+                    };
                     if slot > sz {
                         writeln!(s, "    uint8_t _pad_{:x}[{:#x}];", off + sz, slot - sz).ok();
                     }
                 }
                 None => {
-                    writeln!(
-                        s,
-                        "    uint8_t {fname}[{slot:#x}]; // #{} {}, {}",
-                        f.number,
-                        proto_ty(f),
-                        hbit
-                    )
-                    .ok();
+                    match f.has_bit {
+                        Some(b) => writeln!(
+                            s,
+                            "    uint8_t {fname}[{slot:#x}]; // #{} {}, has-bit {b}",
+                            f.number,
+                            proto_ty(f),
+                        )
+                        .ok(),
+                        None => writeln!(
+                            s,
+                            "    uint8_t {fname}[{slot:#x}]; // #{} {}, no has-bit",
+                            f.number,
+                            proto_ty(f),
+                        )
+                        .ok(),
+                    };
                 }
             }
-            asserts.push(format!(
+            let _ = writeln!(
+                asserts,
                 "static_assert(offsetof({name}, {fname}) == {off:#x});"
-            ));
+            );
             cursor = off + slot;
         }
         if cursor < size {
@@ -467,9 +518,7 @@ fn struct_block(m: &ProtoMessage, cur_ns: &str, reg: &Registry) -> String {
     writeln!(s, "}};").ok();
     writeln!(s, "#pragma pack(pop)").ok();
     writeln!(s, "static_assert(sizeof({name}) == {size:#x});").ok();
-    for a in asserts {
-        writeln!(s, "{a}").ok();
-    }
+    s.push_str(&asserts);
     s.push('\n');
     s
 }
@@ -516,11 +565,10 @@ pub fn render_hpp(map: &ProtobufMap, build_number: Option<u32>) -> String {
         let mut seen = BTreeSet::new();
         let mut fwd = String::new();
         for m in messages {
-            if m.size == 0 {
+            if m.size == 0 || !seen.insert(m.name.as_str()) {
                 continue;
             }
-            let n = sanitize(&m.name);
-            if seen.insert(n.clone()) {
+            if let Some(n) = reg.emitted_name(ns.as_ref(), &m.name) {
                 writeln!(fwd, "    struct {n};").ok();
             }
         }
@@ -539,65 +587,121 @@ pub fn render_hpp(map: &ProtobufMap, build_number: Option<u32>) -> String {
         writeln!(s, "namespace pb::{} {{", ns).ok();
         let mut seen = BTreeSet::new();
         for m in messages {
-            if m.size == 0 || !seen.insert(sanitize(&m.name)) {
+            if m.size == 0 || !seen.insert(m.name.as_str()) {
                 continue;
             }
-            s.push_str(&struct_block(m, &ns, &reg));
+            if let Some(name) = reg.emitted_name(ns.as_ref(), &m.name) {
+                s.push_str(&struct_block(m, name, &ns, &reg));
+            }
         }
         writeln!(s, "}} // namespace pb::{}\n", ns).ok();
     }
     s
 }
 
-pub fn render_json(map: &ProtobufMap) -> String {
-    let mut s = String::new();
-    s.push_str("{\n");
-    let modules: Vec<_> = map.iter().filter(|(_, m)| !m.is_empty()).collect();
-    for (mi, (module, messages)) in modules.iter().enumerate() {
-        writeln!(s, "  \"{}\": {{", module).ok();
-        for (msgi, m) in messages.iter().enumerate() {
-            writeln!(s, "    \"{}\": {{", m.name).ok();
-            writeln!(s, "      \"size\": {},", m.size).ok();
-            writeln!(s, "      \"map_entry\": {},", m.map_entry).ok();
-            writeln!(
-                s,
-                "      \"has_bits_offset\": {},",
-                m.has_bits_offset.map(|o| o as i64).unwrap_or(-1)
-            )
-            .ok();
-            s.push_str("      \"fields\": {\n");
-            for (fi, f) in m.fields.iter().enumerate() {
-                let comma = if fi + 1 < m.fields.len() { "," } else { "" };
-                writeln!(
-                    s,
-                    "        \"{}\": {{ \"offset\": {}, \"number\": {}, \"has_bit\": {}, \"type\": {}, \"label\": {}, \"oneof\": {}, \"is_map\": {} }}{}",
-                    f.name,
-                    f.offset,
-                    f.number,
-                    f.has_bit.map(|b| b as i64).unwrap_or(-1),
-                    f.ty,
-                    f.label,
-                    serde_json::to_string(&f.oneof).unwrap_or_else(|_| "null".to_string()),
-                    f.is_map,
-                    comma,
-                )
-                .ok();
-            }
-            s.push_str("      }\n");
-            let comma = if msgi + 1 < messages.len() { "," } else { "" };
-            writeln!(s, "    }}{}", comma).ok();
+pub fn render_json(map: &ProtobufMap) -> Result<String, serde_json::Error> {
+    let mut root = serde_json::Map::new();
+    for (module, messages) in map {
+        if messages.is_empty() {
+            continue;
         }
-        let comma = if mi + 1 < modules.len() { "," } else { "" };
-        writeln!(s, "  }}{}", comma).ok();
+        let mut msgs = serde_json::Map::new();
+        for m in messages {
+            let mut fields = serde_json::Map::new();
+            for f in &m.fields {
+                fields.insert(
+                    f.name.clone(),
+                    serde_json::json!({
+                        "offset": f.offset,
+                        "number": f.number,
+                        "has_bit": f.has_bit.map(|b| b as i64).unwrap_or(-1),
+                        "type": f.ty,
+                        "label": f.label,
+                        "oneof": f.oneof,
+                        "is_map": f.is_map,
+                    }),
+                );
+            }
+            msgs.insert(
+                m.name.clone(),
+                serde_json::json!({
+                    "size": m.size,
+                    "map_entry": m.map_entry,
+                    "has_bits_offset": m.has_bits_offset.map(|o| o as i64).unwrap_or(-1),
+                    "fields": fields,
+                }),
+            );
+        }
+        root.insert(module.clone(), serde_json::Value::Object(msgs));
     }
-    s.push_str("}\n");
-    s
+    serde_json::to_string_pretty(&serde_json::Value::Object(root))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{render_hpp, render_json};
+    use super::{render_hpp, render_json, sanitize};
     use crate::analysis::{ProtoField, ProtoMessage, ProtobufMap};
+
+    #[test]
+    fn sanitizer_uses_current_cpp_keywords() {
+        assert_eq!(sanitize("consteval").as_ref(), "consteval_");
+        assert_eq!(sanitize("char8_t").as_ref(), "char8_t_");
+        assert_eq!(sanitize("co_await").as_ref(), "co_await_");
+        assert_eq!(sanitize("message-name").as_ref(), "message_name");
+    }
+
+    #[test]
+    fn hpp_disambiguates_message_and_field_name_collisions() {
+        let mut map = ProtobufMap::new();
+        map.insert(
+            "client.dll".into(),
+            vec![
+                ProtoMessage {
+                    name: "message-name".into(),
+                    size: 0x10,
+                    has_bits_offset: None,
+                    map_entry: false,
+                    fields: Vec::new(),
+                },
+                ProtoMessage {
+                    name: "message_name".into(),
+                    size: 0x18,
+                    has_bits_offset: None,
+                    map_entry: false,
+                    fields: vec![
+                        ProtoField {
+                            name: "field-name".into(),
+                            number: 1,
+                            offset: 0x10,
+                            has_bit: None,
+                            label: 1,
+                            ty: 5,
+                            type_name: "Injected\n#define TYPE_INJECTED 1".into(),
+                            is_map: false,
+                            oneof: None,
+                        },
+                        ProtoField {
+                            name: "field_name".into(),
+                            number: 2,
+                            offset: 0x14,
+                            has_bit: None,
+                            label: 1,
+                            ty: 5,
+                            type_name: String::new(),
+                            is_map: false,
+                            oneof: None,
+                        },
+                    ],
+                },
+            ],
+        );
+        let hpp = render_hpp(&map, None);
+        assert!(hpp.contains("struct message_name;"), "{hpp}");
+        assert!(hpp.contains("struct message_name_2;"), "{hpp}");
+        assert!(hpp.contains("int32_t field_name;"), "{hpp}");
+        assert!(hpp.contains("int32_t field_name_2;"), "{hpp}");
+        assert!(!hpp.contains("\n#define"), "type text escaped a comment: {hpp}");
+    }
 
     #[test]
     fn preserves_oneof_members_as_union_and_json_metadata() {
@@ -639,7 +743,7 @@ mod tests {
         assert!(hpp.contains("union {"));
         assert!(hpp.contains("int32_t as_int"));
         assert!(hpp.contains("float as_float"));
-        let json = render_json(&map);
+        let json = render_json(&map).expect("serialize");
         assert!(json.contains("\"oneof\": \"value\""));
     }
 
@@ -700,8 +804,45 @@ mod tests {
         );
         let hpp = render_hpp(&map, None);
         assert!(hpp.contains("MapField<pb::string_t, int32_t>"));
-        let json = render_json(&map);
+        let json = render_json(&map).expect("serialize");
         assert!(json.contains("\"map_entry\": true"));
         assert!(json.contains("\"is_map\": true"));
+    }
+
+    #[test]
+    fn message_pointer_uses_interned_pb_path() {
+        let mut map = ProtobufMap::new();
+        map.insert(
+            "client.dll".into(),
+            vec![
+                ProtoMessage {
+                    name: "Child".into(),
+                    size: 0x10,
+                    has_bits_offset: None,
+                    map_entry: false,
+                    fields: vec![],
+                },
+                ProtoMessage {
+                    name: "Parent".into(),
+                    size: 0x18,
+                    has_bits_offset: None,
+                    map_entry: false,
+                    fields: vec![ProtoField {
+                        name: "child".into(),
+                        number: 1,
+                        offset: 0x10,
+                        has_bit: None,
+                        label: 1,
+                        ty: 11,
+                        type_name: ".Child".into(),
+                        is_map: false,
+                        oneof: None,
+                    }],
+                },
+            ],
+        );
+        let hpp = render_hpp(&map, None);
+        assert!(hpp.contains("pb::client::Child* child"));
+        assert!(hpp.contains("struct Child"));
     }
 }

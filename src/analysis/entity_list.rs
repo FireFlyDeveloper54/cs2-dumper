@@ -148,20 +148,40 @@ pub fn live_entities<P: MemoryView>(
         let chunk_index = slot >> 9;
         if chunk_index != cached_chunk_index {
             cached_chunk_index = chunk_index;
-            cached_chunk = rd_u64(
-                process,
-                list + layout.chunk_array_base + layout.chunk_ptr_stride * chunk_index as u64,
-            );
+            let Some(chunk_slot) = list
+                .checked_add(layout.chunk_array_base)
+                .and_then(|value| {
+                    layout
+                        .chunk_ptr_stride
+                        .checked_mul(chunk_index as u64)
+                        .and_then(|stride| value.checked_add(stride))
+                })
+            else {
+                continue;
+            };
+            cached_chunk = rd_u64(process, chunk_slot);
         }
         if cached_chunk == 0 {
             continue;
         }
-        let ident = cached_chunk + layout.chunk_entry_stride * (slot & SLOT_INDEX_MASK) as u64;
-        let instance = rd_u64(process, ident + layout.identity_instance);
+        let Some(ident) = layout
+            .chunk_entry_stride
+            .checked_mul((slot & SLOT_INDEX_MASK) as u64)
+            .and_then(|stride| cached_chunk.checked_add(stride))
+        else {
+            continue;
+        };
+        let Some(instance_addr) = ident.checked_add(layout.identity_instance) else {
+            continue;
+        };
+        let instance = rd_u64(process, instance_addr);
         if instance == 0 {
             continue;
         }
-        let name_ptr = rd_u64(process, ident + layout.identity_designer_name);
+        let Some(name_addr) = ident.checked_add(layout.identity_designer_name) else {
+            continue;
+        };
+        let name_ptr = rd_u64(process, name_addr);
         let classname = rd_cstr(process, name_ptr);
         if classname.is_empty() {
             continue;
@@ -184,22 +204,45 @@ fn score_layout<P: MemoryView>(process: &mut P, list: u64, layout: EntityListLay
     // candidate whose base is one slot too early still sees the whole array
     // (it just starts with a junk slot) and ties with the correct layout,
     // which the first-wins tie-break would then resolve the wrong way.
-    if rd_u64(process, list + layout.chunk_array_base) < 0x10000 {
+    let Some(first_chunk_slot) = list.checked_add(layout.chunk_array_base) else {
+        return 0;
+    };
+    if rd_u64(process, first_chunk_slot) < 0x10000 {
         return 0;
     }
     let mut score = 0;
     for chunk_index in 0..8u64 {
-        let chunk = rd_u64(
-            process,
-            list + layout.chunk_array_base + layout.chunk_ptr_stride * chunk_index,
-        );
+        let Some(chunk_slot) = list
+            .checked_add(layout.chunk_array_base)
+            .and_then(|value| {
+                layout
+                    .chunk_ptr_stride
+                    .checked_mul(chunk_index)
+                    .and_then(|stride| value.checked_add(stride))
+            })
+        else {
+            break;
+        };
+        let chunk = rd_u64(process, chunk_slot);
         if chunk < 0x10000 {
             continue;
         }
         for slot in 0..32u64 {
-            let ident = chunk + layout.chunk_entry_stride * slot;
-            let inst = rd_u64(process, ident + layout.identity_instance);
-            let name_ptr = rd_u64(process, ident + layout.identity_designer_name);
+            let Some(ident) = layout
+                .chunk_entry_stride
+                .checked_mul(slot)
+                .and_then(|stride| chunk.checked_add(stride))
+            else {
+                continue;
+            };
+            let Some(inst_addr) = ident.checked_add(layout.identity_instance) else {
+                continue;
+            };
+            let Some(name_addr) = ident.checked_add(layout.identity_designer_name) else {
+                continue;
+            };
+            let inst = rd_u64(process, inst_addr);
+            let name_ptr = rd_u64(process, name_addr);
             if inst >= 0x10000 && plausible_name(&rd_cstr(process, name_ptr)) {
                 score += 1;
                 if score >= 16 {
@@ -220,20 +263,11 @@ pub fn plausible_name(name: &str) -> bool {
 }
 
 fn rd_u64<P: MemoryView>(process: &mut P, va: u64) -> u64 {
-    process
-        .read::<u64>(Address::from(va))
-        .data_part()
-        .unwrap_or(0)
+    crate::analysis::read::u64_va(process, va)
 }
 
 fn rd_cstr<P: MemoryView>(process: &mut P, ptr: u64) -> String {
-    if ptr == 0 {
-        return String::new();
-    }
-    process
-        .read_utf8_lossy(Address::from(ptr), 128)
-        .data_part()
-        .unwrap_or_default()
+    crate::analysis::read::cstr(process, ptr)
 }
 
 /// Test-only builders for a `CGameEntitySystem`-shaped list. Shared so the
@@ -307,7 +341,7 @@ pub mod fixture {
         /// Publish the list through a global pointer, the way a walk finds it.
         pub fn global(&self, mem: &mut FakeMemory) -> u64 {
             let global = mem.alloc(0x8);
-            mem.put_ptr(global, self.list);
+            mem.put_ptr(global, self.list());
             global
         }
     }

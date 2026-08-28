@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 use memflow::prelude::v1::*;
 use serde::Serialize;
 
-use crate::analysis::{SchemaMap, entity_list, field_offset};
+use crate::analysis::{SchemaMap, class_index, entity_list, field_offset_in};
 
 #[derive(Debug, Serialize)]
 pub struct EntitySnapshotEntry {
@@ -38,11 +38,12 @@ pub fn walk<P: MemoryView>(
     }
     let layout = entity_list::detect_layout(process, list);
 
-    let off_scene_node = field_offset(schemas, "C_BaseEntity", "m_pGameSceneNode");
-    let off_max_health = field_offset(schemas, "C_BaseEntity", "m_iMaxHealth");
-    let off_health = field_offset(schemas, "C_BaseEntity", "m_iHealth");
-    let off_team = field_offset(schemas, "C_BaseEntity", "m_iTeamNum");
-    let off_origin = field_offset(schemas, "CGameSceneNode", "m_vecAbsOrigin");
+    let classes = class_index(schemas);
+    let off_scene_node = field_offset_in(&classes, "C_BaseEntity", "m_pGameSceneNode");
+    let off_max_health = field_offset_in(&classes, "C_BaseEntity", "m_iMaxHealth");
+    let off_health = field_offset_in(&classes, "C_BaseEntity", "m_iHealth");
+    let off_team = field_offset_in(&classes, "C_BaseEntity", "m_iTeamNum");
+    let off_origin = field_offset_in(&classes, "CGameSceneNode", "m_vecAbsOrigin");
     let mut out = Vec::new();
     for entity in entity_list::live_entities(process, list, layout) {
         let inst = entity.instance;
@@ -50,33 +51,33 @@ pub fn walk<P: MemoryView>(
         // Universal C_BaseEntity fields — sanity-gated so logic/non-spatial
         // entities that don't actually have these don't emit garbage.
         let health = off_health.and_then(|off| {
-            let value = rd_i32(process, inst + off);
+            let value = rd_i32(process, inst.checked_add(off)?);
             (-16384..=1_000_000).contains(&value).then_some(value)
         });
         let max_health = off_max_health.and_then(|off| {
-            let value = rd_i32(process, inst + off);
+            let value = rd_i32(process, inst.checked_add(off)?);
             (0..=1_000_000).contains(&value).then_some(value)
         });
         let team = off_team.and_then(|off| {
-            let value = rd_u8(process, inst + off);
+            let value = rd_u8(process, inst.checked_add(off)?);
             (value <= 4).then_some(value)
         });
 
         let scene = off_scene_node
-            .map(|off| rd_u64(process, inst + off))
+            .and_then(|off| inst.checked_add(off))
+            .map(|va| rd_u64(process, va))
             .unwrap_or(0);
-        let origin = if scene > 0x10000 {
-            let base = off_origin.unwrap_or(0);
-            let o = [
-                rd_f32(process, scene + base),
-                rd_f32(process, scene + base + 4),
-                rd_f32(process, scene + base + 8),
-            ];
-            let ok = o.iter().all(|c| c.is_finite() && c.abs() < 1_048_576.0);
-            ok.then_some(o)
-        } else {
-            None
-        };
+        let origin = (scene > 0x10000)
+            .then(|| {
+                let base = off_origin?;
+                let x = scene.checked_add(base)?;
+                let y = x.checked_add(4)?;
+                let z = x.checked_add(8)?;
+                let o = [rd_f32(process, x), rd_f32(process, y), rd_f32(process, z)];
+                let ok = o.iter().all(|c| c.is_finite() && c.abs() < 1_048_576.0);
+                ok.then_some(o)
+            })
+            .flatten();
 
         out.push(EntitySnapshotEntry {
             index: entity.index,
@@ -92,37 +93,16 @@ pub fn walk<P: MemoryView>(
 }
 
 fn rd_u64<P: MemoryView>(process: &mut P, va: u64) -> u64 {
-    process
-        .read::<u64>(Address::from(va))
-        .data_part()
-        .unwrap_or(0)
+    crate::analysis::read::u64_va(process, va)
 }
 fn rd_i32<P: MemoryView>(process: &mut P, va: u64) -> i32 {
-    process
-        .read::<i32>(Address::from(va))
-        .data_part()
-        .unwrap_or(i32::MIN)
+    crate::analysis::read::or(process, va, i32::MIN)
 }
 fn rd_u8<P: MemoryView>(process: &mut P, va: u64) -> u8 {
-    process
-        .read::<u8>(Address::from(va))
-        .data_part()
-        .unwrap_or(0xFF)
+    crate::analysis::read::or(process, va, 0xFF)
 }
 fn rd_f32<P: MemoryView>(process: &mut P, va: u64) -> f32 {
-    process
-        .read::<f32>(Address::from(va))
-        .data_part()
-        .unwrap_or(f32::NAN)
-}
-fn rd_cstr<P: MemoryView>(process: &mut P, ptr: u64) -> String {
-    if ptr == 0 {
-        return String::new();
-    }
-    process
-        .read_utf8_lossy(Address::from(ptr), 64)
-        .data_part()
-        .unwrap_or_default()
+    crate::analysis::read::or(process, va, f32::NAN)
 }
 
 #[cfg(test)]
@@ -150,7 +130,7 @@ mod tests {
     fn class(name: &str, fields: Vec<ClassField>) -> Class {
         Class {
             name: name.to_string(),
-            module_name: "client.dll".to_string(),
+            module_name: "client.dll".into(),
             parent_name: None,
             size: 0x1000,
             alignment: 8,
@@ -299,6 +279,29 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].classname, "weapon_ak47");
         assert_eq!(found[0].health, None);
+        assert_eq!(found[0].origin, None);
+    }
+
+    #[test]
+    fn a_scene_without_an_origin_schema_field_does_not_emit_fake_coordinates() {
+        let mut mem = FakeMemory::new();
+        let mut list = ListBuilder::new(&mut mem);
+        let entity = list.place(&mut mem, 5, "prop_dynamic");
+        attach_scene_node(&mut mem, entity, [12.0, 34.0, 56.0]);
+        let global = list.global(&mut mem);
+
+        let schemas = SchemaMap::from([(
+            "client.dll".to_string(),
+            (
+                vec![class(
+                    "C_BaseEntity",
+                    vec![field("m_pGameSceneNode", OFF_SCENE_NODE)],
+                )],
+                Vec::new(),
+            ),
+        )]);
+        let found = walk(&mut mem, global, &schemas).expect("walk");
+        assert_eq!(found.len(), 1);
         assert_eq!(found[0].origin, None);
     }
 }

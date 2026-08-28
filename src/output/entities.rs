@@ -6,7 +6,10 @@ use serde_json::json;
 
 use crate::analysis::entities::EntitySnapshotEntry;
 
-pub fn render_json(entities: &[EntitySnapshotEntry], build: Option<u32>) -> String {
+pub fn render_json(
+    entities: &[EntitySnapshotEntry],
+    build: Option<u32>,
+) -> Result<String, serde_json::Error> {
     // Per-classname counts — "what's in the world", most-common first.
     let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
     for e in entities {
@@ -29,7 +32,6 @@ pub fn render_json(entities: &[EntitySnapshotEntry], build: Option<u32>) -> Stri
         "by_class": by_class_json,
         "entities": entities,
     }))
-    .unwrap_or_else(|_| "{}".into())
 }
 
 #[cfg(test)]
@@ -38,7 +40,8 @@ mod tests {
 
     #[test]
     fn reports_full_entity_handle_space() {
-        let report: serde_json::Value = serde_json::from_str(&render_json(&[], None)).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&render_json(&[], None).expect("serialize")).unwrap();
         assert_eq!(report["entity_handle_capacity"], 32768);
         assert_eq!(report["entity_index_max"], 32767);
     }

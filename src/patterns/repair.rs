@@ -29,6 +29,7 @@ const MIN_CONSTRAINED: usize = 8;
 /// Upper bound on repair attempts per run. Each attempt is a full `.text`
 /// sweep, so this keeps a badly stale database from stalling the dump.
 pub(crate) const MAX_REPAIR_ATTEMPTS: usize = 64;
+const _: () = assert!(MAX_REPAIR_ATTEMPTS > 0 && MAX_REPAIR_ATTEMPTS <= 256);
 
 /// A repair suggestion for one failed pattern.
 #[derive(Clone, Debug, Serialize)]
@@ -220,7 +221,7 @@ fn token(value: u8, mask: u8) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_REPAIR_ATTEMPTS, suggest};
+    use super::suggest;
 
     #[test]
     fn wildcards_only_the_drifted_bytes() {
@@ -309,11 +310,6 @@ mod tests {
             .expect("repair candidate for duplicated prologue");
         assert_eq!(candidate.mismatches, vec![9]);
         assert_eq!(candidate.repaired_matches, 2);
-    }
-
-    #[test]
-    fn attempt_budget_is_bounded() {
-        assert!(MAX_REPAIR_ATTEMPTS > 0 && MAX_REPAIR_ATTEMPTS <= 256);
     }
 
     /// Repair sweeps a whole `.text` section, so cost matters on patch day.

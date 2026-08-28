@@ -10,6 +10,8 @@
 //! hardcoded entry — same mechanism `CreateInterface`-registered interfaces
 //! use, just driven by pattern resolution instead of factory enumeration.
 
+use std::borrow::Cow;
+
 use memflow::prelude::v1::*;
 
 use crate::analysis::rtti;
@@ -19,22 +21,11 @@ use crate::patterns::PatternReport;
 /// Maximum vtable slots we attempt to walk before bailing.
 const MAX_METHODS: usize = 256;
 
-pub fn discover<P: Process + MemoryView>(
+pub fn discover<'a, P: Process + MemoryView>(
     process: &mut P,
-    report: &PatternReport,
-) -> Vec<IfaceClass> {
-    let modules: Vec<(String, u64, u64)> = process
-        .module_list()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|m| {
-            (
-                m.name.to_string().to_ascii_lowercase(),
-                m.base.to_umem() as u64,
-                m.size as u64,
-            )
-        })
-        .collect();
+    report: &'a PatternReport,
+) -> Vec<IfaceClass<'a>> {
+    let modules = crate::analysis::module_data::cached_module_list(process).unwrap_or_default();
 
     let mut out = Vec::new();
     for hit in &report.hits {
@@ -46,10 +37,12 @@ pub fn discover<P: Process + MemoryView>(
         }
         let Some(rva) = hit.rva else { continue };
 
-        let Some((_, base, _)) = modules.iter().find(|(n, _, _)| n == &hit.module) else {
+        let Some((_, base, _)) = modules.iter().find(|(n, _, _)| n.as_ref() == hit.module.as_ref()) else {
             continue;
         };
-        let singleton_va = base + rva;
+        let Some(singleton_va) = base.checked_add(rva) else {
+            continue;
+        };
 
         // Read qword at the singleton — should be the vtable VA for class singletons.
         let Ok(vt_va) = process.read::<u64>(Address::from(singleton_va)).data_part() else {
@@ -62,7 +55,10 @@ pub fn discover<P: Process + MemoryView>(
         // Locate which module hosts the vtable.
         let Some((_, vt_mod_base, vt_mod_size)) = modules
             .iter()
-            .find(|(_, b, s)| vt_va >= *b && vt_va < b + s)
+            .find(|(_, b, s)| {
+                b.checked_add(*s)
+                    .is_some_and(|end| vt_va >= *b && vt_va < end)
+            })
         else {
             continue;
         };
@@ -81,10 +77,10 @@ pub fn discover<P: Process + MemoryView>(
         }
 
         out.push(IfaceClass {
-            module: hit.module.clone(),
-            iface_name: hit.name.clone(),
+            module: hit.module.as_ref(),
+            iface_name: hit.name.as_ref(),
             instance_rva: Some(rva),
-            rtti_class: Some(class_name),
+            rtti_class: Some(Cow::Owned(class_name)),
             methods: (0..methods)
                 .map(|i| Method {
                     index: i,
@@ -100,7 +96,7 @@ pub fn discover<P: Process + MemoryView>(
 fn walk_vtable_methods<P: MemoryView>(
     process: &mut P,
     vt_va: u64,
-    modules: &[(String, u64, u64)],
+    modules: &[(std::sync::Arc<str>, u64, u64)],
 ) -> usize {
     let Ok(raw) = process
         .read_raw(Address::from(vt_va), MAX_METHODS * 8)
@@ -109,9 +105,12 @@ fn walk_vtable_methods<P: MemoryView>(
         return 0;
     };
     let mut count = 0;
-    for chunk in raw.chunks_exact(8) {
-        let p = u64::from_le_bytes(chunk.try_into().unwrap());
-        if !modules.iter().any(|(_, b, s)| p >= *b && p < b + s) {
+    for chunk in raw.as_chunks::<8>().0 {
+        let p = u64::from_le_bytes(*chunk);
+        if !modules.iter().any(|(_, b, s)| {
+            b.checked_add(*s)
+                .is_some_and(|end| p >= *b && p < end)
+        }) {
             break;
         }
         count += 1;

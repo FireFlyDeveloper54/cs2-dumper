@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 
-use super::{ButtonMap, CodeWriter, Formatter, zig_ident};
+use super::ident::{
+    csharp_identifier, cpp_identifier, rust_identifier, IdentifierAllocator,
+};
+use super::{zig_ident, ButtonMap, CodeWriter, Formatter};
 
 impl CodeWriter for ButtonMap {
     fn write_cs(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
@@ -9,8 +12,14 @@ impl CodeWriter for ButtonMap {
             writeln!(fmt, "// Module: client.dll")?;
 
             fmt.block("public static class Buttons", false, |fmt| {
+                let mut names = IdentifierAllocator::default();
                 for (name, value) in self {
-                    writeln!(fmt, "public const nint {} = {:#X};", name, value)?;
+                    writeln!(
+                        fmt,
+                        "public const nint {} = {:#X};",
+                        names.allocate(csharp_identifier(name)),
+                        value
+                    )?;
                 }
 
                 Ok(())
@@ -27,8 +36,14 @@ impl CodeWriter for ButtonMap {
             writeln!(fmt, "// Module: client.dll")?;
 
             fmt.block("namespace buttons", false, |fmt| {
+                let mut names = IdentifierAllocator::default();
                 for (name, value) in self {
-                    writeln!(fmt, "constexpr std::ptrdiff_t {} = {:#X};", name, value)?;
+                    writeln!(
+                        fmt,
+                        "constexpr std::ptrdiff_t {} = {:#X};",
+                        names.allocate(cpp_identifier(name)),
+                        value
+                    )?;
                 }
 
                 Ok(())
@@ -38,12 +53,12 @@ impl CodeWriter for ButtonMap {
 
     fn write_json(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
         let content = {
-            let buttons: BTreeMap<_, _> = self.iter().map(|(name, value)| (name, value)).collect();
+            let buttons: BTreeMap<_, _> = self.iter().collect();
 
             BTreeMap::from_iter([("client.dll", buttons)])
         };
 
-        fmt.write_str(&serde_json::to_string_pretty(&content).unwrap())
+        super::formatter::write_pretty_json(fmt, &content)
     }
 
     fn write_rs(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
@@ -53,14 +68,14 @@ impl CodeWriter for ButtonMap {
             writeln!(fmt, "// Module: client.dll")?;
 
             fmt.block("pub mod buttons", false, |fmt| {
+                let mut names = IdentifierAllocator::default();
                 for (name, value) in self {
-                    let mut name = name.clone();
-
-                    if name == "use" {
-                        name = format!("r#{}", name);
-                    }
-
-                    writeln!(fmt, "pub const {}: usize = {:#X};", name, value)?;
+                    writeln!(
+                        fmt,
+                        "pub const {}: usize = {:#X};",
+                        names.allocate(rust_identifier(name)),
+                        value
+                    )?;
                 }
 
                 Ok(())
@@ -73,8 +88,14 @@ impl CodeWriter for ButtonMap {
             writeln!(fmt, "// Module: client.dll")?;
 
             fmt.block("pub const buttons = struct", true, |fmt| {
+                let mut names = IdentifierAllocator::default();
                 for (name, value) in self {
-                    writeln!(fmt, "pub const {}: usize = {:#X};", zig_ident(name), value)?;
+                    writeln!(
+                        fmt,
+                        "pub const {}: usize = {:#X};",
+                        names.allocate(zig_ident(name).into_owned()),
+                        value
+                    )?;
                 }
 
                 Ok(())

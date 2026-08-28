@@ -75,20 +75,20 @@ impl Head {
     }
 
     pub fn u64(&self, at: u64) -> u64 {
-        self.bytes(at).map(u64::from_le_bytes).unwrap_or(0)
+        self.at(at, crate::analysis::read::u64_le_at).unwrap_or(0)
     }
 
     pub fn u32(&self, at: u64) -> u32 {
-        self.bytes(at).map(u32::from_le_bytes).unwrap_or(0)
+        self.at(at, crate::analysis::read::u32_le_at).unwrap_or(0)
     }
 
     pub fn u16(&self, at: u64) -> u16 {
-        self.bytes(at).map(u16::from_le_bytes).unwrap_or(0)
+        self.at(at, crate::analysis::read::u16_le_at).unwrap_or(0)
     }
 
-    fn bytes<const N: usize>(&self, at: u64) -> Option<[u8; N]> {
-        let at = at as usize;
-        self.0.get(at..at + N)?.try_into().ok()
+    fn at<T>(&self, at: u64, load: impl FnOnce(&[u8], usize) -> Option<T>) -> Option<T> {
+        let offset = usize::try_from(at).ok()?;
+        load(&self.0, offset)
     }
 }
 
@@ -176,19 +176,26 @@ fn candidate_slots(image: &[u8], base: u64, ranges: &[(u64, u64)]) -> Vec<(u64, 
     let mut targets: BTreeMap<u64, u64> = BTreeMap::new();
 
     for &(rva, size) in ranges {
-        let start = rva as usize;
+        let start = (rva as usize).min(image.len());
         let end = start.saturating_add(size as usize).min(image.len());
         let mut offset = start.next_multiple_of(8);
 
-        while offset + 8 <= end && targets.len() < MAX_TARGETS {
-            let target = u64::from_le_bytes(image[offset..offset + 8].try_into().unwrap());
+        while offset
+            .checked_add(8)
+            .is_some_and(|candidate_end| candidate_end <= end)
+            && targets.len() < MAX_TARGETS
+        {
+            let Some(target) = crate::analysis::read::u64_le_at(image, offset) else {
+                break;
+            };
             // These objects are heap-allocated and pointer-aligned, so a
             // pointer back into the module's own image is a different global.
             if (0x10000..USER_SPACE_END).contains(&target)
                 && target % 8 == 0
                 && !(base..image_end).contains(&target)
+                && let Some(slot) = base.checked_add(offset as u64)
             {
-                targets.entry(target).or_insert(base + offset as u64);
+                targets.entry(target).or_insert(slot);
             }
             offset += 8;
         }
@@ -209,13 +216,19 @@ pub fn globals_holding(image: &[u8], base: u64, ranges: &[(u64, u64)], object: u
     let mut slots = Vec::new();
 
     for &(rva, size) in ranges {
-        let start = rva as usize;
+        let start = (rva as usize).min(image.len());
         let end = start.saturating_add(size as usize).min(image.len());
         let mut offset = start.next_multiple_of(8);
 
-        while offset + 8 <= end && slots.len() < MAX_ALIASES {
-            if u64::from_le_bytes(image[offset..offset + 8].try_into().unwrap()) == object {
-                slots.push(base + offset as u64);
+        while offset
+            .checked_add(8)
+            .is_some_and(|candidate_end| candidate_end <= end)
+            && slots.len() < MAX_ALIASES
+        {
+            if crate::analysis::read::u64_le_at(image, offset) == Some(object)
+                && let Some(slot) = base.checked_add(offset as u64)
+            {
+                slots.push(slot);
             }
             offset += 8;
         }

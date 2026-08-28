@@ -41,7 +41,7 @@
 //! return the raw stripped form, which is still useful as a stable
 //! identifier across patches.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use memflow::prelude::v1::*;
 
 /// Maximum bytes to read for a single mangled name C-string.  The
@@ -70,16 +70,25 @@ fn try_resolve<P: MemoryView>(
     module_base: u64,
     module_size: u64,
 ) -> Result<String> {
-    if vftable_va < 8 + module_base {
+    let vftable_min = module_base
+        .checked_add(8)
+        .ok_or_else(|| anyhow!("module base overflow"))?;
+    if vftable_va < vftable_min {
         return Err(anyhow!("vftable too low for COL slot"));
     }
     // [vftable - 8] = COL pointer
+    let col_slot = vftable_va
+        .checked_sub(8)
+        .ok_or_else(|| anyhow!("vftable too low for COL slot"))?;
     let col_va = process
-        .read::<u64>(Address::from(vftable_va - 8))
+        .read::<u64>(Address::from(col_slot))
         .data_part()?;
 
     // COL must live inside the same module image.
-    if col_va < module_base || col_va >= module_base + module_size {
+    let module_end = module_base
+        .checked_add(module_size)
+        .ok_or_else(|| anyhow!("module range overflow"))?;
+    if col_va < module_base || col_va >= module_end {
         return Err(anyhow!("COL pointer outside module"));
     }
 
@@ -89,9 +98,12 @@ fn try_resolve<P: MemoryView>(
         return Err(anyhow!("short COL read"));
     }
 
-    let signature = u32::from_le_bytes(col_bytes[0..4].try_into().unwrap());
-    let type_desc_rva = u32::from_le_bytes(col_bytes[12..16].try_into().unwrap());
-    let self_rva = u32::from_le_bytes(col_bytes[20..24].try_into().unwrap());
+    let signature = crate::analysis::read::u32_le_at(&col_bytes, 0)
+        .ok_or_else(|| anyhow!("short COL signature"))?;
+    let type_desc_rva = crate::analysis::read::u32_le_at(&col_bytes, 12)
+        .ok_or_else(|| anyhow!("short COL type descriptor"))?;
+    let self_rva = crate::analysis::read::u32_le_at(&col_bytes, 20)
+        .ok_or_else(|| anyhow!("short COL self RVA"))?;
 
     // x64 COL signature is always 1.
     if signature != 1 {
@@ -100,19 +112,30 @@ fn try_resolve<P: MemoryView>(
     // Self-RVA must point back to the COL we just read — this is what
     // lets MSVC reconstruct the image base at runtime, and is a cheap
     // sanity check that we're looking at a real COL.
-    if (col_va - module_base) as u32 != self_rva {
+    if col_va - module_base != u64::from(self_rva) {
         return Err(anyhow!("COL self-RVA mismatch"));
     }
     if (type_desc_rva as u64) >= module_size {
         return Err(anyhow!("TypeDescriptor RVA out of range"));
     }
 
-    let td_va = module_base + type_desc_rva as u64;
+    let td_va = module_base
+        .checked_add(type_desc_rva as u64)
+        .ok_or_else(|| anyhow!("TypeDescriptor address overflow"))?;
     // The mangled name starts at TypeDescriptor + 0x10.
-    let name_va = td_va + 0x10;
+    let name_va = td_va
+        .checked_add(0x10)
+        .ok_or_else(|| anyhow!("TypeDescriptor name address overflow"))?;
+    let available = module_end
+        .checked_sub(name_va)
+        .ok_or_else(|| anyhow!("TypeDescriptor name outside module"))?;
+    let read_len = MAX_NAME_BYTES.min(usize::try_from(available).unwrap_or(usize::MAX));
+    if read_len == 0 {
+        return Err(anyhow!("empty TypeDescriptor name range"));
+    }
 
     let raw = process
-        .read_raw(Address::from(name_va), MAX_NAME_BYTES)
+        .read_raw(Address::from(name_va), read_len)
         .data_part()?;
     let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     let mangled = std::str::from_utf8(&raw[..nul]).map_err(|_| anyhow!("non-utf8 mangled name"))?;

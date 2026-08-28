@@ -57,6 +57,12 @@ unsafe extern "system" {
     fn FreeLibraryAndExitThread(module: Handle, code: u32) -> !;
 }
 
+/// Windows loader entry. Spawns the schema-registration worker on attach
+/// and always returns success so `LoadLibraryW` does not fail the host.
+///
+/// # Safety
+/// `module` must be this DLL's `HMODULE`. `reason` is a `DLL_*` code from
+/// the loader. Only the Windows loader may call this.
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(module: Handle, reason: u32, _reserved: Handle) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
@@ -78,7 +84,7 @@ pub unsafe extern "system" fn DllMain(module: Handle, reason: u32, _reserved: Ha
 
 unsafe extern "system" fn on_attach(module: Handle) -> u32 {
     let status_path = status_path_from_module(module);
-    let result = std::panic::catch_unwind(|| register_schema());
+    let result = std::panic::catch_unwind(register_schema);
     match result {
         Ok(Ok(report)) => write_status(&status_path, true, &report, None),
         Ok(Err(err)) => write_status(&status_path, false, &Report::default(), Some(&err)),
@@ -95,10 +101,10 @@ struct Report {
 }
 
 fn register_schema() -> Result<Report, String> {
-    let schema_dll = load_mod(b"schemasystem.dll\0")?;
-    let create: CreateInterfaceFn = export(schema_dll, b"CreateInterface\0")
+    let schema_dll = load_mod(c"schemasystem.dll")?;
+    let create: CreateInterfaceFn = export(schema_dll, c"CreateInterface")
         .ok_or_else(|| "schemasystem.dll has no CreateInterface".to_string())?;
-    let schema_system = unsafe { create(b"SchemaSystem_001\0".as_ptr().cast(), core::ptr::null_mut()) };
+    let schema_system = unsafe { create(c"SchemaSystem_001".as_ptr(), core::ptr::null_mut()) };
     if schema_system.is_null() {
         return Err("CreateInterface(SchemaSystem_001) returned null".into());
     }
@@ -111,11 +117,11 @@ fn register_schema() -> Result<Report, String> {
             continue;
         }
         let Some(install): Option<InstallSchemaBindingsFn> =
-            export(handle, b"InstallSchemaBindings\0")
+            export(handle, c"InstallSchemaBindings")
         else {
             continue;
         };
-        let status = unsafe { install(b"SchemaSystem_001\0".as_ptr().cast(), schema_system) };
+        let status = unsafe { install(c"SchemaSystem_001".as_ptr(), schema_system) };
         if status == SCHEMA_BINDINGS_OK || status == 0 {
             report.bindings.push(name);
         } else {
@@ -130,20 +136,17 @@ fn register_schema() -> Result<Report, String> {
     Ok(report)
 }
 
-fn load_mod(name: &[u8]) -> Result<Handle, String> {
-    let handle = unsafe { GetModuleHandleA(name.as_ptr().cast()) };
+fn load_mod(name: &std::ffi::CStr) -> Result<Handle, String> {
+    let handle = unsafe { GetModuleHandleA(name.as_ptr()) };
     if handle.is_null() {
-        Err(format!(
-            "GetModuleHandleA({}) failed",
-            String::from_utf8_lossy(&name[..name.len().saturating_sub(1)])
-        ))
+        Err(format!("GetModuleHandleA({}) failed", name.to_string_lossy()))
     } else {
         Ok(handle)
     }
 }
 
-fn export<T>(module: Handle, name: &[u8]) -> Option<T> {
-    let ptr = unsafe { GetProcAddress(module, name.as_ptr().cast()) };
+fn export<T>(module: Handle, name: &std::ffi::CStr) -> Option<T> {
+    let ptr = unsafe { GetProcAddress(module, name.as_ptr()) };
     if ptr.is_null() {
         None
     } else {
@@ -201,6 +204,14 @@ fn json_escape(text: &str) -> String {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04X}", c as u32);
+            }
             c => out.push(c),
         }
     }
@@ -211,9 +222,14 @@ fn write_status(path: &Path, ok: bool, report: &Report, error: Option<&str>) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+    let json = format_status_json(ok, report, error);
+    let _ = fs::write(path, json);
+}
+
+fn format_status_json(ok: bool, report: &Report, error: Option<&str>) -> String {
     let mut json = String::from("{\n");
     json.push_str(&format!("  \"ok\": {},\n", if ok { "true" } else { "false" }));
-    json.push_str(&format!("  \"schema_system\": {:#x},\n", report.schema_system));
+    json.push_str(&format!("  \"schema_system\": {},\n", report.schema_system));
     json.push_str("  \"bindings\": [");
     for (i, name) in report.bindings.iter().enumerate() {
         if i > 0 {
@@ -238,5 +254,44 @@ fn write_status(path: &Path, ok: bool, report: &Report, error: Option<&str>) {
         None => json.push_str("null"),
     }
     json.push_str("\n}\n");
-    let _ = fs::write(path, json);
+    json
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_json_uses_a_decimal_schema_system_number() {
+        let report = Report {
+            schema_system: 0x7FFD_17ED_5730,
+            bindings: vec!["client.dll".into()],
+            failed: Vec::new(),
+        };
+        let json = format_status_json(true, &report, None);
+        assert!(
+            json.contains("\"schema_system\": 140725004883760"),
+            "payload must emit a JSON number, not 0x...: {json}"
+        );
+        assert!(!json.contains("0x"));
+        assert!(json.contains("\"ok\": true"));
+    }
+
+    #[test]
+    fn status_json_escapes_all_control_characters() {
+        let report = Report {
+            bindings: vec!["module\r\n\t\u{0001}".into()],
+            failed: vec![("bad\u{000B}module".into(), "err\u{000C}".into())],
+            ..Report::default()
+        };
+        let json = format_status_json(false, &report, Some("fatal\u{0000}"));
+        assert!(!json
+            .chars()
+            .any(|ch| matches!(ch, '\r' | '\t' | '\u{0001}' | '\u{000B}' | '\u{000C}' | '\0')));
+        assert!(json.contains("\\r\\n\\t\\u0001"));
+        assert!(json.contains("\\u000B"));
+        assert!(json.contains("\\f"));
+        assert!(json.contains("\\u0000"));
+        assert!(json.contains("\"ok\": false"));
+    }
 }

@@ -15,28 +15,32 @@
 //! ifc::LocalPlayerController()->m_iTeamNum();
 //! ```
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use crate::analysis::InterfaceMap;
 
-use super::ident::{sanitize_ident, slugify, type_ident};
+use super::ident::{cpp_identifier, sanitize_ident, type_ident};
+use super::comment_text;
 
-pub struct Method {
+pub struct Method<'a> {
     pub index: usize,
     /// Pattern-recovered name for this slot, when known.
-    pub name: Option<String>,
+    pub name: Option<&'a str>,
 }
 
-pub struct IfaceClass {
-    pub module: String,
-    pub iface_name: String,
+pub struct IfaceClass<'a> {
+    pub module: &'a str,
+    pub iface_name: &'a str,
     /// RVA of the resolved singleton instance in `module`, when available.
     /// This lets the generated header provide a typed accessor without
     /// baking a process-specific absolute address.
     pub instance_rva: Option<u64>,
-    pub rtti_class: Option<String>,
-    pub methods: Vec<Method>,
+    /// Owned only for RTTI names recovered by the manual pattern walk;
+    /// registered-interface classes borrow `VTableInfo::rtti_class`.
+    pub rtti_class: Option<Cow<'a, str>>,
+    pub methods: Vec<Method<'a>>,
     /// True for classes discovered via pattern + RTTI walk rather than
     /// CreateInterface registration. Affects rendering only at the struct
     /// banner — `iface:` is shown as empty.
@@ -70,20 +74,20 @@ fn curated(module: &str, class: &str, index: usize) -> Option<Curated> {
     }
 }
 
-fn module_ns(module: &str) -> String {
-    slugify(module.trim_end_matches(".dll"))
+fn module_ns(module: &str) -> Cow<'_, str> {
+    sanitize_ident(module.trim_end_matches(".dll"))
 }
 
-fn class_ns(c: &IfaceClass) -> String {
+fn class_ns(c: &IfaceClass<'_>) -> String {
     c.rtti_class
         .as_deref()
-        .map(sanitize_ident)
-        .unwrap_or_else(|| type_ident(&c.iface_name))
+        .map(cpp_identifier)
+        .unwrap_or_else(|| cpp_identifier(type_ident(c.iface_name).as_ref()))
 }
 
 pub fn render_hpp(
     _interfaces: &InterfaceMap,
-    classes: &[IfaceClass],
+    classes: &[IfaceClass<'_>],
     build_number: Option<u32>,
 ) -> String {
     let mut s = String::new();
@@ -115,21 +119,19 @@ pub fn render_hpp(
     }
 
     // --- ifc::module::Class structs ----------------------------------------
-    let mut sorted: Vec<&IfaceClass> = classes.iter().collect();
-    sorted.sort_by(|a, b| {
-        (a.module.as_str(), a.iface_name.as_str()).cmp(&(b.module.as_str(), b.iface_name.as_str()))
-    });
+    let mut sorted: Vec<&IfaceClass<'_>> = classes.iter().collect();
+    sorted.sort_by(|a, b| (a.module, a.iface_name).cmp(&(b.module, b.iface_name)));
 
-    let mut grouped: BTreeMap<String, BTreeMap<String, (&IfaceClass, Vec<String>)>> =
+    let mut grouped: BTreeMap<&str, BTreeMap<String, (&IfaceClass<'_>, Vec<&str>)>> =
         BTreeMap::new();
     for c in &sorted {
         let entry = grouped
-            .entry(c.module.clone())
+            .entry(c.module)
             .or_default()
             .entry(class_ns(c))
             .or_insert_with(|| (*c, Vec::new()));
         if !c.manual {
-            entry.1.push(c.iface_name.clone());
+            entry.1.push(c.iface_name);
         }
     }
 
@@ -138,11 +140,13 @@ pub fn render_hpp(
         let mns = module_ns(module);
         writeln!(s, "    namespace {} {{", mns).ok();
         for (cns, (rep, ifaces)) in ns_map {
+            let joined_ifaces = ifaces.join(", ");
+            let iface_list = comment_text(&joined_ifaces);
             writeln!(
                 s,
                 "        // {} (iface: {}) | {} methods",
                 cns,
-                ifaces.join(", "),
+                iface_list,
                 rep.methods.len()
             )
             .ok();
@@ -163,9 +167,9 @@ pub fn render_hpp(
                         cur.ret, cur.name, params, m.index
                     )
                     .ok();
-                } else if let Some(name) = m.name.as_deref() {
+                } else if let Some(name) = m.name {
                     // Slot identified via Pattern-RVA cross-reference; args unknown.
-                    writeln!(s, "            virtual void {}() = 0; // slot {} (name recovered, args unverified)", sanitize_ident(name), m.index).ok();
+                    writeln!(s, "            virtual void {}() = 0; // slot {} (name recovered, args unverified)", cpp_identifier(name), m.index).ok();
                 } else {
                     writeln!(s, "            virtual void method_{}() = 0;", m.index).ok();
                 }
@@ -197,17 +201,14 @@ pub fn render_hpp(
                 continue;
             };
             let class_name = cns;
-            let names = if ifaces.is_empty() {
-                vec![rep.iface_name.clone()]
-            } else {
-                ifaces.clone()
-            };
+            let fallback = [rep.iface_name];
+            let names: &[&str] = if ifaces.is_empty() { &fallback } else { ifaces };
             for iface in names {
                 writeln!(
                     s,
                     "        inline {}* get_{}(std::uintptr_t module_base) noexcept {{ return reinterpret_cast<{}*>(module_base + 0x{:X}); }}",
                     class_name,
-                    sanitize_ident(&iface),
+                    cpp_identifier(iface),
                     class_name,
                     rva
                 )
@@ -228,20 +229,21 @@ pub fn render_hpp(
 
 #[cfg(test)]
 mod tests {
-    use super::{IfaceClass, Method, render_hpp};
+    use super::{module_ns, render_hpp, IfaceClass, Method};
     use crate::analysis::InterfaceMap;
+    use std::borrow::Cow;
 
     #[test]
     fn emits_aslr_safe_singleton_accessor() {
         let interfaces = InterfaceMap::new();
         let classes = vec![IfaceClass {
-            module: "client.dll".into(),
-            iface_name: "Client001".into(),
+            module: "client.dll",
+            iface_name: "Client001",
             instance_rva: Some(0x1234),
-            rtti_class: Some("CClient".into()),
+            rtti_class: Some(std::borrow::Cow::Borrowed("CClient")),
             methods: vec![Method {
                 index: 0,
-                name: None,
+                name: Some("Connect"),
             }],
             manual: false,
         }];
@@ -249,5 +251,15 @@ mod tests {
         assert!(output.contains("get_Client001"));
         assert!(output.contains("module_base + 0x1234"));
         assert!(output.contains("CS2_BUILD = 42"));
+        assert!(output.contains("virtual void Connect() = 0"));
+    }
+
+    #[test]
+    fn module_ns_borrows_dll_stem() {
+        let module = "client.dll";
+        let ns = module_ns(module);
+        assert_eq!(ns.as_ref(), "client");
+        assert!(matches!(ns, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(ns.as_ref().as_ptr(), module.as_ptr()));
     }
 }

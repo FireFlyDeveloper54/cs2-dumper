@@ -60,6 +60,7 @@ pub fn find_in_module<P: Process + MemoryView>(process: &mut P, module: &str) ->
 /// Scan `ranges` (`(rva, size)` pairs into `image`, a live copy of the module at
 /// `base`) for the global pointing at the entity system, returning the VA of
 /// the *global* — what a walker dereferences — not of the object.
+#[cfg(test)]
 pub fn find_entity_system<P: MemoryView>(
     mem: &mut P,
     image: &[u8],
@@ -119,18 +120,14 @@ fn read_block<P: MemoryView>(mem: &mut P, va: u64, len: usize) -> Vec<u8> {
 }
 
 fn block_u64(block: &[u8], at: u64) -> u64 {
-    let at = at as usize;
-    block
-        .get(at..at + 8)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(u64::from_le_bytes)
+    usize::try_from(at)
+        .ok()
+        .and_then(|offset| crate::analysis::read::u64_le_at(block, offset))
         .unwrap_or(0)
 }
 
 fn read_cstr<P: MemoryView>(mem: &mut P, va: u64) -> String {
-    mem.read_utf8_lossy(Address::from(va), 128)
-        .data_part()
-        .unwrap_or_default()
+    crate::analysis::read::cstr(mem, va)
 }
 
 #[cfg(test)]
