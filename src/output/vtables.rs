@@ -12,8 +12,8 @@ use serde_json::json;
 
 use crate::analysis::{VTableInfo, VTableMap};
 
-use super::ident::{cpp_csharp_identifier, sanitize_ident};
 use super::comment_text;
+use super::ident::{cpp_csharp_identifier, sanitize_ident};
 
 fn module_ns(module: &str) -> Cow<'_, str> {
     sanitize_ident(module)

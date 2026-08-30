@@ -1,3 +1,4 @@
+* text=auto eol=lf
 *.cs linguist-detectable=false
 *.hpp linguist-detectable=false
 *.json linguist-detectable=false

@@ -33,7 +33,10 @@ pub const SCHEMA_EF_GLOBAL_TYPE_SCOPE: u8 = 1 << 2;
 const CLASS_FLAG_LABELS: &[(u32, &str)] = &[
     (SCHEMA_CF1_HAS_VIRTUAL_MEMBERS, "Has VTable"),
     (SCHEMA_CF1_IS_ABSTRACT, "Is Abstract"),
-    (SCHEMA_CF1_HAS_TRIVIAL_CONSTRUCTOR, "Has Trivial Constructor"),
+    (
+        SCHEMA_CF1_HAS_TRIVIAL_CONSTRUCTOR,
+        "Has Trivial Constructor",
+    ),
     (SCHEMA_CF1_HAS_TRIVIAL_DESTRUCTOR, "Has Trivial Destructor"),
     (SCHEMA_CF1_LIMITED_METADATA, "Limited Metadata"),
     (
@@ -201,7 +204,10 @@ mod tests {
             enum_flag_names(SCHEMA_EF_IS_REGISTERED | SCHEMA_EF_GLOBAL_TYPE_SCOPE),
             vec!["Is Registered".to_string(), "Global Type Scope".to_string()]
         );
-        assert_eq!(class_flag_names(1 << 30), vec!["Unknown 0x40000000".to_string()]);
+        assert_eq!(
+            class_flag_names(1 << 30),
+            vec!["Unknown 0x40000000".to_string()]
+        );
     }
 
     #[test]
@@ -215,10 +221,7 @@ mod tests {
 
     #[test]
     fn missing_schema_modules_names_the_real_panorama_ui_client_dll() {
-        let schemas = SchemaMap::from([(
-            "panoramauiclient.dll".into(),
-            (Vec::new(), Vec::new()),
-        )]);
+        let schemas = SchemaMap::from([("panoramauiclient.dll".into(), (Vec::new(), Vec::new()))]);
         let missing = missing_schema_modules(&schemas);
         assert!(
             !missing.iter().any(|m| m == "panoramauiclient.dll"),

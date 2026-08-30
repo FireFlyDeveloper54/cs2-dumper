@@ -72,9 +72,7 @@ pub fn render_hpp(sdk_modules: &[&str], build_number: Option<u32>) -> String {
         .copied()
         .filter(|m| !EDITOR_MODULES.contains(m))
         .collect();
-    if ordered_modules.contains(&"server_dll")
-        && ordered_modules.contains(&"client_dll")
-    {
+    if ordered_modules.contains(&"server_dll") && ordered_modules.contains(&"client_dll") {
         ordered_modules.retain(|m| *m != "client_dll");
         if let Some(pos) = ordered_modules.iter().position(|m| *m == "server_dll") {
             ordered_modules.insert(pos, "client_dll");

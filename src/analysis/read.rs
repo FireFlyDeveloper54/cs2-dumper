@@ -53,7 +53,9 @@ pub fn u64_le_at(bytes: &[u8], offset: usize) -> Option<u64> {
 /// `read::<T>().data_part().unwrap_or(...)` with slightly different defaults.
 #[inline]
 pub fn or<T: Pod, P: MemoryView>(mem: &mut P, va: u64, fallback: T) -> T {
-    mem.read::<T>(Address::from(va)).data_part().unwrap_or(fallback)
+    mem.read::<T>(Address::from(va))
+        .data_part()
+        .unwrap_or(fallback)
 }
 
 #[inline]

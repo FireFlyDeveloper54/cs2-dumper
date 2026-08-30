@@ -1,16 +1,16 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{self, Write};
 
 use heck::{AsPascalCase, AsSnakeCase};
 
 use serde_json::json;
 
-use super::{comment_text, slugify, zig_ident, CodeWriter, Formatter, SchemaMap};
+use super::{CodeWriter, Formatter, SchemaMap, comment_text, slugify, zig_ident};
 
 use crate::analysis::{Class, ClassMetadata, Enum, EnumMember};
 
 use super::ident::{
-    csharp_identifier, cpp_identifier, rust_identifier, IdentifierAllocator,
+    IdentifierAllocator, cpp_identifier, csharp_identifier, rust_identifier, unique_slug,
 };
 
 /// One schema module, borrowed from the live dump map so per-file emit does
@@ -155,24 +155,20 @@ impl SchemaModule<'_> {
                     write_metadata(fmt, &class.metadata)?;
 
                     let class_name = declarations.allocate(cpp_identifier(&class.name));
-                    fmt.block(
-                        format_args!("namespace {class_name}"),
-                        false,
-                        |fmt| {
-                            let mut names = IdentifierAllocator::default();
-                            for field in &class.fields {
-                                writeln!(
-                                    fmt,
-                                    "constexpr std::ptrdiff_t {} = {:#X}; // {}",
-                                    names.allocate(cpp_identifier(&field.name)),
-                                    field.offset,
-                                    comment_text(&field.type_name)
-                                )?;
-                            }
+                    fmt.block(format_args!("namespace {class_name}"), false, |fmt| {
+                        let mut names = IdentifierAllocator::default();
+                        for field in &class.fields {
+                            writeln!(
+                                fmt,
+                                "constexpr std::ptrdiff_t {} = {:#X}; // {}",
+                                names.allocate(cpp_identifier(&field.name)),
+                                field.offset,
+                                comment_text(&field.type_name)
+                            )?;
+                        }
 
-                            Ok(())
-                        },
-                    )?;
+                        Ok(())
+                    })?;
                 }
 
                 Ok(())
@@ -181,6 +177,7 @@ impl SchemaModule<'_> {
     }
 
     fn json_value(&self) -> serde_json::Value {
+        let mut class_keys = BTreeSet::new();
         let classes: BTreeMap<_, _> = self
             .classes
             .iter()
@@ -235,10 +232,11 @@ impl SchemaModule<'_> {
                     value["flags"] = json!(class.flags);
                 }
 
-                (slugify(&class.name), value)
+                (unique_slug(&class.name, &mut class_keys), value)
             })
             .collect();
 
+        let mut enum_keys = BTreeSet::new();
         let enums: BTreeMap<_, _> = self
             .enums
             .iter()
@@ -258,7 +256,7 @@ impl SchemaModule<'_> {
                 };
 
                 (
-                    slugify(&enum_.name),
+                    unique_slug(&enum_.name, &mut enum_keys),
                     json!({
                         "size": enum_.size,
                         "alignment": enum_.alignment,
@@ -302,11 +300,7 @@ impl SchemaModule<'_> {
 
                     let enum_name = declarations.allocate(rust_identifier(&enum_.name));
                     fmt.block(
-                        format_args!(
-                            "#[repr({})]\npub enum {}",
-                            type_name,
-                            enum_name
-                        ),
+                        format_args!("#[repr({})]\npub enum {}", type_name, enum_name),
                         false,
                         |fmt| {
                             let members = unique_enum_members_masked(&enum_.members, type_name);
@@ -334,24 +328,20 @@ impl SchemaModule<'_> {
                     write_metadata(fmt, &class.metadata)?;
 
                     let class_name = declarations.allocate(rust_identifier(&class.name));
-                    fmt.block(
-                        format_args!("pub mod {class_name}"),
-                        false,
-                        |fmt| {
-                            let mut names = IdentifierAllocator::default();
-                            for field in &class.fields {
-                                writeln!(
-                                    fmt,
-                                    "pub const {}: usize = {:#X}; // {}",
-                                    names.allocate(rust_identifier(&field.name)),
-                                    field.offset,
-                                    comment_text(&field.type_name)
-                                )?;
-                            }
+                    fmt.block(format_args!("pub mod {class_name}"), false, |fmt| {
+                        let mut names = IdentifierAllocator::default();
+                        for field in &class.fields {
+                            writeln!(
+                                fmt,
+                                "pub const {}: usize = {:#X}; // {}",
+                                names.allocate(rust_identifier(&field.name)),
+                                field.offset,
+                                comment_text(&field.type_name)
+                            )?;
+                        }
 
-                            Ok(())
-                        },
-                    )?;
+                        Ok(())
+                    })?;
                 }
 
                 Ok(())
@@ -577,10 +567,7 @@ impl CodeWriter for SchemaMap {
     }
 }
 
-fn unique_enum_members_masked<'a>(
-    members: &'a [EnumMember],
-    storage: &str,
-) -> Vec<&'a EnumMember> {
+fn unique_enum_members_masked<'a>(members: &'a [EnumMember], storage: &str) -> Vec<&'a EnumMember> {
     let mut used_values = HashSet::new();
     members
         .iter()
@@ -628,7 +615,10 @@ fn write_metadata(fmt: &mut Formatter<'_>, metadata: &[ClassMetadata]) -> fmt::R
 }
 
 fn format_zig_enum_member_value(value: i64, type_name: &str) -> String {
-    format!("{:#X}", super::cpp_types::enum_value_masked(value, type_name))
+    format!(
+        "{:#X}",
+        super::cpp_types::enum_value_masked(value, type_name)
+    )
 }
 
 #[cfg(test)]
@@ -819,15 +809,24 @@ mod tests {
             out
         };
         let cs = render("cs");
-        assert!(cs.contains("Overflow = 0x0"), "C# byte 0x100 must wrap: {cs}");
+        assert!(
+            cs.contains("Overflow = 0x0"),
+            "C# byte 0x100 must wrap: {cs}"
+        );
         assert!(cs.contains("Neg = 0xFF"), "C# byte -1 must be 0xFF: {cs}");
         assert!(!cs.contains("0x100"), "unmasked 0x100 is not a byte: {cs}");
         let rs = render("rs");
-        assert!(rs.contains("Overflow = 0x0"), "Rust u8 0x100 must wrap: {rs}");
+        assert!(
+            rs.contains("Overflow = 0x0"),
+            "Rust u8 0x100 must wrap: {rs}"
+        );
         assert!(rs.contains("Neg = 0xFF"), "Rust u8 -1 must be 0xFF: {rs}");
         assert!(!rs.contains("u8::MAX"), "do not special-case only -1: {rs}");
         let zig = render("zig");
-        assert!(zig.contains("Overflow = 0x0"), "Zig u8 0x100 must wrap: {zig}");
+        assert!(
+            zig.contains("Overflow = 0x0"),
+            "Zig u8 0x100 must wrap: {zig}"
+        );
         assert!(zig.contains("Neg = 0xFF"), "Zig u8 -1 must be 0xFF: {zig}");
     }
 }

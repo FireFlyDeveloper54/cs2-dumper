@@ -26,8 +26,8 @@ pub(crate) mod manual_iface;
 pub mod module_data;
 mod offsets;
 mod protobufs;
-pub(crate) mod rtti;
 pub mod read;
+pub(crate) mod rtti;
 pub(crate) mod schema_anchor;
 pub(crate) mod schema_flags;
 mod schemas;
@@ -54,7 +54,10 @@ pub(crate) fn analyze_all<P: Process + MemoryView>(process: &mut P) -> Result<An
 
     info!(
         "found {} interfaces across {} modules",
-        interfaces.values().map(|ifaces| ifaces.len()).sum::<usize>(),
+        interfaces
+            .values()
+            .map(|ifaces| ifaces.len())
+            .sum::<usize>(),
         interfaces.len()
     );
 

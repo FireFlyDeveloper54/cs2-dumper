@@ -565,10 +565,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cs2-dumper-shade"
-version = "0.2.0"
-
-[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1180,7 +1176,7 @@ dependencies = [
 [[package]]
 name = "memflow-native"
 version = "0.2.6"
-source = "git+https://github.com/memflow/memflow-native#937b57c6cf7ba0b8cba4948f453a7ab5d57d943f"
+source = "git+https://github.com/memflow/memflow-native?rev=937b57c6cf7ba0b8cba4948f453a7ab5d57d943f#937b57c6cf7ba0b8cba4948f453a7ab5d57d943f"
 dependencies = [
  "goblin 0.9.3",
  "itertools 0.14.0",

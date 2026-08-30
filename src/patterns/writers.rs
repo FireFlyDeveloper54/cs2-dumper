@@ -1,6 +1,6 @@
 //! Multi-language emitters for resolved patterns.
 //!
-//! We already emit a hand-formatted [`patterns.json`].  This module adds
+//! We already emit a hand-formatted `patterns.json`. This module adds
 //! sibling files in the same set of languages the offset pass produces
 //! (`.hpp`, `.rs`, `.cs`, `.zig`) so consumers can drop the file straight into
 //! their project without writing a converter.
@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use crate::output::ident::{
-    csharp_identifier, cpp_identifier, rust_identifier, slugify, IdentifierAllocator,
+    IdentifierAllocator, cpp_identifier, csharp_identifier, rust_identifier, slugify,
 };
 use crate::output::zig_ident;
 
@@ -142,10 +142,7 @@ pub fn render_cs(hits: &[PatternHit]) -> String {
     let mut modules = IdentifierAllocator::default();
     for (module, items) in grouped(hits) {
         let module_name = modules.allocate(csharp_identifier(module_stem(module)));
-        let _ = writeln!(
-            s,
-            "    public static class {module_name}\n    {{"
-        );
+        let _ = writeln!(s, "    public static class {module_name}\n    {{");
         let mut names = IdentifierAllocator::default();
         for h in items {
             if let Some(pattern) = emit_pattern(h) {
@@ -332,10 +329,16 @@ mod tests {
         assert!(rust.contains("_struct_2"), "Rust keyword collision: {rust}");
         assert!(rust.contains("foo_bar_2"), "Rust collision: {rust}");
         let csharp = render_cs(&hits);
-        assert!(csharp.contains("_struct_2"), "C# keyword collision: {csharp}");
+        assert!(
+            csharp.contains("_struct_2"),
+            "C# keyword collision: {csharp}"
+        );
         assert!(csharp.contains("foo_bar_2"), "C# collision: {csharp}");
         let zig = render_zig(&hits);
-        assert!(zig.contains("@\"struct\""), "Zig keyword was not escaped: {zig}");
+        assert!(
+            zig.contains("@\"struct\""),
+            "Zig keyword was not escaped: {zig}"
+        );
         assert!(zig.contains("foo_bar_2"), "Zig collision: {zig}");
     }
 }

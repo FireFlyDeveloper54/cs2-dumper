@@ -6,7 +6,7 @@
 //! older `output::Formatter` machinery.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// Allocate deterministic, unique identifiers within one generated scope.
 #[derive(Default)]
@@ -174,6 +174,43 @@ pub fn slugify(input: &str) -> Cow<'_, str> {
     }
 }
 
+fn is_windows_reserved_stem(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let fold = |byte: u8| byte | 0x20;
+    match bytes.len() {
+        3 => {
+            let con = fold(bytes[0]) == 99 && fold(bytes[1]) == 111 && fold(bytes[2]) == 110;
+            let prn = fold(bytes[0]) == 112 && fold(bytes[1]) == 114 && fold(bytes[2]) == 110;
+            let aux = fold(bytes[0]) == 97 && fold(bytes[1]) == 117 && fold(bytes[2]) == 120;
+            let nul = fold(bytes[0]) == 110 && fold(bytes[1]) == 117 && fold(bytes[2]) == 108;
+            con || prn || aux || nul
+        }
+        4 => {
+            let device = fold(bytes[0]) == 99 && fold(bytes[1]) == 111 && fold(bytes[2]) == 109;
+            let printer = fold(bytes[0]) == 108 && fold(bytes[1]) == 112 && fold(bytes[2]) == 116;
+            (device || printer) && (bytes[3] >= 49 && bytes[3] <= 57)
+        }
+        _ => false,
+    }
+}
+
+/// Return a filesystem-safe slug that is unique under Windows
+/// case-insensitive filename rules. The first occurrence keeps its normal
+/// spelling; later collisions receive a stable _2, _3, ... suffix.
+pub(crate) fn unique_slug(input: &str, used: &mut BTreeSet<String>) -> String {
+    let mut base = slugify(input).into_owned();
+    if base.is_empty() {
+        base.push('_');
+    }
+    let mut candidate = base.clone();
+    let mut suffix = 2usize;
+    while is_windows_reserved_stem(&candidate) || !used.insert(candidate.to_ascii_lowercase()) {
+        candidate = format!("{base}_{suffix}");
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
+}
+
 /// Like [`slugify`] but keeps the leading character if it's already a
 /// valid C++ identifier start. Used for type names where we want
 /// `C_CSPlayerPawn` to stay as `C_CSPlayerPawn`.
@@ -309,8 +346,7 @@ pub fn cpp_csharp_identifier(raw: &str) -> String {
 fn is_rust_keyword(name: &str) -> bool {
     matches!(
         name,
-        "as"
-            | "break"
+        "as" | "break"
             | "const"
             | "continue"
             | "crate"
@@ -490,8 +526,9 @@ fn is_csharp_keyword(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        csharp_identifier, cpp_csharp_identifier, cpp_identifier, cpp_type_ident, is_cpp_keyword,
-        rust_identifier, sanitize_enum_member, slugify, type_ident, IdentifierAllocator,
+        IdentifierAllocator, cpp_csharp_identifier, cpp_identifier, cpp_type_ident,
+        csharp_identifier, is_cpp_keyword, rust_identifier, sanitize_enum_member, slugify,
+        type_ident, unique_slug,
     };
     use std::borrow::Cow;
 
@@ -563,6 +600,15 @@ mod tests {
         assert!(std::ptr::eq(out.as_ref().as_ptr(), name.as_ptr()));
     }
 
+    #[test]
+    fn unique_slug_handles_windows_case_insensitive_collisions() {
+        let mut used = std::collections::BTreeSet::new();
+        assert_eq!(unique_slug("foo.dll", &mut used), "foo_dll");
+        assert_eq!(unique_slug("foo_dll", &mut used), "foo_dll_2");
+        assert_eq!(unique_slug("FOO.DLL", &mut used), "FOO_DLL_3");
+        assert_eq!(unique_slug("CON", &mut used), "CON_2");
+        assert_eq!(unique_slug("NUL", &mut used), "NUL_2");
+    }
     #[test]
     fn allocator_stably_disambiguates_sanitized_collisions() {
         let mut names = IdentifierAllocator::default();

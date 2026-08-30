@@ -29,7 +29,8 @@ impl<T: Pod> UtlMemory<T> {
             .to_umem()
             .checked_add(offset)
             .ok_or(ErrorKind::OutOfBounds)?;
-        mem.read_ptr(Pointer64::from(Address::from(address))).data_part()
+        mem.read_ptr(Pointer64::from(Address::from(address)))
+            .data_part()
     }
 }
 

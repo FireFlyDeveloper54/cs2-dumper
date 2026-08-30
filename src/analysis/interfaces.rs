@@ -9,8 +9,8 @@ use memflow::prelude::v1::*;
 use pelite::pe64::exports::Export;
 use pelite::pe64::{Pe, PeView};
 
-use crate::memory::address;
 use crate::analysis::module_data;
+use crate::memory::address;
 use crate::source2::InterfaceReg;
 
 pub type InterfaceMap = BTreeMap<String, BTreeMap<String, umem>>;

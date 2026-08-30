@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::analysis::{ProtoField, ProtoMessage, ProtobufMap};
 
 use super::comment_text;
-use super::ident::{already_ascii_ident, is_cpp_keyword, IdentifierAllocator};
+use super::ident::{IdentifierAllocator, already_ascii_ident, is_cpp_keyword};
 
 fn module_ns(module: &str) -> Cow<'_, str> {
     sanitize(module.trim_end_matches(".dll"))
@@ -700,7 +700,10 @@ mod tests {
         assert!(hpp.contains("struct message_name_2;"), "{hpp}");
         assert!(hpp.contains("int32_t field_name;"), "{hpp}");
         assert!(hpp.contains("int32_t field_name_2;"), "{hpp}");
-        assert!(!hpp.contains("\n#define"), "type text escaped a comment: {hpp}");
+        assert!(
+            !hpp.contains("\n#define"),
+            "type text escaped a comment: {hpp}"
+        );
     }
 
     #[test]

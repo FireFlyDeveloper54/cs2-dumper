@@ -41,7 +41,7 @@
 //! return the raw stripped form, which is still useful as a stable
 //! identifier across patches.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use memflow::prelude::v1::*;
 
 /// Maximum bytes to read for a single mangled name C-string.  The
@@ -80,9 +80,7 @@ fn try_resolve<P: MemoryView>(
     let col_slot = vftable_va
         .checked_sub(8)
         .ok_or_else(|| anyhow!("vftable too low for COL slot"))?;
-    let col_va = process
-        .read::<u64>(Address::from(col_slot))
-        .data_part()?;
+    let col_va = process.read::<u64>(Address::from(col_slot)).data_part()?;
 
     // COL must live inside the same module image.
     let module_end = module_base

@@ -4,9 +4,9 @@ use std::fmt::Write;
 
 use rayon::prelude::*;
 
-use super::cpp_types;
 use super::comment_text;
-use super::ident::IdentifierAllocator;
+use super::cpp_types;
+use super::ident::{IdentifierAllocator, unique_slug};
 use crate::analysis::{Class, ClassField, Enum, SchemaMap};
 
 const SDK_TYPES_BODY: &str = r#"// Type-safe field accessor.
@@ -286,8 +286,14 @@ fn template_arg<'a>(raw: &'a str, prefix: &str) -> Option<&'a str> {
 fn wrap_vector_like<'a>(raw: &'a str, known_types: &HashSet<&str>) -> Option<ResolvedType<'a>> {
     const PREFIXES: &[(&str, &str)] = &[
         ("CUtlVector<", "CUtlVector"),
-        ("C_UtlVectorEmbeddedNetworkVar<", "C_UtlVectorEmbeddedNetworkVar"),
-        ("CUtlVectorEmbeddedNetworkVar<", "CUtlVectorEmbeddedNetworkVar"),
+        (
+            "C_UtlVectorEmbeddedNetworkVar<",
+            "C_UtlVectorEmbeddedNetworkVar",
+        ),
+        (
+            "CUtlVectorEmbeddedNetworkVar<",
+            "CUtlVectorEmbeddedNetworkVar",
+        ),
         ("C_NetworkUtlVectorBase<", "C_NetworkUtlVectorBase"),
         ("CNetworkUtlVectorBase<", "CNetworkUtlVectorBase"),
     ];
@@ -355,11 +361,7 @@ fn render_sdk_enum(module_name: &str, enum_: &Enum, enum_ident: &str) -> String 
     let mut out = String::with_capacity(96 + enum_.members.len() * 40);
     let type_name = cpp_types::enum_underlying(enum_.storage_bytes());
     let _ = writeln!(out, "// Module: {}", comment_text(module_name));
-    let _ = writeln!(
-        out,
-        "enum class {} : {} {{",
-        enum_ident, type_name
-    );
+    let _ = writeln!(out, "enum class {} : {} {{", enum_ident, type_name);
 
     let mut names = IdentifierAllocator::default();
     for member in &enum_.members {
@@ -584,11 +586,7 @@ fn render_sdk_class(
             .get(parent)
             .cloned()
             .unwrap_or_else(|| sanitize_cpp_ident(parent).into_owned());
-        let _ = writeln!(
-            out,
-            "class {} : public {} {{",
-            class_name, parent_ident
-        );
+        let _ = writeln!(out, "class {} : public {} {{", class_name, parent_ident);
     } else {
         let _ = writeln!(out, "class {} {{", class_name);
     }
@@ -682,7 +680,9 @@ pub fn collect_sdk_data(schemas: &SchemaMap) -> (SdkEnums<'_>, SdkClasses<'_>) {
 }
 
 fn module_slug(input: &str) -> Cow<'_, str> {
-    if let Some(stem) = input.strip_suffix(".dll")
+    if let Some(stem) = input
+        .strip_suffix(".dll")
+        .or_else(|| input.strip_suffix(".DLL"))
         && super::ident::already_ascii_ident(stem)
         && !stem.as_bytes().first().is_some_and(|b| b.is_ascii_digit())
         && !is_cpp_keyword(stem)
@@ -735,21 +735,12 @@ fn write_module_header(
         "// Auto-generated per-schema-scope offsets for {}.",
         comment_text(module)
     );
-    let _ = writeln!(
-        out,
-        "namespace offsets {{ namespace {} {{",
-        module_ident
-    );
+    let _ = writeln!(out, "namespace offsets {{ namespace {} {{", module_ident);
     let mut declarations = IdentifierAllocator::default();
     for enum_ in enums {
         let underlying = cpp_types::enum_underlying(enum_.storage_bytes());
         let enum_name = declarations.allocate(sanitize_cpp_ident(&enum_.name).into_owned());
-        let _ = writeln!(
-            out,
-            "enum class {} : {} {{",
-            enum_name,
-            underlying
-        );
+        let _ = writeln!(out, "enum class {} : {} {{", enum_name, underlying);
         let mut names = IdentifierAllocator::default();
         for member in &enum_.members {
             let _ = writeln!(
@@ -804,8 +795,7 @@ fn write_class_header(module_ident: &str, class_ident: &str, class: &Class) -> S
     let _ = writeln!(
         out,
         "namespace offsets {{ namespace {} {{ namespace {} {{",
-        module_ident,
-        class_ident
+        module_ident, class_ident
     );
     let _ = writeln!(
         out,
@@ -839,19 +829,21 @@ pub fn dump_module_headers(out_dir: &std::path::Path, schemas: &SchemaMap) -> st
     let mut umbrella = String::from("#pragma once\n\n");
     let mut module_jobs = Vec::with_capacity(schemas.len());
     let mut class_files = Vec::new();
-    let mut module_names = IdentifierAllocator::default();
+    let mut module_names = BTreeSet::new();
     for (module, (classes, enums)) in schemas {
-        let slug = module_names.allocate(module_slug(module).into_owned());
+        let slug_base = module_slug(module).into_owned();
+        let slug = unique_slug(&slug_base, &mut module_names);
         let module_classes_dir = classes_dir.join(&slug);
         std::fs::create_dir_all(&module_classes_dir)?;
         let mut declarations = IdentifierAllocator::default();
+        let mut class_file_names = BTreeSet::new();
         for enum_ in enums {
             declarations.allocate(sanitize_cpp_ident(&enum_.name).into_owned());
         }
         class_files.extend(classes.iter().map(|class| {
-            let class_ident =
-                declarations.allocate(sanitize_cpp_ident(&class.name).into_owned());
-            let mut path = module_classes_dir.join(&class_ident);
+            let class_ident = declarations.allocate(sanitize_cpp_ident(&class.name).into_owned());
+            let file_stem = unique_slug(&class_ident, &mut class_file_names);
+            let mut path = module_classes_dir.join(file_stem);
             path.set_extension("hpp");
             (path, slug.clone(), class_ident, class)
         }));
@@ -865,20 +857,23 @@ pub fn dump_module_headers(out_dir: &std::path::Path, schemas: &SchemaMap) -> st
                 .try_for_each(|(module, classes, enums, slug)| {
                     let mut path = modules_dir.join(slug);
                     path.set_extension("hpp");
-                    std::fs::write(path, write_module_header(module, slug, classes, enums))
+                    super::write_staged(&path, write_module_header(module, slug, classes, enums))
+                        .map_err(|err| std::io::Error::other(err.to_string()))
                 })
         },
         || {
             class_files
                 .par_iter()
                 .try_for_each(|(path, module_ident, class_ident, class)| {
-                    std::fs::write(path, write_class_header(module_ident, class_ident, class))
+                    super::write_staged(path, write_class_header(module_ident, class_ident, class))
+                        .map_err(|err| std::io::Error::other(err.to_string()))
                 })
         },
     );
     module_res?;
     class_res?;
-    std::fs::write(out_dir.join("sdk").join("modules.hpp"), umbrella)?;
+    super::write_staged(&out_dir.join("sdk").join("modules.hpp"), umbrella)
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
     Ok(())
 }
 pub fn dump_sdk(
@@ -914,7 +909,9 @@ pub fn dump_sdk(
         (sdk_dir.join("sdk.hpp"), umbrella),
     ]
     .into_par_iter()
-    .try_for_each(|(path, body)| std::fs::write(path, body))?;
+    .try_for_each(|(path, body)| {
+        super::write_staged(&path, body).map_err(|err| std::io::Error::other(err.to_string()))
+    })?;
 
     let emitted_classes = classes
         .iter()
@@ -967,6 +964,7 @@ mod tests {
         assert!(matches!(slug, Cow::Borrowed(_)));
         assert!(std::ptr::eq(slug.as_ref().as_ptr(), module.as_ptr()));
         assert_eq!(module_slug("engine2.dll").as_ref(), "engine2");
+        assert_eq!(module_slug("CLIENT.DLL").as_ref(), "CLIENT");
         assert_eq!(module_slug("client_dll").as_ref(), "client");
         assert_eq!(module_slug("namespace.dll").as_ref(), "_namespace");
         assert_eq!(module_slug("3d.dll").as_ref(), "_3d");
@@ -1000,7 +998,10 @@ mod tests {
         );
         let class_body = write_class_header("_namespace", "C_Test", &class);
         for body in [&module_body, &class_body] {
-            assert!(!body.contains("\n#define"), "schema text escaped a comment: {body}");
+            assert!(
+                !body.contains("\n#define"),
+                "schema text escaped a comment: {body}"
+            );
         }
     }
 
@@ -1210,18 +1211,13 @@ mod tests {
                         "CEntityIdentity",
                         vec![field("m_designerName", "CUtlSymbolLarge", 0x20)],
                     ),
-                    dummy(
-                        "C_CSPlayerPawn",
-                        vec![field("m_vecOrigin", "Vector", 0x10)],
-                    ),
+                    dummy("C_CSPlayerPawn", vec![field("m_vecOrigin", "Vector", 0x10)]),
                 ],
                 Vec::new(),
             ),
         )]);
-        let root = std::env::temp_dir().join(format!(
-            "cs2-dumper-sdk-baked-types-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("cs2-dumper-sdk-baked-types-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         dump_sdk(&root, &schemas, Some(1)).expect("write sdk");
         let types = std::fs::read_to_string(root.join("sdk/sdk_types.hpp")).unwrap();
@@ -1308,8 +1304,7 @@ mod tests {
             static_fields: Vec::new(),
             flags: Vec::new(),
         };
-        let schemas =
-            SchemaMap::from([("client.dll".to_string(), (vec![derived], Vec::new()))]);
+        let schemas = SchemaMap::from([("client.dll".to_string(), (vec![derived], Vec::new()))]);
         let (enums, classes) = collect_sdk_data(&schemas);
         let body = write_sdk_classes(&classes, &enums);
         assert!(
@@ -1428,7 +1423,10 @@ mod tests {
     #[test]
     fn resource_handles_are_eight_bytes_entity_handles_are_four() {
         let known = HashSet::new();
-        assert_eq!(resolve_type("CHandle< C_BaseEntity >", &known).cpp_type, "uint32_t");
+        assert_eq!(
+            resolve_type("CHandle< C_BaseEntity >", &known).cpp_type,
+            "uint32_t"
+        );
         assert_eq!(
             resolve_type("CStrongHandle< InfoForResourceTypeCModel >", &known).cpp_type,
             "uint64_t"
@@ -1590,10 +1588,7 @@ mod tests {
         };
         let schemas = SchemaMap::from([(
             "client.dll".to_string(),
-            (
-                vec![identity, vector, base, derived, orphan],
-                vec![enum_],
-            ),
+            (vec![identity, vector, base, derived, orphan], vec![enum_]),
         )]);
 
         dump_sdk(&root, &schemas, Some(12345)).expect("write synthetic SDK");

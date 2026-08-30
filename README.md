@@ -1,5 +1,8 @@
 # cs2-dumper
 
+> Platform: Windows x86-64 only. Linux, macOS, and 32-bit Windows builds are intentionally unsupported.
+
+
 Counter-Strike 2 外部 offset / schema / SDK dumper。单 exe、默认全量输出。
 
 本仓库是若干公开 GitHub 项目的融合：分析管线来自 [a2x/cs2-dumper](https://github.com/a2x/cs2-dumper)，消费端 include-tree SDK 来自 [scros22/cs2-universal-offsets](https://github.com/scros22/cs2-universal-offsets)，离线 LoadLibrary、注入注册 schema、syscall 读内存等来自下面列出的其它 dumper。**借鉴的东西都可以在 GitHub 找到**，完整出处见 [Credits](#credits)。
@@ -33,6 +36,8 @@ cs2-dumper.exe
 ```
 
 不传参数就会跑完全部阶段，写出扁平多语言文件、C++ include-tree，以及全局命名空间 `sdk/`。
+
+如不希望回退扫描所有盘符，可设置环境变量 `CS2_DUMPER_SKIP_DRIVE_SCAN=1`；这不会影响注册表、Steam VDF 和常见路径探测。
 
 1. 本机有 `cs2.exe`：attach 后 dump 活进程。
 2. 没有游戏进程、且未指定 memflow 插件（`-c pcileech` / `kvm` / `winio`）：从注册表 / `libraryfolders.vdf` / 本地盘自动找 `steamapps/common/Counter-Strike*`，把 schema DLL `LoadLibrary` 进 **dumper 自己的进程** 再 dump（不是注入 `cs2.exe`）。插件连接器上找不到 `cs2.exe` 会直接失败，不会误 dump 本机 LoadLibrary 镜像。

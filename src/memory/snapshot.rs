@@ -1,7 +1,7 @@
 //! Cached module list shared by the local and syscall backends.
 
 use memflow::cglue::{CTup2, CTup3};
-use memflow::mem::mem_data::{opt_call, MemOps, WriteRawMemOps};
+use memflow::mem::mem_data::{MemOps, WriteRawMemOps, opt_call};
 use memflow::prelude::v1::*;
 
 pub struct ProcessSnapshot {

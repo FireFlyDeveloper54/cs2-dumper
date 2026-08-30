@@ -148,15 +148,12 @@ pub fn live_entities<P: MemoryView>(
         let chunk_index = slot >> 9;
         if chunk_index != cached_chunk_index {
             cached_chunk_index = chunk_index;
-            let Some(chunk_slot) = list
-                .checked_add(layout.chunk_array_base)
-                .and_then(|value| {
-                    layout
-                        .chunk_ptr_stride
-                        .checked_mul(chunk_index as u64)
-                        .and_then(|stride| value.checked_add(stride))
-                })
-            else {
+            let Some(chunk_slot) = list.checked_add(layout.chunk_array_base).and_then(|value| {
+                layout
+                    .chunk_ptr_stride
+                    .checked_mul(chunk_index as u64)
+                    .and_then(|stride| value.checked_add(stride))
+            }) else {
                 continue;
             };
             cached_chunk = rd_u64(process, chunk_slot);
@@ -212,15 +209,12 @@ fn score_layout<P: MemoryView>(process: &mut P, list: u64, layout: EntityListLay
     }
     let mut score = 0;
     for chunk_index in 0..8u64 {
-        let Some(chunk_slot) = list
-            .checked_add(layout.chunk_array_base)
-            .and_then(|value| {
-                layout
-                    .chunk_ptr_stride
-                    .checked_mul(chunk_index)
-                    .and_then(|stride| value.checked_add(stride))
-            })
-        else {
+        let Some(chunk_slot) = list.checked_add(layout.chunk_array_base).and_then(|value| {
+            layout
+                .chunk_ptr_stride
+                .checked_mul(chunk_index)
+                .and_then(|stride| value.checked_add(stride))
+        }) else {
             break;
         };
         let chunk = rd_u64(process, chunk_slot);

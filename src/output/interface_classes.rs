@@ -21,8 +21,8 @@ use std::fmt::Write;
 
 use crate::analysis::InterfaceMap;
 
-use super::ident::{cpp_identifier, sanitize_ident, type_ident, IdentifierAllocator};
 use super::comment_text;
+use super::ident::{IdentifierAllocator, cpp_identifier, sanitize_ident, type_ident};
 
 pub struct Method<'a> {
     pub index: usize,
@@ -78,6 +78,10 @@ fn module_ns(module: &str) -> Cow<'_, str> {
     sanitize_ident(module.trim_end_matches(".dll"))
 }
 
+type IfaceGroup<'a> = (&'a IfaceClass<'a>, Vec<(&'a str, Option<u64>)>);
+
+type GroupedIfaces<'a> = BTreeMap<&'a str, BTreeMap<String, IfaceGroup<'a>>>;
+
 fn class_ns(c: &IfaceClass<'_>) -> String {
     c.rtti_class
         .as_deref()
@@ -125,8 +129,7 @@ pub fn render_hpp(
     // Group by RTTI class so one struct describes one vtable shape, but keep
     // every interface's own singleton RVA: sharing an RTTI class does not mean
     // sharing an instance, and the analysis pass resolves the RVA per interface.
-    let mut grouped: BTreeMap<&str, BTreeMap<String, (&IfaceClass<'_>, Vec<(&str, Option<u64>)>)>> =
-        BTreeMap::new();
+    let mut grouped: GroupedIfaces<'_> = BTreeMap::new();
     for c in &sorted {
         let entry = grouped
             .entry(c.module)
@@ -249,7 +252,7 @@ pub fn render_hpp(
 
 #[cfg(test)]
 mod tests {
-    use super::{module_ns, render_hpp, IfaceClass, Method};
+    use super::{IfaceClass, Method, module_ns, render_hpp};
     use crate::analysis::InterfaceMap;
     use std::borrow::Cow;
 

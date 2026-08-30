@@ -208,57 +208,48 @@ pub fn load_pattern_file(path: &Path) -> Result<Vec<PatternSpec>> {
     entries
         .into_iter()
         .map(|entry| {
-            if entry.name.trim().is_empty() || entry.module.trim().is_empty() {
+            // Normalize human-edited files once at the boundary so surrounding
+            // whitespace cannot create a distinct key from the built-in entry.
+            let name = entry.name.trim().to_string();
+            let module = entry.module.trim().to_string();
+            if name.is_empty() || module.is_empty() {
                 return Err(anyhow!("pattern name and module must not be empty"));
             }
             let resolve = match entry.resolve {
                 ExternalResolve::Raw => ResolveKind::None,
                 ExternalResolve::Rel32 => ResolveKind::Rel32 {
                     rel_off: entry.rel_off.ok_or_else(|| {
-                        anyhow!(
-                            "{}::{} uses rel32 but has no rel_off",
-                            entry.module,
-                            entry.name
-                        )
+                        anyhow!("{}::{} uses rel32 but has no rel_off", module, name)
                     })?,
                 },
                 ExternalResolve::Riprel => ResolveKind::RipRel {
                     rel_off: entry.rel_off.ok_or_else(|| {
-                        anyhow!(
-                            "{}::{} uses riprel but has no rel_off",
-                            entry.module,
-                            entry.name
-                        )
+                        anyhow!("{}::{} uses riprel but has no rel_off", module, name)
                     })?,
                 },
                 ExternalResolve::StringRef => ResolveKind::StringRef,
             };
             match resolve {
                 ResolveKind::StringRef => {
-                    if entry.pattern.is_empty() {
+                    if entry.pattern.trim().is_empty() {
                         return Err(anyhow!(
                             "string reference {}::{} must not be empty",
-                            entry.module,
-                            entry.name
+                            module,
+                            name
                         ));
                     }
                 }
                 _ => {
-                    parse_ida(&entry.pattern).with_context(|| {
-                        format!("invalid pattern {}::{}", entry.module, entry.name)
-                    })?;
+                    parse_ida(&entry.pattern)
+                        .with_context(|| format!("invalid pattern {}::{}", module, name))?;
                 }
             }
-            if !keys.insert(pattern_key(&entry.module, &entry.name)) {
-                return Err(anyhow!(
-                    "duplicate external pattern {}::{}",
-                    entry.module,
-                    entry.name
-                ));
+            if !keys.insert(pattern_key(&module, &name)) {
+                return Err(anyhow!("duplicate external pattern {}::{}", module, name));
             }
             Ok(PatternSpec {
-                name: entry.name,
-                module: entry.module,
+                name,
+                module,
                 needle: entry.pattern,
                 resolve,
                 extra_off: entry.extra_off,
@@ -288,7 +279,11 @@ pub fn merged_patterns(builtins: &[Pattern], external: Vec<PatternSpec>) -> Vec<
 }
 
 fn pattern_key(module: &str, name: &str) -> String {
-    format!("{}::{}", ascii_lower_cow(module), ascii_lower_cow(name))
+    let module = ascii_lower_cow(module);
+    let name = ascii_lower_cow(name);
+    // Length-prefix both components so unusual user-provided names cannot
+    // collide merely because they contain the historical `::` separator.
+    format!("{}:{}:{}", module.len(), module, name)
 }
 
 fn canonical_module_name(module: &str) -> Cow<'_, str> {
@@ -531,7 +526,8 @@ where
                 // A `stringref` needle is a literal, not a byte pattern.
             } else if repair_attempts >= repair::MAX_REPAIR_ATTEMPTS {
                 repairs_skipped += 1;
-            } else if let Some(mc) = module_cache.get(canonical_module_name(sig.module()).as_ref()) {
+            } else if let Some(mc) = module_cache.get(canonical_module_name(sig.module()).as_ref())
+            {
                 repair_attempts += 1;
                 if let Some((suggestion, recovered)) = try_repair(mc, sig, options.auto_repair) {
                     log::warn!(
@@ -1307,7 +1303,9 @@ fn capture_prologue(mc: &ModuleCache, rva: u64) -> Option<String> {
 
 fn relative_target(base: u64, rva: usize, instruction_len: u64, disp: i64) -> Option<u64> {
     let target = base as i128 + rva as i128 + instruction_len as i128 + disp as i128;
-    (0..=u64::MAX as i128).contains(&target).then_some(target as u64)
+    (0..=u64::MAX as i128)
+        .contains(&target)
+        .then_some(target as u64)
 }
 
 fn resolve<S: PatternLike>(
@@ -1707,6 +1705,28 @@ mod tests {
     }
 
     #[test]
+    fn external_patterns_trim_keys_before_overriding_builtins() {
+        let builtins = [Pattern {
+            name: "Existing",
+            module: "client.dll",
+            needle: "48 8B 01",
+            resolve: ResolveKind::None,
+            extra_off: 0,
+            prototype: "",
+        }];
+        let path = temp_pattern_file(
+            r#"[{"name":"  Existing  ","module":" CLIENT.DLL ","pattern":"48 8B 02"}]"#,
+        );
+        let external = load_pattern_file(&path).expect("parse trimmed external pattern");
+        let merged = merged_patterns(&builtins, external);
+        std::fs::remove_file(path).expect("remove pattern file");
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "Existing");
+        assert_eq!(merged[0].module, "CLIENT.DLL");
+        assert_eq!(merged[0].needle, "48 8B 02");
+    }
+    #[test]
     fn external_pattern_file_rejects_duplicate_keys() {
         let path = temp_pattern_file(
             r#"[
@@ -1735,7 +1755,7 @@ mod tests {
 
         let path = temp_pattern_file(
             r#"[
-                {"name":"Empty","module":"client.dll","pattern":"","resolve":"string_ref"}
+                {"name":"Empty","module":"client.dll","pattern":"   ","resolve":"string_ref"}
             ]"#,
         );
         let error = load_pattern_file(&path).expect_err("empty string reference must fail");
@@ -2048,7 +2068,9 @@ mod tests {
         );
         let short = tokens[..16].join(" ");
         assert_eq!(
-            find_ida(text, &short).expect("shipped finder parses 16-byte prefix").len(),
+            find_ida(text, &short)
+                .expect("shipped finder parses 16-byte prefix")
+                .len(),
             2,
             "the 16-byte prefix must stay ambiguous so uniqueness actually chose a longer synth"
         );
@@ -2116,7 +2138,10 @@ mod tests {
 
         let cached = cached_hit(&pattern, 16, uncached.matches);
         let (warm, used_cache) = scan_one_cached(&module, &pattern, Some(&cached));
-        assert!(used_cache, "duplicate prologue must not reject a still-valid cached RVA");
+        assert!(
+            used_cache,
+            "duplicate prologue must not reject a still-valid cached RVA"
+        );
         assert_eq!(warm.match_rva, Some(16));
         let synth = warm
             .pattern_synth
@@ -2127,7 +2152,10 @@ mod tests {
             "duplicated prologue still wildcards the planted CALL: {synth}"
         );
         let hits = find_ida(module.text(), synth).expect("shipped finder parses cache synth");
-        assert!(hits.contains(&16), "cache synth must still match site A: {hits:?}");
+        assert!(
+            hits.contains(&16),
+            "cache synth must still match site A: {hits:?}"
+        );
         assert!(
             hits.len() >= 2,
             "local cache synth must not uniqueness-walk; duplicated prologue should match twice: {hits:?}"
@@ -2387,8 +2415,14 @@ mod tests {
         let out = display_name(dw);
         assert!(matches!(out, Cow::Borrowed(_)));
         assert!(std::ptr::eq(out.as_ref().as_ptr(), dw.as_ptr()));
-        assert_eq!(display_name("CCSPlayer_RunCommand_Context").as_ref(), "RunCommand_Context");
-        assert_eq!(display_name("client.dll::CreateMove").as_ref(), "CreateMove");
+        assert_eq!(
+            display_name("CCSPlayer_RunCommand_Context").as_ref(),
+            "RunCommand_Context"
+        );
+        assert_eq!(
+            display_name("client.dll::CreateMove").as_ref(),
+            "CreateMove"
+        );
     }
 
     #[test]
@@ -2403,7 +2437,10 @@ mod tests {
         };
         let needle = pattern.needle_cow();
         assert!(matches!(needle, Cow::Borrowed(_)));
-        assert!(std::ptr::eq(needle.as_ref().as_ptr(), pattern.needle.as_ptr()));
+        assert!(std::ptr::eq(
+            needle.as_ref().as_ptr(),
+            pattern.needle.as_ptr()
+        ));
         let name = pattern.display_name_cow();
         assert!(matches!(name, Cow::Borrowed(_)));
         assert!(std::ptr::eq(name.as_ref().as_ptr(), pattern.name.as_ptr()));
@@ -2416,7 +2453,10 @@ mod tests {
         assert!(matches!(out, Cow::Borrowed(_)));
         assert!(std::ptr::eq(out.as_ref().as_ptr(), module.as_ptr()));
         assert_eq!(canonical_module_name("CLIENT.DLL").as_ref(), "client.dll");
-        assert_eq!(canonical_module_name("  engine2.dll").as_ref(), "engine2.dll");
+        assert_eq!(
+            canonical_module_name("  engine2.dll").as_ref(),
+            "engine2.dll"
+        );
     }
 
     #[test]
@@ -2447,14 +2487,33 @@ mod tests {
             "client.dll\0dwentitylist"
         );
         let index = PatternCacheIndex::from_cache(Some(&cache));
-        assert!(index.get("client.dll", "DWENTITYLIST", "48 8B 0D").is_some());
+        assert!(
+            index
+                .get("client.dll", "DWENTITYLIST", "48 8B 0D")
+                .is_some()
+        );
         assert!(
             index.get("client.dll", "dwEntityList", "DE AD").is_none(),
             "a drifted needle must miss the cache and rescan"
         );
-        assert!(index.get("engine2.dll", "dwEntityList", "48 8B 0D").is_none());
-        assert!(PatternCacheIndex::from_cache(None)
-            .get("client.dll", "dwEntityList", "48 8B 0D")
-            .is_none());
+        assert!(
+            index
+                .get("engine2.dll", "dwEntityList", "48 8B 0D")
+                .is_none()
+        );
+        assert!(
+            PatternCacheIndex::from_cache(None)
+                .get("client.dll", "dwEntityList", "48 8B 0D")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pattern_keys_are_unambiguous_for_separator_containing_names() {
+        assert_ne!(pattern_key("a::b", "c"), pattern_key("a", "b::c"));
+        assert_eq!(
+            pattern_key("CLIENT.DLL", "DwEntityList"),
+            pattern_key("client.dll", "dwentitylist")
+        );
     }
 }

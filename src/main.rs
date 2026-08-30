@@ -1,3 +1,8 @@
+#[cfg(not(windows))]
+compile_error!("cs2-dumper supports Windows only");
+#[cfg(all(windows, not(target_arch = "x86_64")))]
+compile_error!("cs2-dumper requires the x86_64 Windows target");
+
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -56,7 +61,10 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let file_types: Vec<String> = dump::FILE_TYPES.iter().map(|s| (*s).to_string()).collect();
     fs::create_dir_all(&args.output).with_context(|| {
-        format!("failed to create output directory {}", args.output.display())
+        format!(
+            "failed to create output directory {}",
+            args.output.display()
+        )
     })?;
     ui::init(args.no_sound);
     ui::banner();
@@ -90,6 +98,16 @@ fn main() -> Result<()> {
         );
     }
 
+    // Validate connector arguments before any backend can attach, inject, or
+    // load game modules. A malformed value must be a side-effect-free CLI error.
+    let conn_args = args
+        .connector_args
+        .as_deref()
+        .map(ConnectorArgs::from_str)
+        .transpose()
+        .map_err(|err| anyhow::anyhow!("unable to parse connector arguments: {err}"))?
+        .unwrap_or_default();
+
     let dump_cfg = |backend: &str,
                     loadlib_schema_va: Option<u64>,
                     used_load_lib: bool,
@@ -108,10 +126,6 @@ fn main() -> Result<()> {
     };
 
     if memory::syscall::is_syscall_connector(args.connector.as_deref()) {
-        #[cfg(not(windows))]
-        {
-            anyhow::bail!("-c syscall is Windows-only");
-        }
         #[cfg(windows)]
         {
             ui::section("Target");
@@ -128,10 +142,6 @@ fn main() -> Result<()> {
     let mut shade_bindings: Vec<String> = Vec::new();
     let shade_mode = memory::shade::is_shade_connector(args.connector.as_deref());
     if shade_mode {
-        #[cfg(not(windows))]
-        {
-            anyhow::bail!("-c shade is Windows-only");
-        }
         #[cfg(windows)]
         {
             ui::section("Target");
@@ -152,23 +162,11 @@ fn main() -> Result<()> {
         }
     }
 
-    let conn_args = args
-        .connector_args
-        .as_deref()
-        .map(ConnectorArgs::from_str)
-        .transpose()
-        .map_err(|err| anyhow::anyhow!("unable to parse connector arguments: {err}"))?
-        .unwrap_or_default();
-
     let mut os = match args.connector.as_deref() {
         Some(_) if shade_mode => {
             #[cfg(windows)]
             {
                 memflow_native::create_os(&OsArgs::default(), LibArc::default())?
-            }
-            #[cfg(not(windows))]
-            {
-                anyhow::bail!("-c shade is Windows-only")
             }
         }
         Some(conn) => {
@@ -184,10 +182,6 @@ fn main() -> Result<()> {
             #[cfg(windows)]
             {
                 memflow_native::create_os(&OsArgs::default(), LibArc::default())?
-            }
-            #[cfg(not(windows))]
-            {
-                anyhow::bail!("no connector specified; pass --connector on this platform")
             }
         }
     };
@@ -216,10 +210,6 @@ fn main() -> Result<()> {
         ));
         for (name, err) in &report.failed {
             ui::warn(format_args!("{name}: {err}"));
-        }
-        #[cfg(not(windows))]
-        {
-            anyhow::bail!("LoadLibrary dump is Windows-only");
         }
         #[cfg(windows)]
         {
@@ -251,10 +241,7 @@ fn main() -> Result<()> {
     )
 }
 
-fn dump_or_fail<P: Process + MemoryView>(
-    process: &mut P,
-    cfg: &dump::Config<'_>,
-) -> Result<()> {
+fn dump_or_fail<P: Process + MemoryView>(process: &mut P, cfg: &dump::Config<'_>) -> Result<()> {
     match dump::run(process, cfg) {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -275,10 +262,7 @@ fn log_file_or_warn(log_path: &Path) -> Option<File> {
     match File::create(log_path) {
         Ok(file) => Some(file),
         Err(err) => {
-            eprintln!(
-                "unable to write log file {}: {err}",
-                log_path.display()
-            );
+            eprintln!("unable to write log file {}: {err}", log_path.display());
             None
         }
     }
@@ -302,11 +286,7 @@ fn init_logging(verbose: u8, log_path: &Path) -> Result<()> {
         ColorChoice::Auto,
     )];
     if let Some(file) = log_file_or_warn(log_path) {
-        loggers.push(WriteLogger::new(
-            LevelFilter::Info,
-            Config::default(),
-            file,
-        ));
+        loggers.push(WriteLogger::new(LevelFilter::Info, Config::default(), file));
     }
     CombinedLogger::init(loggers)?;
     Ok(())
@@ -317,7 +297,10 @@ fn load_pattern_cache(output: &std::path::Path) -> Option<patterns::PatternCache
     if !path.is_file() {
         return None;
     }
-    match fs::read_to_string(&path).ok().and_then(|raw| serde_json::from_str(&raw).ok()) {
+    match fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+    {
         Some(cache) => Some(cache),
         None => {
             log::warn!("unable to load pattern cache {}", path.display());
@@ -343,10 +326,7 @@ mod tests {
 
     #[test]
     fn log_file_or_warn_returns_none_when_the_path_is_a_directory() {
-        let dir = std::env::temp_dir().join(format!(
-            "cs2-dumper-log-dir-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("cs2-dumper-log-dir-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("temp log dir");
         assert!(

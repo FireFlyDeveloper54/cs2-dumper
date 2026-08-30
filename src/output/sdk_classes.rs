@@ -62,9 +62,7 @@ use crate::analysis::{ButtonMap, Class, Enum, SchemaMap};
 
 use super::comment_text;
 use super::cpp_types;
-use super::ident::{
-    cpp_type_ident, slugify, IdentifierAllocator,
-};
+use super::ident::{IdentifierAllocator, cpp_type_ident, slugify};
 
 type TypeNsMap = BTreeMap<Arc<str>, Arc<str>>;
 
@@ -127,14 +125,16 @@ fn actual_owner_ns(
 ) -> String {
     if let Some(&owner) = canonical.get(type_name)
         && present_in.iter().any(|module| {
-            slugify(module.trim_end_matches(".dll")).as_ref() == owner
+            slugify(module.trim_end_matches(".dll").trim_end_matches(".DLL")).as_ref() == owner
         })
     {
         return owner.to_string();
     }
     present_in
         .iter()
-        .map(|module| slugify(module.trim_end_matches(".dll")).into_owned())
+        .map(|module| {
+            slugify(module.trim_end_matches(".dll").trim_end_matches(".DLL")).into_owned()
+        })
         .min_by_key(|stem| (stem.as_str() != "client", stem.clone()))
         .unwrap_or_else(|| "client".into())
 }
@@ -182,7 +182,7 @@ pub fn render_module_headers(
 
     // First pass: build type_namespace_map and apply dedup
     for (module, (classes, enums)) in schemas {
-        let ns = slugify(module.trim_end_matches(".dll"));
+        let ns = slugify(module.trim_end_matches(".dll").trim_end_matches(".DLL"));
         let ns_arc = intern_stem.intern(ns.as_ref());
         interned_ns.insert(module.as_str(), Arc::clone(&ns_arc));
 
@@ -193,11 +193,8 @@ pub fn render_module_headers(
                 .get(class_name.as_ref())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let owner = actual_owner_ns(
-                class_name.as_ref(),
-                present,
-                &canonical_type_namespace_map,
-            );
+            let owner =
+                actual_owner_ns(class_name.as_ref(), present, &canonical_type_namespace_map);
             let name: Arc<str> = Arc::from(class_name.as_ref());
             type_namespace_map
                 .entry(Arc::clone(&name))
@@ -214,11 +211,7 @@ pub fn render_module_headers(
                 .get(enum_name.as_ref())
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let owner = actual_owner_ns(
-                enum_name.as_ref(),
-                present,
-                &canonical_type_namespace_map,
-            );
+            let owner = actual_owner_ns(enum_name.as_ref(), present, &canonical_type_namespace_map);
             let name: Arc<str> = Arc::from(enum_name.as_ref());
             type_namespace_map
                 .entry(Arc::clone(&name))
@@ -538,7 +531,7 @@ fn render_one_module(
     let timestamp = context.timestamp;
     let type_namespace_map = context.type_namespace_map;
     let module_index_map = context.module_index_map;
-    let ns = slugify(module.trim_end_matches(".dll"));
+    let ns = slugify(module.trim_end_matches(".dll").trim_end_matches(".DLL"));
     let mut s = String::with_capacity(64 * 1024);
     let mut enum_defs: BTreeMap<String, &'static str> = BTreeMap::new();
     let mut schema_field_types: BTreeSet<String> = BTreeSet::new();
@@ -800,7 +793,10 @@ fn render_one_module(
                 writeln!(
                     s,
                     "        SCHEMA_FIELD({:<32}, {:<48}, {:#X}) // {}",
-                    safe_ty, field_name, f.offset, comment_text(&f.type_name),
+                    safe_ty,
+                    field_name,
+                    f.offset,
+                    comment_text(&f.type_name),
                 )
                 .ok();
             } else {
@@ -1016,7 +1012,7 @@ fn write_banner(
 /// each class with size/alignment/metadata and each field with its offset,
 /// type and annotation names. Powers the site's class browser and `/api`.
 pub fn render_schemas_json(schemas: &SchemaMap) -> Result<String, serde_json::Error> {
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
 
     let meta_str = |m: &crate::analysis::ClassMetadata| -> String {
         match m {
@@ -1337,7 +1333,7 @@ mod tests {
     /// placing every base before its derived class.
     #[test]
     fn topological_order_follows_the_input_and_keeps_bases_first() {
-        let owned = vec![
+        let owned = [
             bare_class("CRootB", None),
             bare_class("CDerivedOfA", Some("CRootA")),
             bare_class("CRootA", None),
@@ -1871,10 +1867,7 @@ mod tests {
             ],
             flags: Vec::new(),
         };
-        let schemas = SchemaMap::from([(
-            "client.dll".to_string(),
-            (vec![class], vec![malformed]),
-        )]);
+        let schemas = SchemaMap::from([("client.dll".to_string(), (vec![class], vec![malformed]))]);
         let body = &render_module_headers(&schemas, &BTreeMap::new(), None, "now")[0].body;
         assert!(body.contains("SCHEMA_FIELD(std::int32_t"));
         assert!(body.contains("_class"));

@@ -23,7 +23,10 @@ mod tests {
 
     #[test]
     fn type_scopes_vector_sits_at_0x190() {
-        assert_eq!(size_of::<crate::source2::UtlVector<Pointer64<SchemaSystemTypeScope>>>(), 0x10);
+        assert_eq!(
+            size_of::<crate::source2::UtlVector<Pointer64<SchemaSystemTypeScope>>>(),
+            0x10
+        );
         assert_eq!(offset_of!(SchemaSystem, type_scopes), 0x190);
         assert_eq!(offset_of!(SchemaSystem, registration_count), 0x280);
     }

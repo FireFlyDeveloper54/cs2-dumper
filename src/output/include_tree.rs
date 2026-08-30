@@ -138,7 +138,7 @@ pub fn dump(
                                 out_dir,
                                 &impl_dir,
                                 &engine_dir,
-                        result,
+                                result,
                                 build_number,
                                 csgo_input_rva,
                             )

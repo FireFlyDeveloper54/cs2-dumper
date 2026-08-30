@@ -37,7 +37,10 @@ pub fn discover<'a, P: Process + MemoryView>(
         }
         let Some(rva) = hit.rva else { continue };
 
-        let Some((_, base, _)) = modules.iter().find(|(n, _, _)| n.as_ref() == hit.module.as_ref()) else {
+        let Some((_, base, _)) = modules
+            .iter()
+            .find(|(n, _, _)| n.as_ref() == hit.module.as_ref())
+        else {
             continue;
         };
         let Some(singleton_va) = base.checked_add(rva) else {
@@ -53,13 +56,10 @@ pub fn discover<'a, P: Process + MemoryView>(
         }
 
         // Locate which module hosts the vtable.
-        let Some((_, vt_mod_base, vt_mod_size)) = modules
-            .iter()
-            .find(|(_, b, s)| {
-                b.checked_add(*s)
-                    .is_some_and(|end| vt_va >= *b && vt_va < end)
-            })
-        else {
+        let Some((_, vt_mod_base, vt_mod_size)) = modules.iter().find(|(_, b, s)| {
+            b.checked_add(*s)
+                .is_some_and(|end| vt_va >= *b && vt_va < end)
+        }) else {
             continue;
         };
 
@@ -107,10 +107,10 @@ fn walk_vtable_methods<P: MemoryView>(
     let mut count = 0;
     for chunk in raw.as_chunks::<8>().0 {
         let p = u64::from_le_bytes(*chunk);
-        if !modules.iter().any(|(_, b, s)| {
-            b.checked_add(*s)
-                .is_some_and(|end| p >= *b && p < end)
-        }) {
+        if !modules
+            .iter()
+            .any(|(_, b, s)| b.checked_add(*s).is_some_and(|end| p >= *b && p < end))
+        {
             break;
         }
         count += 1;

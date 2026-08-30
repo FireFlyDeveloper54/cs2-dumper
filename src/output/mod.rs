@@ -2,7 +2,7 @@ use std::fmt::{self, Write};
 use std::fs;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rayon::prelude::*;
 
 use chrono::{DateTime, Utc};
@@ -12,6 +12,53 @@ use serde_json::json;
 use formatter::Formatter;
 
 use crate::analysis::*;
+#[cfg(windows)]
+pub(crate) fn write_staged(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("output"),
+        std::process::id()
+    ));
+    if let Err(err) = fs::write(&tmp, contents.as_ref()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow::anyhow!(
+            "failed to write temporary {}: {err}",
+            tmp.display()
+        ));
+    }
+    let result = {
+        use std::os::windows::ffi::OsStrExt;
+        unsafe extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        }
+        let source: Vec<u16> = tmp
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let target: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let ok = unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 0x1 | 0x8) };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+    if let Err(err) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow::anyhow!(
+            "failed to replace {}: {err}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
 
 pub(crate) mod amalgamation;
 mod buttons;
@@ -285,7 +332,8 @@ impl<'a> Output<'a> {
             "outputs": outputs,
         }))?;
 
-        fs::write(self.out_dir.join("manifest.json"), content)?;
+        let path = self.out_dir.join("manifest.json");
+        write_staged(&path, content)?;
         Ok(())
     }
     fn dump_info(&self) -> Result<()> {
@@ -298,7 +346,8 @@ impl<'a> Output<'a> {
             "build_number": build_number,
         }))?;
 
-        fs::write(&file_path, &content)?;
+        fs::write(&file_path, &content)
+            .with_context(|| format!("failed to write {}", file_path.display()))?;
 
         Ok(())
     }
@@ -319,7 +368,7 @@ impl<'a> Output<'a> {
         item.write(&mut fmt, file_type)?;
         let mut path = self.out_dir.join(file_name);
         path.set_extension(file_type);
-        fs::write(path, out)?;
+        write_staged(&path, out)?;
         Ok(())
     }
 
@@ -344,13 +393,31 @@ impl<'a> Output<'a> {
     }
 
     fn dump_schemas(&self) -> Result<()> {
-        let first_err = self
+        // Schema scope names come from the target process. Distinct names can
+        // sanitize to the same path (for example foo.dll and foo_dll), and
+        // Windows treats case-only differences as the same file. Allocate the
+        // stems before entering rayon so every module gets a deterministic,
+        // collision-free output path.
+        let mut used_stems = std::collections::BTreeSet::new();
+        let modules: Vec<_> = self
             .result
             .schemas
-            .par_iter()
-            .filter_map(|(module_name, (classes, enums))| {
+            .iter()
+            .map(|(module_name, (classes, enums))| {
+                (
+                    ident::unique_slug(module_name, &mut used_stems),
+                    module_name,
+                    classes,
+                    enums,
+                )
+            })
+            .collect();
+
+        let first_err = modules
+            .into_par_iter()
+            .filter_map(|(file_name, module_name, classes, enums)| {
                 self.dump_item(
-                    ident::slugify(module_name).as_ref(),
+                    &file_name,
                     &Item::SchemaModule(schemas::SchemaModule {
                         module_name,
                         classes,
@@ -370,7 +437,6 @@ impl<'a> Output<'a> {
             None => Ok(()),
         }
     }
-
     fn write_banner(&self, fmt: &mut Formatter<'_>) -> Result<()> {
         writeln!(fmt, "// Generated using https://github.com/a2x/cs2-dumper")?;
         writeln!(fmt, "// {}\n", self.timestamp)?;
@@ -663,8 +729,8 @@ mod tests {
             vtables: Default::default(),
         };
         let file_types = vec!["json".to_string()];
-        let output = Output::new(&file_types, 4, &out_dir, &result, None)
-            .expect("create output writer");
+        let output =
+            Output::new(&file_types, 4, &out_dir, &result, None).expect("create output writer");
 
         let error = output
             .dump_all()
@@ -724,7 +790,10 @@ mod tests {
             if kind == "rs" {
                 assert!(body.contains("class: usize") || body.contains("operator ="));
             } else {
-                assert!(body.contains("_class"), "{kind} did not escape class: {body}");
+                assert!(
+                    body.contains("_class"),
+                    "{kind} did not escape class: {body}"
+                );
                 assert!(
                     body.contains("_operator"),
                     "{kind} did not escape enum member: {body}"

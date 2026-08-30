@@ -201,6 +201,9 @@ mod tests {
             ..Default::default()
         };
         let hpp = render_hpp(&dump, None);
-        assert!(!hpp.contains("\n#define"), "runtime text escaped a comment: {hpp}");
+        assert!(
+            !hpp.contains("\n#define"),
+            "runtime text escaped a comment: {hpp}"
+        );
     }
 }

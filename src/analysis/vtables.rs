@@ -349,6 +349,10 @@ mod tests {
             )]),
         )]);
         recover_names(&mut map, &[hit("Connect", "client.dll", 0x9999)]);
-        assert!(map["client.dll"]["Source2Client002"].methods[0].name.is_none());
+        assert!(
+            map["client.dll"]["Source2Client002"].methods[0]
+                .name
+                .is_none()
+        );
     }
 }

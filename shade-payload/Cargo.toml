@@ -2,8 +2,13 @@
 name = "cs2-dumper-shade"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.88"
 description = "Optional in-process InstallSchemaBindings payload injected by cs2-dumper -c shade"
+license = "MIT"
+repository = "https://github.com/FireFlyDeveloper54/cs2-dumper"
 publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[workspace]

@@ -6,7 +6,7 @@
 //! *primitive* tokens (`int32`, `float32`, …) so a game update cannot map
 //! `int32` to `int32_t` in one emitter and leave it raw in the other.
 
-use phf::{phf_map, Map};
+use phf::{Map, phf_map};
 
 static PRIMITIVES: Map<&'static str, &'static str> = phf_map! {
     "bool" => "bool",
@@ -262,7 +262,10 @@ mod tests {
     fn enum_value_masked_accepts_language_storage_names() {
         assert_eq!(enum_value_masked(0x100, "byte"), 0);
         assert_eq!(enum_value_masked(-1, "u8"), 0xFF);
-        assert_eq!(enum_value_masked(i32::MAX as i64 + 1, "uint32_t"), 0x8000_0000);
+        assert_eq!(
+            enum_value_masked(i32::MAX as i64 + 1, "uint32_t"),
+            0x8000_0000
+        );
     }
 
     #[test]

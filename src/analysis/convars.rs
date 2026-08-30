@@ -43,7 +43,9 @@ const MAX_WALK: usize = 200_000;
 
 #[inline]
 fn indexed_addr(base: u64, stride: u64, index: u64) -> Option<u64> {
-    stride.checked_mul(index).and_then(|delta| base.checked_add(delta))
+    stride
+        .checked_mul(index)
+        .and_then(|delta| base.checked_add(delta))
 }
 
 // --- CCvar instance offsets ------------------------------------------------

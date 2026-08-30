@@ -120,7 +120,7 @@ pub fn toolhelp_snapshot(flags: u32, pid: u32) -> Result<HandleGuard> {
 pub fn find_pid(process_name: &str) -> Result<u32> {
     let snap = toolhelp_snapshot(TH32CS_SNAPPROCESS, 0)?;
     let mut entry = ProcessEntry32W {
-        dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
+        dw_size: u32::try_from(std::mem::size_of::<ProcessEntry32W>()).unwrap_or(u32::MAX),
         cnt_usage: 0,
         th32_process_id: 0,
         th32_default_heap_id: 0,
@@ -152,7 +152,7 @@ pub fn enumerate_modules(
 ) -> Result<Vec<ModuleInfo>> {
     let snap = toolhelp_snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)?;
     let mut entry = unsafe { std::mem::zeroed::<ModuleEntry32W>() };
-    entry.dw_size = std::mem::size_of::<ModuleEntry32W>() as u32;
+    entry.dw_size = u32::try_from(std::mem::size_of::<ModuleEntry32W>()).unwrap_or(u32::MAX);
     if unsafe { Module32FirstW(snap.get(), &mut entry) } == 0 {
         bail!("Module32FirstW(pid {pid}) failed ({})", last_error());
     }

@@ -8,4 +8,5 @@ pub mod syscall;
 pub(crate) mod win;
 
 #[cfg(any(test, feature = "bench"))]
+#[allow(dead_code)]
 pub(crate) mod fake;

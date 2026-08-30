@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SteamInf {
@@ -154,11 +154,6 @@ fn steam_roots_from_registry() -> Vec<PathBuf> {
     windows_reg::steam_install_paths()
 }
 
-#[cfg(not(windows))]
-fn steam_roots_from_registry() -> Vec<PathBuf> {
-    Vec::new()
-}
-
 fn env_steam_roots() -> Vec<PathBuf> {
     ["STEAM", "STEAM_PATH", "STEAMROOT", "STEAM_ROOT"]
         .iter()
@@ -174,13 +169,11 @@ fn well_known_steam_roots() -> Vec<PathBuf> {
             roots.push(base.join("Steam"));
         }
     }
-    if let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-    {
-        roots.push(home.join(".steam").join("steam"));
-        roots.push(home.join(".steam").join("root"));
-        roots.push(home.join(".local").join("share").join("Steam"));
+    // On Windows Steam is normally installed below Program Files or the
+    // user's profile. Do not carry Unix-only ~/.steam/.local fallbacks into
+    // this Windows-only binary: they can cause needless filesystem probes and
+    // make discovery results depend on unrelated compatibility environments.
+    if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
         roots.push(home.join("Steam"));
     }
     roots
@@ -198,6 +191,9 @@ fn drive_letters() -> Vec<PathBuf> {
 /// (`D:\games\Steam`, `E:\application\steam`, …) without baking in a machine
 /// path.
 fn discover_steam_roots_on_drives() -> Vec<PathBuf> {
+    if std::env::var_os("CS2_DUMPER_SKIP_DRIVE_SCAN").is_some() {
+        return Vec::new();
+    }
     let mut roots = Vec::new();
     for drive in drive_letters() {
         for name in [
@@ -279,11 +275,7 @@ fn cs2_candidates_in_common(common: &Path) -> Vec<PathBuf> {
         .filter(|path| is_counter_strike_folder(path))
         .cloned()
         .collect();
-    if named.is_empty() {
-        installs
-    } else {
-        named
-    }
+    if named.is_empty() { installs } else { named }
 }
 
 /// First CS2 folder from `trusted` Steam roots, otherwise from `fallback`.
@@ -385,17 +377,9 @@ mod windows_reg {
 }
 
 pub fn load(game_dir: &Path) -> Result<LoadLibReport> {
-    #[cfg(windows)]
-    {
-        let mut report = windows::load(game_dir)?;
-        report.steam_inf = read_steam_inf(game_dir);
-        Ok(report)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = game_dir;
-        bail!("LoadLibrary dump is only supported on Windows")
-    }
+    let mut report = windows::load(game_dir)?;
+    report.steam_inf = read_steam_inf(game_dir);
+    Ok(report)
 }
 
 /// Parse Valve `steam.inf` key=value lines (CS2: `game/csgo/steam.inf`).
@@ -447,7 +431,7 @@ fn resolve_game_file(game_dir: &Path, relative: &str) -> PathBuf {
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use crate::memory::win::{last_error, to_wide_path, GetProcAddress};
+    use crate::memory::win::{GetProcAddress, last_error, to_wide_path};
     use std::collections::BTreeMap;
     use std::ffi::CString;
 
@@ -497,9 +481,7 @@ mod windows {
                     last_error()
                 );
             }
-            if csgo64.is_dir()
-                && AddDllDirectory(to_wide_path(&csgo64).as_ptr()).is_null()
-            {
+            if csgo64.is_dir() && AddDllDirectory(to_wide_path(&csgo64).as_ptr()).is_null() {
                 bail!(
                     "AddDllDirectory({}) failed: {}",
                     csgo64.display(),
@@ -610,7 +592,18 @@ mod windows {
             report.failed.push((file_name, msg));
             return Ok(());
         }
-        match load_library(&path) {
+        let game_root = fs::canonicalize(game_dir)
+            .with_context(|| format!("failed to canonicalize game root {}", game_dir.display()))?;
+        let canonical_path = fs::canonicalize(&path)
+            .with_context(|| format!("failed to canonicalize {}", path.display()))?;
+        if !canonical_path.starts_with(&game_root) {
+            bail!(
+                "refusing to load {} outside the selected game root {}",
+                canonical_path.display(),
+                game_root.display()
+            );
+        }
+        match load_library(&canonical_path) {
             Ok(handle) => {
                 info!("LoadLibrary {}", path.display());
                 report.loaded.push(file_name.clone());
@@ -689,9 +682,11 @@ mod tests {
 }
 "#;
         let paths = super::parse_libraryfolders(vdf);
-        assert!(paths
-            .iter()
-            .any(|p| p.to_string_lossy().contains("Program Files")));
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.to_string_lossy().contains("Program Files"))
+        );
     }
 
     #[test]
@@ -738,7 +733,10 @@ mod tests {
             Vec::new()
         });
         let _ = std::fs::remove_dir_all(&steam);
-        assert_eq!(fallback_calls, 0, "drive scan must not run after a trusted hit");
+        assert_eq!(
+            fallback_calls, 0,
+            "drive scan must not run after a trusted hit"
+        );
         assert_eq!(found.as_deref(), Some(game.as_path()));
     }
 

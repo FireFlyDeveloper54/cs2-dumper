@@ -1,10 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 
-use super::ident::{
-    csharp_identifier, cpp_identifier, rust_identifier, IdentifierAllocator,
-};
-use super::{zig_ident, ButtonMap, CodeWriter, Formatter};
+use super::ident::{IdentifierAllocator, cpp_identifier, csharp_identifier, rust_identifier};
+use super::{ButtonMap, CodeWriter, Formatter, zig_ident};
 
 impl CodeWriter for ButtonMap {
     fn write_cs(&self, fmt: &mut Formatter<'_>) -> fmt::Result {

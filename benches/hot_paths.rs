@@ -7,13 +7,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
-use cs2_dumper::analysis::module_data::{intern_loaded_name, ImageSession};
+use cs2_dumper::analysis::module_data::{ImageSession, intern_loaded_name};
 use cs2_dumper::analysis::read::{u32_le_at, u64_le_at};
 use cs2_dumper::output::ident::{slugify, type_ident};
 use cs2_dumper::patterns::database::CS2_PATTERNS;
-use cs2_dumper::patterns::{find_ida, CachedPatternHit, PatternCache, PatternCacheIndex};
+use cs2_dumper::patterns::{CachedPatternHit, PatternCache, PatternCacheIndex, find_ida};
 
 const HAYSTACK: usize = 1 << 20;
 const PLANT_AT: usize = 0x000A_BCDE;
@@ -185,15 +185,12 @@ fn pattern_cache_get(c: &mut Criterion) {
 }
 
 fn plant_ida(hay: &mut [u8], at: usize, needle: &str) {
-    let mut i = at;
-    for tok in needle.split_ascii_whitespace() {
+    for (i, tok) in (at..).zip(needle.split_ascii_whitespace()) {
         if tok != "?" && tok != "??" {
-            let byte = u8::from_str_radix(tok, 16).unwrap_or_else(|_| {
-                panic!("bench needle token {tok:?} must be hex or wildcard")
-            });
+            let byte = u8::from_str_radix(tok, 16)
+                .unwrap_or_else(|_| panic!("bench needle token {tok:?} must be hex or wildcard"));
             hay[i] = byte;
         }
-        i += 1;
     }
 }
 

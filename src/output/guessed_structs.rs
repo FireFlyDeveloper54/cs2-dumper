@@ -9,8 +9,8 @@ use std::fmt::Write;
 
 use crate::analysis::{Class, ClassField, SchemaMap};
 
-use super::ident::{cpp_identifier, IdentifierAllocator};
 use super::comment_text;
+use super::ident::{IdentifierAllocator, cpp_identifier};
 
 pub fn render_hpp(schemas: &SchemaMap, build_number: Option<u32>) -> String {
     let votes = vote_unknown_sizes(schemas);
@@ -345,7 +345,10 @@ mod tests {
             ),
         )]);
         let hpp = render_hpp(&schemas, None);
-        assert!(hpp.contains("struct C_Test {"), "first sanitized name: {hpp}");
+        assert!(
+            hpp.contains("struct C_Test {"),
+            "first sanitized name: {hpp}"
+        );
         assert!(
             hpp.contains("struct C_Test_2 {"),
             "colliding class name must be allocated: {hpp}"

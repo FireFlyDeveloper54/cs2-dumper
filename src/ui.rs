@@ -50,16 +50,12 @@ fn beep(freq: u32, ms: u32) {
     }
 }
 
-#[cfg(not(windows))]
-fn beep(_: u32, _: u32) {}
-
 pub enum Cue {
     Start,
     Step,
     Success,
     Failure,
 }
-
 pub fn sound(cue: Cue) {
     if NO_SOUND.load(Ordering::Relaxed) {
         return;
@@ -113,7 +109,9 @@ fn flush() {
 
 pub fn banner() {
     println!();
-    println!("    {FG_CYAN}{BOLD}cs2-dumper{RESET} {DIM}{FG_GRAY}— CS2 offset / SDK generator{RESET}");
+    println!(
+        "    {FG_CYAN}{BOLD}cs2-dumper{RESET} {DIM}{FG_GRAY}— CS2 offset / SDK generator{RESET}"
+    );
     divider();
 }
 

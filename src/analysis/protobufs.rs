@@ -104,11 +104,7 @@ fn rd_u64(buf: &[u8], rva: usize) -> Option<u64> {
 /// Convert an in-image VA pointer to a buffer RVA, if it lands inside the module.
 fn va_to_rva(va: u64, base: u64, len: usize) -> Option<usize> {
     let rva = usize::try_from(va.checked_sub(base)?).ok()?;
-    if rva < len {
-        Some(rva)
-    } else {
-        None
-    }
+    if rva < len { Some(rva) } else { None }
 }
 
 fn scan_module(buf: &[u8], base: u64) -> Vec<ProtoMessage> {
@@ -122,25 +118,25 @@ fn scan_module(buf: &[u8], base: u64) -> Vec<ProtoMessage> {
         if buf[i] == 0x0A
             && let Some((name_len, hdr)) = read_varint(buf, i + 1)
         {
-                let Some(name_start) = i.checked_add(1).and_then(|v| v.checked_add(hdr)) else {
-                    i += 1;
-                    continue;
-                };
-                let Some(name_end) = name_start.checked_add(name_len as usize) else {
-                    i += 1;
-                    continue;
-                };
-                if name_len > 3
-                    && name_len < 128
-                    && name_end <= buf.len()
-                    && buf[name_start..name_end].ends_with(b".proto")
-                    && buf[name_start..name_end]
-                        .iter()
-                        .all(|&c| c.is_ascii_graphic())
-                    && let Some(va) = base.checked_add(i as u64)
-                {
-                    blob_vas.insert(va, ());
-                }
+            let Some(name_start) = i.checked_add(1).and_then(|v| v.checked_add(hdr)) else {
+                i += 1;
+                continue;
+            };
+            let Some(name_end) = name_start.checked_add(name_len as usize) else {
+                i += 1;
+                continue;
+            };
+            if name_len > 3
+                && name_len < 128
+                && name_end <= buf.len()
+                && buf[name_start..name_end].ends_with(b".proto")
+                && buf[name_start..name_end]
+                    .iter()
+                    .all(|&c| c.is_ascii_graphic())
+                && let Some(va) = base.checked_add(i as u64)
+            {
+                blob_vas.insert(va, ());
+            }
         }
         i += 1;
     }
@@ -231,9 +227,7 @@ fn parse_descriptor_table(buf: &[u8], base: u64, t: usize) -> Option<Vec<ProtoMe
                 .and_then(|delta| offsets_rva.checked_add(delta))
                 .and_then(|at| rd_u32(buf, at))?;
             let has_bit = if has_bit_index >= 0 {
-                let has_index = usize::try_from(has_bit_index)
-                    .ok()?
-                    .checked_add(j)?;
+                let has_index = usize::try_from(has_bit_index).ok()?.checked_add(j)?;
                 has_index
                     .checked_mul(4)
                     .and_then(|delta| offsets_rva.checked_add(delta))
@@ -566,9 +560,12 @@ mod tests {
     #[test]
     fn complete_wire_fields_are_forwarded() {
         let mut fields = Vec::new();
-        for_each_field(&[0x08, 0x96, 0x01, 0x12, 0x02, b'o', b'k'], |field, wire, payload| {
-            fields.push((field, wire, payload.to_vec()));
-        });
+        for_each_field(
+            &[0x08, 0x96, 0x01, 0x12, 0x02, b'o', b'k'],
+            |field, wire, payload| {
+                fields.push((field, wire, payload.to_vec()));
+            },
+        );
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0], (1, 0, vec![0x96, 0x01]));
         assert_eq!(fields[1], (2, 2, b"ok".to_vec()));

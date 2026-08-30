@@ -1,6 +1,6 @@
 use super::PatternHit;
 use crate::analysis::{InterfaceMap, OffsetMap};
-use crate::output::ident::{cpp_identifier, IdentifierAllocator};
+use crate::output::ident::{IdentifierAllocator, cpp_identifier};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;

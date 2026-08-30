@@ -132,16 +132,32 @@ pub fn render_impl_hpp(_offsets: &OffsetMap, build_number: Option<u32>) -> Strin
     writeln!(s, "#include <windows.h>").ok();
     writeln!(s, "#if __has_include(\"../offsets_merged.hpp\")").ok();
     writeln!(s, "#include \"../offsets_merged.hpp\"").ok();
-    writeln!(s, "#define CS2_OFF_GAME_ENTITY_SYSTEM offsets::client::GameEntitySystem").ok();
+    writeln!(
+        s,
+        "#define CS2_OFF_GAME_ENTITY_SYSTEM offsets::client::GameEntitySystem"
+    )
+    .ok();
     writeln!(s, "#define CS2_OFF_GAME_ENTITY_SYSTEM_HIGHEST offsets::client::GameEntitySystem_highestEntityIndex").ok();
-    writeln!(s, "#define CS2_OFF_LOCAL_PLAYER_CONTROLLER offsets::client::LocalPlayerController").ok();
+    writeln!(
+        s,
+        "#define CS2_OFF_LOCAL_PLAYER_CONTROLLER offsets::client::LocalPlayerController"
+    )
+    .ok();
     writeln!(s, "#elif __has_include(\"../offsets.hpp\")").ok();
     writeln!(s, "#include \"../offsets.hpp\"").ok();
-    writeln!(s, "#define CS2_OFF_GAME_ENTITY_SYSTEM cs2_dumper::offsets::client_dll::dwGameEntitySystem").ok();
+    writeln!(
+        s,
+        "#define CS2_OFF_GAME_ENTITY_SYSTEM cs2_dumper::offsets::client_dll::dwGameEntitySystem"
+    )
+    .ok();
     writeln!(s, "#define CS2_OFF_GAME_ENTITY_SYSTEM_HIGHEST cs2_dumper::offsets::client_dll::dwGameEntitySystem_highestEntityIndex").ok();
     writeln!(s, "#define CS2_OFF_LOCAL_PLAYER_CONTROLLER cs2_dumper::offsets::client_dll::dwLocalPlayerController").ok();
     writeln!(s, "#else").ok();
-    writeln!(s, "#error \"entity helper needs offsets_merged.hpp or offsets.hpp\"").ok();
+    writeln!(
+        s,
+        "#error \"entity helper needs offsets_merged.hpp or offsets.hpp\""
+    )
+    .ok();
     writeln!(s, "#endif").ok();
     writeln!(s, "#if __has_include(\"../schemas/client_dll.hpp\")").ok();
     writeln!(s, "#include \"../schemas/client_dll.hpp\"").ok();
@@ -192,9 +208,17 @@ pub fn render_impl_hpp(_offsets: &OffsetMap, build_number: Option<u32>) -> Strin
     )
     .ok();
     writeln!(s, "        if (!client) return 0;").ok();
-    writeln!(s, "        auto es = *reinterpret_cast<uintptr_t*>(client + CS2_OFF_GAME_ENTITY_SYSTEM);").ok();
+    writeln!(
+        s,
+        "        auto es = *reinterpret_cast<uintptr_t*>(client + CS2_OFF_GAME_ENTITY_SYSTEM);"
+    )
+    .ok();
     writeln!(s, "        if (!es) return 0;").ok();
-    writeln!(s, "        return *reinterpret_cast<int*>(es + CS2_OFF_GAME_ENTITY_SYSTEM_HIGHEST);").ok();
+    writeln!(
+        s,
+        "        return *reinterpret_cast<int*>(es + CS2_OFF_GAME_ENTITY_SYSTEM_HIGHEST);"
+    )
+    .ok();
     writeln!(s, "    }}").ok();
     writeln!(s).ok();
 
@@ -239,7 +263,11 @@ pub fn render_impl_hpp(_offsets: &OffsetMap, build_number: Option<u32>) -> Strin
     )
     .ok();
     writeln!(s, "        if (!client) return nullptr;").ok();
-    writeln!(s, "        return *reinterpret_cast<void**>(client + CS2_OFF_LOCAL_PLAYER_CONTROLLER);").ok();
+    writeln!(
+        s,
+        "        return *reinterpret_cast<void**>(client + CS2_OFF_LOCAL_PLAYER_CONTROLLER);"
+    )
+    .ok();
     writeln!(s, "    }}").ok();
     writeln!(s, "#endif").ok();
     writeln!(s).ok();
@@ -287,11 +315,7 @@ pub fn render_impl_hpp(_offsets: &OffsetMap, build_number: Option<u32>) -> Strin
         "        if (!identity || !GetEntityByIndex(index)) return nullptr;"
     )
     .ok();
-    writeln!(
-        s,
-        "        return identity->m_designerName().String();"
-    )
-    .ok();
+    writeln!(s, "        return identity->m_designerName().String();").ok();
     writeln!(s, "#else").ok();
     writeln!(s, "        auto* entity = GetEntityByIndex(index);").ok();
     writeln!(s, "        if (!entity) return nullptr;").ok();
@@ -336,8 +360,12 @@ mod tests {
             !body.contains("const char**>(&identity->m_designerName())"),
             "must not take the address of a SCHEMA_FIELD temporary: {body}"
         );
-        let merged = body.find("offsets_merged.hpp").expect("prefer merged offsets");
-        let legacy = body.find("../offsets.hpp").expect("legacy offsets fallback");
+        let merged = body
+            .find("offsets_merged.hpp")
+            .expect("prefer merged offsets");
+        let legacy = body
+            .find("../offsets.hpp")
+            .expect("legacy offsets fallback");
         assert!(
             merged < legacy,
             "merged offsets must be preferred over a2x offsets.hpp: {body}"
@@ -353,7 +381,10 @@ mod tests {
     #[test]
     fn root_helper_defines_every_offset_macro_it_uses() {
         let body = render_hpp(Some(1));
-        for macro_name in ["CS2_OFF_GAME_ENTITY_SYSTEM", "CS2_OFF_LOCAL_PLAYER_CONTROLLER"] {
+        for macro_name in [
+            "CS2_OFF_GAME_ENTITY_SYSTEM",
+            "CS2_OFF_LOCAL_PLAYER_CONTROLLER",
+        ] {
             assert!(
                 body.contains(&format!("#define {macro_name} ")),
                 "{macro_name} is used but never defined in the root header: {body}"

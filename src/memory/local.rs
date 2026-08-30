@@ -11,12 +11,12 @@ use anyhow::Result;
 mod win {
     use anyhow::Result;
     use memflow::cglue::{CTup2, CTup3};
-    use memflow::mem::mem_data::{opt_call, MemOps, ReadRawMemOps, WriteRawMemOps};
+    use memflow::mem::mem_data::{MemOps, ReadRawMemOps, WriteRawMemOps, opt_call};
     use memflow::prelude::v1::*;
 
     use crate::memory::snapshot::{self, ProcessSnapshot};
     use crate::memory::win::{
-        enumerate_modules, GetCurrentProcess, GetCurrentProcessId, ReadProcessMemory, PAGE,
+        GetCurrentProcess, GetCurrentProcessId, PAGE, ReadProcessMemory, enumerate_modules,
     };
 
     pub struct LocalProcess {
@@ -214,9 +214,4 @@ mod win {
 #[cfg(windows)]
 pub fn attach_self() -> Result<win::LocalProcess> {
     win::attach_self()
-}
-
-#[cfg(not(windows))]
-pub fn attach_self() -> Result<()> {
-    anyhow::bail!("LoadLibrary dump is Windows-only")
 }

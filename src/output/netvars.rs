@@ -29,8 +29,8 @@ use serde_json::json;
 
 use crate::analysis::{ClassMetadata, SchemaMap};
 
-use super::ident::{cpp_identifier, type_ident, IdentifierAllocator};
 use super::comment_text;
+use super::ident::{IdentifierAllocator, cpp_identifier, type_ident};
 
 /// Extracted view of one networked field.
 ///
@@ -117,8 +117,7 @@ pub fn render_hpp(netvars: &[NetVar<'_>], build_number: Option<u32>) -> String {
     s.push_str("namespace netvar {\n\n");
     let mut class_names = IdentifierAllocator::default();
     for (class, fields) in grouped(netvars) {
-        let class_ident =
-            class_names.allocate(cpp_identifier(type_ident(class).as_ref()));
+        let class_ident = class_names.allocate(cpp_identifier(type_ident(class).as_ref()));
         writeln!(s, "    namespace {class_ident} {{").ok();
         let mut field_names = IdentifierAllocator::default();
         for n in fields {

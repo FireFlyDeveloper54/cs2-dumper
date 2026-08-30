@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Compare two schema_index.json documents and report class, field, enum, and member changes.
 pub fn render_json(previous: &str, current: &str) -> Result<String> {

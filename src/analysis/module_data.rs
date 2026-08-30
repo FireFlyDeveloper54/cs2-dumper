@@ -2,7 +2,7 @@
 //!
 //! Several anchors in this crate are found by *describing* the object they
 //! point at rather than by signing the code that references them (see
-//! [`crate::analysis::schema_anchor`] and [`crate::analysis::entity_anchor`]).
+//! `schema_anchor` and `entity_anchor` modules).
 //! Every such scan needs the same two things: a live copy of the module image
 //! and the ranges within it that hold writable data, which is where a global
 //! can be. Both live here so the scans agree on where they are allowed to look.
@@ -47,7 +47,7 @@ fn shared_modules() -> std::sync::MutexGuard<'static, Option<(u64, ModuleList)>>
 
 /// Holds the per-dump image cache. Drop clears it so the next run or test
 /// cannot see stale bytes. The module-name intern list is also mirrored to
-/// [`SHARED_MODULES`] so rayon workers (no TLS session) can intern `"client.dll"`.
+/// `SHARED_MODULES` so rayon workers (no TLS session) can intern `"client.dll"`.
 pub struct ImageSession {
     id: u64,
 }
@@ -88,21 +88,14 @@ fn session_active() -> bool {
     SESSION.with(|s| s.get())
 }
 
-fn cache_get(
-    map: &'static std::thread::LocalKey<ImageCache>,
-    key: &str,
-) -> Option<CachedImage> {
+fn cache_get(map: &'static std::thread::LocalKey<ImageCache>, key: &str) -> Option<CachedImage> {
     if !session_active() {
         return None;
     }
     map.with(|c| c.borrow().get(key).cloned())
 }
 
-fn cache_put(
-    map: &'static std::thread::LocalKey<ImageCache>,
-    key: String,
-    value: CachedImage,
-) {
+fn cache_put(map: &'static std::thread::LocalKey<ImageCache>, key: String, value: CachedImage) {
     if !session_active() {
         return;
     }
@@ -144,7 +137,11 @@ fn intern_from_list(list: &ModuleList, name: &str) -> Option<Arc<str>> {
 /// schema type-scope names do not always use the same casing, while the
 /// session list is stored lowercase.
 pub fn intern_loaded_name(name: &str) -> Option<Arc<str>> {
-    let local = MODULES.with(|c| c.borrow().as_ref().and_then(|list| intern_from_list(list, name)));
+    let local = MODULES.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|list| intern_from_list(list, name))
+    });
     if local.is_some() {
         return local;
     }
@@ -165,9 +162,7 @@ fn store_module_list(list: ModuleList) {
 ///
 /// Name is lowercase `Arc<str>` so vtable classify and fingerprints can share
 /// it without cloning `"client.dll"` once per vtable slot.
-pub fn cached_module_list<P: Process + MemoryView>(
-    process: &mut P,
-) -> Result<ModuleList> {
+pub fn cached_module_list<P: Process + MemoryView>(process: &mut P) -> Result<ModuleList> {
     if session_active()
         && let Some(hit) = MODULES.with(|c| c.borrow().clone())
     {
@@ -236,8 +231,8 @@ const MAX_MAPPED_PE: usize = 512 * 1024 * 1024;
 /// Pattern / offset scanners slice `.text` at `VirtualAddress`. That is only
 /// valid on a loaded image; on-disk bytes sit at `PointerToRawData`.
 pub fn map_file_pe_to_image(file: &[u8]) -> Result<Vec<u8>> {
-    let pe = PeFile::from_bytes(file)
-        .map_err(|err| anyhow::anyhow!("invalid on-disk PE: {err}"))?;
+    let pe =
+        PeFile::from_bytes(file).map_err(|err| anyhow::anyhow!("invalid on-disk PE: {err}"))?;
     let size = usize::try_from(pe.optional_header().SizeOfImage)
         .map_err(|_| anyhow::anyhow!("SizeOfImage does not fit usize"))?;
     if size == 0 || size > MAX_MAPPED_PE {
@@ -411,7 +406,7 @@ mod tests {
         const TEXT_VA: u32 = 0x1000;
         const TEXT_RAW: u32 = 0x200;
         let raw_size = payload.len() as u32;
-        let raw_size = (raw_size + FILE_ALIGN - 1) / FILE_ALIGN * FILE_ALIGN;
+        let raw_size = raw_size.div_ceil(FILE_ALIGN) * FILE_ALIGN;
         let mut file = vec![0u8; (TEXT_RAW + raw_size) as usize];
         file[0] = b'M';
         file[1] = b'Z';
@@ -465,8 +460,7 @@ mod tests {
             "file offset 0x200 must not be treated as the .text RVA"
         );
         assert_eq!(
-            mapped[0x1003],
-            0,
+            mapped[0x1003], 0,
             "bytes past VirtualSize stay zero in the mapped image"
         );
     }
@@ -486,7 +480,11 @@ mod tests {
         let _session = super::ImageSession::begin();
         assert!(super::cached_live("client.dll").is_none());
         let image: std::sync::Arc<[u8]> = std::sync::Arc::from(&b"MZ\x00\x00"[..]);
-        super::cache_put(&super::LIVE, "client.dll".into(), (0x1800_0000, image.clone()));
+        super::cache_put(
+            &super::LIVE,
+            "client.dll".into(),
+            (0x1800_0000, image.clone()),
+        );
         let hit = super::cached_live("client.dll").expect("cached");
         assert_eq!(hit.0, 0x1800_0000);
         assert_eq!(&*hit.1, b"MZ\x00\x00");

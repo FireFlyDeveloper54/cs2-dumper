@@ -76,7 +76,10 @@ pub enum ClassMetadata {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Class {
     pub name: String,
-    #[serde(serialize_with = "serialize_arc_str", deserialize_with = "deserialize_arc_str")]
+    #[serde(
+        serialize_with = "serialize_arc_str",
+        deserialize_with = "deserialize_arc_str"
+    )]
     pub module_name: Arc<str>,
     pub parent_name: Option<String>,
     pub size: i32,
@@ -232,10 +235,7 @@ fn schema_name(mem: &mut impl MemoryView, at: Address) -> Option<String> {
     if at.is_null() {
         return None;
     }
-    let short = mem
-        .read_utf8_lossy(at, SCHEMA_NAME_SPAN)
-        .data_part()
-        .ok()?;
+    let short = mem.read_utf8_lossy(at, SCHEMA_NAME_SPAN).data_part().ok()?;
     let name = if short.len() >= SCHEMA_NAME_SPAN {
         mem.read_utf8_lossy(at, SCHEMA_NAME_MAX).data_part().ok()?
     } else {
@@ -297,9 +297,7 @@ fn read_class_binding_fields(
         return Ok(Vec::new());
     }
 
-    (0..n as i16).try_fold(
-        Vec::with_capacity(n),
-        |mut acc, i| {
+    (0..n as i16).try_fold(Vec::with_capacity(n), |mut acc, i| {
         let Some(field_addr) = array_element_address(
             binding.fields.to_umem(),
             i as usize,
@@ -374,9 +372,7 @@ fn read_class_binding_metadata(
         return Ok(Vec::new());
     }
 
-    (0..n as i16).try_fold(
-        Vec::with_capacity(n),
-        |mut acc, i| {
+    (0..n as i16).try_fold(Vec::with_capacity(n), |mut acc, i| {
         let Some(metadata_addr) = array_element_address(
             binding.static_metadata.to_umem(),
             i as usize,
@@ -464,9 +460,7 @@ fn read_enum_binding_members(
     }
 
     let count = (binding.enumerator_count as usize).min(MAX_ENUM_MEMBERS);
-    (0..count).try_fold(
-        Vec::with_capacity(count),
-        |mut acc, i| {
+    (0..count).try_fold(Vec::with_capacity(count), |mut acc, i| {
         let Some(enumerator_addr) = array_element_address(
             binding.enumerators.to_umem(),
             i,
@@ -512,9 +506,7 @@ fn read_schema_system<P: Process + MemoryView>(process: &mut P) -> Result<Schema
             .checked_add(save[1] as u64)
             .map(Address::from)
         {
-            if let Ok(schema_system) = process
-                .read::<SchemaSystem>(schema_address)
-                .data_part()
+            if let Ok(schema_system) = process.read::<SchemaSystem>(schema_address).data_part()
                 && validate_schema_system(&schema_system).is_ok()
             {
                 return Ok(schema_system);
@@ -811,14 +803,18 @@ mod tests {
         let mut binding: SchemaClassBinding = unsafe { std::mem::zeroed() };
         binding.field_count = -1;
         binding.fields = Pointer64::from(Address::from(0x1000u64));
-        assert!(read_class_binding_fields(&mut mem, &binding)
-            .expect("negative field count")
-            .is_empty());
+        assert!(
+            read_class_binding_fields(&mut mem, &binding)
+                .expect("negative field count")
+                .is_empty()
+        );
         binding.static_metadata_count = -1;
         binding.static_metadata = Pointer64::from(Address::from(0x2000u64));
-        assert!(read_class_binding_metadata(&mut mem, &binding)
-            .expect("negative metadata count")
-            .is_empty());
+        assert!(
+            read_class_binding_metadata(&mut mem, &binding)
+                .expect("negative metadata count")
+                .is_empty()
+        );
         let mut field: SchemaClassFieldData = unsafe { std::mem::zeroed() };
         field.metadata_count = -3;
         field.metadata = Pointer64::from(Address::from(0x3000u64));

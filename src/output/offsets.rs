@@ -2,10 +2,8 @@ use std::fmt::{self, Write};
 
 use heck::{AsPascalCase, AsSnakeCase};
 
-use super::ident::{
-    csharp_identifier, cpp_identifier, rust_identifier, IdentifierAllocator,
-};
-use super::{comment_text, slugify, zig_ident, CodeWriter, Formatter, OffsetMap};
+use super::ident::{IdentifierAllocator, cpp_identifier, csharp_identifier, rust_identifier};
+use super::{CodeWriter, Formatter, OffsetMap, comment_text, slugify, zig_ident};
 
 impl CodeWriter for OffsetMap {
     fn write_cs(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
@@ -13,9 +11,8 @@ impl CodeWriter for OffsetMap {
             let mut modules = IdentifierAllocator::default();
             for (module_name, offsets) in self {
                 writeln!(fmt, "// Module: {}", comment_text(module_name))?;
-                let module_ident = modules.allocate(
-                    AsPascalCase(csharp_identifier(module_name)).to_string(),
-                );
+                let module_ident =
+                    modules.allocate(AsPascalCase(csharp_identifier(module_name)).to_string());
 
                 fmt.block(
                     format_args!("public static class {module_ident}"),
@@ -54,23 +51,19 @@ impl CodeWriter for OffsetMap {
                         &AsSnakeCase(slugify(module_name)).to_string(),
                     ));
 
-                    fmt.block(
-                        format_args!("namespace {module_ident}"),
-                        false,
-                        |fmt| {
-                            let mut names = IdentifierAllocator::default();
-                            for (name, value) in offsets {
-                                writeln!(
-                                    fmt,
-                                    "constexpr std::ptrdiff_t {} = {:#X};",
-                                    names.allocate(cpp_identifier(name)),
-                                    value
-                                )?;
-                            }
+                    fmt.block(format_args!("namespace {module_ident}"), false, |fmt| {
+                        let mut names = IdentifierAllocator::default();
+                        for (name, value) in offsets {
+                            writeln!(
+                                fmt,
+                                "constexpr std::ptrdiff_t {} = {:#X};",
+                                names.allocate(cpp_identifier(name)),
+                                value
+                            )?;
+                        }
 
-                            Ok(())
-                        },
-                    )?;
+                        Ok(())
+                    })?;
                 }
 
                 Ok(())
@@ -94,23 +87,19 @@ impl CodeWriter for OffsetMap {
                         &AsSnakeCase(slugify(module_name)).to_string(),
                     ));
 
-                    fmt.block(
-                        format_args!("pub mod {module_ident}"),
-                        false,
-                        |fmt| {
-                            let mut names = IdentifierAllocator::default();
-                            for (name, value) in offsets {
-                                writeln!(
-                                    fmt,
-                                    "pub const {}: usize = {:#X};",
-                                    names.allocate(rust_identifier(name)),
-                                    value
-                                )?;
-                            }
+                    fmt.block(format_args!("pub mod {module_ident}"), false, |fmt| {
+                        let mut names = IdentifierAllocator::default();
+                        for (name, value) in offsets {
+                            writeln!(
+                                fmt,
+                                "pub const {}: usize = {:#X};",
+                                names.allocate(rust_identifier(name)),
+                                value
+                            )?;
+                        }
 
-                            Ok(())
-                        },
-                    )?;
+                        Ok(())
+                    })?;
                 }
 
                 Ok(())

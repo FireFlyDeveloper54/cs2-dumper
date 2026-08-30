@@ -412,7 +412,10 @@ mod tests {
             .expect("second run still readable");
         assert_eq!(right, [0xAA, 0xBB, 0xCC, 0xDD]);
 
-        assert!(!mem.is_mapped(0x1008), "the hole must not be filled by a merge");
+        assert!(
+            !mem.is_mapped(0x1008),
+            "the hole must not be filled by a merge"
+        );
         let mut hole = [0u8; 4];
         assert!(
             mem.read_raw_into(Address::from(0x1008u64), &mut hole)

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::info;
 use memflow::prelude::v1::*;
 
@@ -29,7 +29,6 @@ impl PatternSet<'_> {
         }
     }
 
-    #[cfg(test)]
     pub fn is_empty(self) -> bool {
         self.len() == 0
     }
@@ -60,15 +59,24 @@ pub fn validate_file_types(file_types: &[String]) -> Result<()> {
         .map(String::as_str)
         .filter(|kind| !FILE_TYPES.contains(kind))
         .collect();
-    if invalid.is_empty() {
-        Ok(())
-    } else {
+    if !invalid.is_empty() {
         anyhow::bail!(
             "unsupported file type(s): {}; supported types: {}",
             invalid.join(", "),
             FILE_TYPES.join(", ")
-        )
+        );
     }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let duplicates: Vec<&str> = file_types
+        .iter()
+        .map(String::as_str)
+        .filter(|kind| !seen.insert(*kind))
+        .collect();
+    if !duplicates.is_empty() {
+        anyhow::bail!("duplicate output file type(s): {}", duplicates.join(", "));
+    }
+    Ok(())
 }
 
 struct AnalyzedDump {
@@ -82,7 +90,8 @@ struct AnalyzedDump {
 
 pub fn run<P: Process + MemoryView>(process: &mut P, cfg: &Config<'_>) -> Result<()> {
     let now = Instant::now();
-    fs::create_dir_all(cfg.output)?;
+    fs::create_dir_all(cfg.output)
+        .with_context(|| format!("failed to create output directory {}", cfg.output.display()))?;
     let _images = analysis::module_data::ImageSession::begin();
     let modules = analysis::module_data::cached_module_list(process)?;
 
@@ -120,7 +129,12 @@ fn analyze_process<P: Process + MemoryView>(
         &mut dynamic_offsets_added,
     )?;
 
-    recover_schema_and_buttons(process, cfg.loadlib_schema_va, pattern_report.as_ref(), &mut result);
+    recover_schema_and_buttons(
+        process,
+        cfg.loadlib_schema_va,
+        pattern_report.as_ref(),
+        &mut result,
+    );
     let anchors = resolve_live_anchors(process, pattern_report.as_ref());
     recover_live_offsets(
         process,
@@ -295,7 +309,10 @@ fn print_summary(cfg: &Config<'_>, analyzed: &AnalyzedDump, elapsed: std::time::
         }
     }
     if let Some(report) = analyzed.pattern_report.as_ref() {
-        ui::kv("Patterns", format_args!("{}/{}", report.found, report.total));
+        ui::kv(
+            "Patterns",
+            format_args!("{}/{}", report.found, report.total),
+        );
     }
     ui::sound(ui::Cue::Success);
     ui::step("All stages completed.");
@@ -346,10 +363,7 @@ fn scan_patterns<P: Process + MemoryView>(
     }
 }
 
-fn write_pattern_artifacts(
-    cfg: &Config<'_>,
-    report: &patterns::PatternReport,
-) -> Result<()> {
+fn write_pattern_artifacts(cfg: &Config<'_>, report: &patterns::PatternReport) -> Result<()> {
     let previous = fs::read_to_string(cfg.output.join("patterns.json")).ok();
     let patterns_json_ok = write_serialized(
         &cfg.output.join("patterns.json"),
@@ -375,13 +389,13 @@ fn write_pattern_artifacts(
         let _ = fs::remove_file(&repair_path);
         let _ = fs::remove_file(&patch_path);
     } else {
-        if !write_serialized(
-            &repair_path,
-            serde_json::to_string_pretty(&report.repairs),
-        ) {
+        if !write_serialized(&repair_path, serde_json::to_string_pretty(&report.repairs)) {
             failed.push("patterns.repair.json".into());
         } else {
-            info!("wrote patterns.repair.json ({} suggestion(s))", report.repairs.len());
+            info!(
+                "wrote patterns.repair.json ({} suggestion(s))",
+                report.repairs.len()
+            );
         }
         match patterns::repair::render_pattern_file(&report.repairs) {
             Some(patch) => {
@@ -420,7 +434,9 @@ fn write_pattern_artifacts(
             }
         }
     }
-    write_logged(&cfg.output.join("patterns.md"), md);
+    if !write_logged(&cfg.output.join("patterns.md"), md) {
+        failed.push("patterns.md".into());
+    }
 
     if !write_logged(&cfg.output.join("patterns.hpp"), hpp) {
         failed.push("patterns.hpp".into());
@@ -429,7 +445,10 @@ fn write_pattern_artifacts(
     if failed.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!("failed to write required pattern artifacts: {}", failed.join(", "))
+        anyhow::bail!(
+            "failed to write required pattern artifacts: {}",
+            failed.join(", ")
+        )
     }
 }
 
@@ -466,7 +485,10 @@ fn write_merged_offset_artifacts(
     if failed.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!("failed to write required pattern artifacts: {}", failed.join(", "))
+        anyhow::bail!(
+            "failed to write required pattern artifacts: {}",
+            failed.join(", ")
+        )
     }
 }
 
@@ -513,7 +535,9 @@ fn recover_schema_and_buttons<P: Process + MemoryView>(
                 );
             }
             Ok(_) => log::warn!("dynamic button registry was empty; retaining legacy buttons"),
-            Err(err) => log::warn!("dynamic button registry failed; retaining legacy buttons: {err}"),
+            Err(err) => {
+                log::warn!("dynamic button registry failed; retaining legacy buttons: {err}")
+            }
         }
     }
 }
@@ -650,10 +674,7 @@ fn iface_classes_from_vtables<'a>(
                                 .find(|(name, _)| name.eq_ignore_ascii_case(iface_name))
                                 .map(|(_, rva)| *rva)
                         }),
-                    rtti_class: info
-                        .rtti_class
-                        .as_deref()
-                        .map(std::borrow::Cow::Borrowed),
+                    rtti_class: info.rtti_class.as_deref().map(std::borrow::Cow::Borrowed),
                     methods,
                     manual: false,
                 }
@@ -683,8 +704,7 @@ fn write_vtables<'a, P: Process + MemoryView>(
         );
         let (write_results, collected) = rayon::join(
             || {
-                let json_result =
-                    write_serialized_required(&out_dir.join("vtables.json"), json);
+                let json_result = write_serialized_required(&out_dir.join("vtables.json"), json);
                 let (hpp_result, cs_result) = rayon::join(
                     || write_required(&out_dir.join("vtables.hpp"), hpp),
                     || write_required(&out_dir.join("vtables.cs"), cs),
@@ -707,11 +727,7 @@ fn write_vtables<'a, P: Process + MemoryView>(
         fs::create_dir_all(&dir)?;
         write_required(
             &dir.join("interfaces.hpp"),
-            output::interface_classes::render_hpp(
-                &result.interfaces,
-                &typed_classes,
-                build_number,
-            ),
+            output::interface_classes::render_hpp(&result.interfaces, &typed_classes, build_number),
         )?;
         info!(
             "wrote interfaces/interfaces.hpp ({} classes)",
@@ -890,19 +906,19 @@ fn write_protobufs<P: Process + MemoryView>(
             let dir = out_dir.join("protobufs");
             fs::create_dir_all(&dir)?;
             let (json_result, hpp_result) = rayon::join(
-                    || {
-                        write_serialized_required(
-                            &dir.join("protobufs.json"),
-                            output::protobufs::render_json(&messages),
-                        )
-                    },
-                    || {
-                        write_required(
-                            &dir.join("protobufs.hpp"),
-                            output::protobufs::render_hpp(&messages, build_number),
-                        )
-                    },
-                );
+                || {
+                    write_serialized_required(
+                        &dir.join("protobufs.json"),
+                        output::protobufs::render_json(&messages),
+                    )
+                },
+                || {
+                    write_required(
+                        &dir.join("protobufs.hpp"),
+                        output::protobufs::render_hpp(&messages, build_number),
+                    )
+                },
+            );
             json_result?;
             hpp_result?;
             let count: usize = messages.values().map(|items| items.len()).sum();
@@ -918,13 +934,12 @@ fn write_serialized_required(
     path: &Path,
     rendered: Result<String, impl std::fmt::Display>,
 ) -> Result<()> {
-    let body = rendered
-        .map_err(|err| anyhow::anyhow!("failed to serialize {}: {err}", path.display()))?;
+    let body =
+        rendered.map_err(|err| anyhow::anyhow!("failed to serialize {}: {err}", path.display()))?;
     write_required(path, body)
 }
-
 fn write_required(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
-    fs::write(path, contents)
+    crate::output::write_staged(path, contents)
         .map_err(|err| anyhow::anyhow!("failed to write {}: {err}", path.display()))
 }
 
@@ -939,7 +954,7 @@ fn write_serialized(path: &Path, rendered: Result<String, impl std::fmt::Display
 }
 
 fn write_logged(path: &Path, contents: impl AsRef<[u8]>) -> bool {
-    match fs::write(path, contents) {
+    match crate::output::write_staged(path, contents) {
         Ok(()) => true,
         Err(err) => {
             log::warn!("failed to write {}: {err}", path.display());
@@ -987,9 +1002,12 @@ fn insert_missing_offset(
         .find(|key| key.eq_ignore_ascii_case(module))
         .cloned();
     if let Some(key) = existing_module {
-        let module_offsets = offsets
-            .get_mut(&key)
-            .expect("module key came from the same map");
+        // The key was cloned from this map, but keep the merge path total in
+        // case the map implementation changes or a caller mutates it between
+        // the lookup and insertion.
+        let Some(module_offsets) = offsets.get_mut(&key) else {
+            return false;
+        };
         if module_offsets
             .keys()
             .any(|present| present.eq_ignore_ascii_case(&symbol))
@@ -1182,9 +1200,18 @@ mod tests {
     fn fnv1a64_head_tail_is_stable_and_covers_both_ends() {
         let head = [0x41u8; 8];
         let tail = [0x42u8; 8];
-        assert_eq!(fnv1a64_head_tail(&head, &tail), fnv1a64_head_tail(&head, &tail));
-        assert_ne!(fnv1a64_head_tail(&head, &tail), fnv1a64_head_tail(&head, &[]));
-        assert_ne!(fnv1a64_head_tail(&head, &tail), fnv1a64_head_tail(&tail, &head));
+        assert_eq!(
+            fnv1a64_head_tail(&head, &tail),
+            fnv1a64_head_tail(&head, &tail)
+        );
+        assert_ne!(
+            fnv1a64_head_tail(&head, &tail),
+            fnv1a64_head_tail(&head, &[])
+        );
+        assert_ne!(
+            fnv1a64_head_tail(&head, &tail),
+            fnv1a64_head_tail(&tail, &head)
+        );
     }
 
     #[test]
@@ -1256,8 +1283,7 @@ mod tests {
         write_merged_offset_artifacts(&cfg, &report, &result)
             .expect("shipped merged-offset writer");
 
-        let patterns_hpp =
-            fs::read_to_string(out_dir.join("patterns.hpp")).expect("patterns.hpp");
+        let patterns_hpp = fs::read_to_string(out_dir.join("patterns.hpp")).expect("patterns.hpp");
         assert!(
             patterns_hpp.contains(symbol),
             "patterns.hpp missing {symbol}: {patterns_hpp}"
@@ -1310,6 +1336,35 @@ mod tests {
         let _ = fs::remove_dir_all(&out_dir);
     }
 
+    #[test]
+    fn write_pattern_artifacts_propagates_markdown_write_failures() {
+        let out_dir =
+            std::env::temp_dir().join(format!("cs2-dumper-pattern-md-fail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&out_dir);
+        fs::create_dir_all(&out_dir).expect("temp output dir");
+        fs::create_dir(out_dir.join("patterns.md")).expect("occupy markdown output path");
+        let file_types = Vec::new();
+        let cfg = Config {
+            output: &out_dir,
+            file_types: &file_types,
+            patterns: PatternSet::Specs(&[]),
+            pattern_cache: None,
+            external_pattern_count: 0,
+            loadlib_schema_va: None,
+            used_load_lib: false,
+            backend: "test".into(),
+            shade_bindings: Vec::new(),
+            guess_structs: false,
+            steam_inf: None,
+        };
+        let err = write_pattern_artifacts(&cfg, &patterns::PatternReport::default())
+            .expect_err("markdown write failure must be returned");
+        assert!(
+            err.to_string().contains("patterns.md"),
+            "failure must name the markdown artifact: {err}"
+        );
+        let _ = fs::remove_dir_all(&out_dir);
+    }
     #[test]
     fn write_pattern_artifacts_propagates_requested_language_write_failures() {
         let out_dir = std::env::temp_dir().join(format!(
@@ -1430,10 +1485,7 @@ mod tests {
 
     #[test]
     fn write_serialized_does_not_emit_empty_json_on_error() {
-        let path = std::env::temp_dir().join(format!(
-            "cs2-dumper-ser-fail-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("cs2-dumper-ser-fail-{}", std::process::id()));
         let _ = fs::remove_file(&path);
         let rendered: Result<String, &str> = Err("boom");
         assert!(!write_serialized(&path, rendered));
@@ -1467,10 +1519,8 @@ mod tests {
 
     #[test]
     fn write_required_names_the_path_when_the_write_fails() {
-        let dir = std::env::temp_dir().join(format!(
-            "cs2-dumper-write-required-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("cs2-dumper-write-required-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("blocked.json");
@@ -1500,6 +1550,11 @@ mod tests {
             .expect_err("unknown output type must be rejected");
         assert!(error.to_string().contains("lua"));
         assert!(error.to_string().contains("cs"));
+
+        let duplicate = validate_file_types(&["json".into(), "json".into()])
+            .expect_err("duplicate output types must be rejected");
+        assert!(duplicate.to_string().contains("duplicate"));
+        assert!(duplicate.to_string().contains("json"));
     }
 
     #[test]
@@ -1611,7 +1666,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolved_pattern_rva(&report, "pCSGOInput"), Some(0x222));
-        assert_eq!(resolved_pattern_va(&report, "pCSGOInput"), Some(0x7FF6_0000_0222));
+        assert_eq!(
+            resolved_pattern_va(&report, "pCSGOInput"),
+            Some(0x7FF6_0000_0222)
+        );
         assert_eq!(
             output::include_tree::live_csgo_input_rva(&analysis::OffsetMap::new(), Some(0x222)),
             Some(0x222)

@@ -8,7 +8,7 @@
 //!   -> CEntityIdentity inline @ chunk + 0x70*(i & 0x1FF)
 //!        identity+0x00 = CEntityInstance*   identity+0x20 = designer-name char*
 //!   -> weapon entities (designer name "weapon_*")
-//!   -> CCSWeaponBaseVData* at entity + <vdata offset>  (offset validated, see below)
+//!   -> CCSWeaponBaseVData* at entity + `<vdata offset>`  (offset validated, see below)
 //!
 //! Coverage note: only weapons that exist as ENTITIES in the dumped session are
 //! captured (held/dropped weapons + view models). Running the dump inside a

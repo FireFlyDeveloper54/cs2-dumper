@@ -81,9 +81,9 @@ pub fn ssn_from_ntdll_window(window: &[u8], center_index: usize, stride: usize) 
 #[cfg(windows)]
 mod win {
     use super::ssn_from_ntdll_window;
-    use anyhow::{bail, Context, Result};
+    use anyhow::{Context, Result, bail};
     use memflow::cglue::{CTup2, CTup3};
-    use memflow::mem::mem_data::{opt_call, MemOps, ReadRawMemOps, WriteRawMemOps};
+    use memflow::mem::mem_data::{MemOps, ReadRawMemOps, WriteRawMemOps, opt_call};
     use memflow::prelude::v1::*;
     use std::slice;
 
@@ -99,8 +99,8 @@ mod win {
 
     use crate::memory::snapshot::{self, ProcessSnapshot};
     use crate::memory::win::{
-        enumerate_modules, find_pid, last_error, CloseHandle, GetModuleHandleA, GetProcAddress,
-        OpenProcess, PAGE,
+        CloseHandle, GetModuleHandleA, GetProcAddress, OpenProcess, PAGE, enumerate_modules,
+        find_pid, last_error,
     };
 
     type Handle = isize;
@@ -461,11 +461,6 @@ pub fn find_process(name: &str) -> Result<u32> {
 
 #[cfg(windows)]
 pub use win::attach;
-
-#[cfg(not(windows))]
-pub fn attach(_process_name: &str) -> Result<std::convert::Infallible> {
-    bail!("-c syscall is Windows-only")
-}
 
 #[cfg(test)]
 mod tests {
